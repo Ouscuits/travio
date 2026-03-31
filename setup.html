@@ -69,17 +69,19 @@
             btn.disabled = true; btn.textContent = 'Creating...';
 
             try {
-                // Check if setup already done
+                // Create auth user first (needed to authenticate Firestore calls)
+                const cred = await auth.createUserWithEmailAndPassword(email, pwd);
+
+                // Now check if an admin already exists (we're authenticated now)
                 const existing = await db.collection('users').limit(1).get();
                 if (!existing.empty) {
+                    // Admin already exists — delete the auth user we just created and abort
+                    await cred.user.delete();
                     msg.textContent = 'Setup already completed. An admin account exists.';
                     msg.className = 'msg err';
                     btn.disabled = false; btn.textContent = 'Create Admin Account';
                     return;
                 }
-
-                // Create auth user
-                const cred = await auth.createUserWithEmailAndPassword(email, pwd);
 
                 // Create user doc
                 await db.collection('users').doc(cred.user.uid).set({

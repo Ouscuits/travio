@@ -13,8 +13,9 @@ service cloud.firestore {
     }
 
     // Users — admin can read all, users can read own doc
+    // Note: create allowed for any authenticated user (setup + admin creating users)
     match /users/{userId} {
-      allow read: if isLoggedIn() && (isAdmin() || request.auth.uid == userId);
+      allow read: if isLoggedIn();
       allow create: if request.auth != null;
       allow update, delete: if isAdmin();
     }
