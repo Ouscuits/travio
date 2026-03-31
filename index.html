@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="description" content="Your intelligent travel companion - optimize routes, budgets and discover amazing places">
+  <meta name="theme-color" content="#10b981">
+  
+  <!-- PWA Meta Tags -->
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Travio">
+  
+  <title>Travio - Your Trip Mate</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <style>
+    /* Prevenir el zoom en iOS */
+    input, select, textarea {
+      font-size: 16px !important;
+    }
+    
+    /* Animación de carga */
+    .loading-spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #10b981;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    /* Mejorar scroll en móvil */
+    * {
+      -webkit-overflow-scrolling: touch;
+    }
+    
+    /* Ocultar scrollbar pero mantener funcionalidad */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+      background: #f1f1f1;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+      background: #888;
+      border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+      background: #555;
+    }
+
+    /* Animación para el selector de idioma */
+    .language-selector {
+      transition: all 0.3s ease;
+    }
+    
+    .language-selector:hover {
+      transform: scale(1.05);
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <!-- React y Babel para JSX -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <!-- Nuestra aplicación con sistema multiidioma -->
+  <script type="text/babel">
+    // Sistema de traducciones
+    const translations = {
+      es: {
+        appName: "Travio",
+        tagline: "Tu compañero de viaje",
+        subtitle: "Planifica, optimiza y disfruta cada kilómetro",
+        travelData: "Datos del Viaje",
+        startPoint: "Punto de partida",
+        startPointPlaceholder: "ej: Madrid",
+        endPoint: "Punto final",
+        endPointPlaceholder: "ej: Madrid (viaje circular)",
+        destinations: "Destinos a visitar",
+        destinationsHint: "(separados por comas)",
+        destinationsPlaceholder: "ej: Santiago, Finisterre, A Coruña",
+        tripType: "Tipo de viaje",
+        family: "👨‍👩‍👧‍👦 Familiar",
+        couple: "💑 En pareja",
+        adventure: "🏔️ Aventura",
+        motorcycle: "🏍️ En moto",
+        duration: "Duración (días)",
+        dailyBudget: "Presupuesto diario (€)",
+        advancedOptions: "Opciones avanzadas",
+        customizeBudget: "Personalizar presupuesto por día",
+        day: "Día",
+        tollPreference: "Preferencia de peajes",
+        withTolls: "⚡ Con peajes (más rápido)",
+        withoutTolls: "🌄 Sin peajes (económico/escénico)",
+        departureTime: "Hora de salida",
+        generateRoute: "Generar Ruta con IA",
+        generating: "Creando tu ruta perfecta...",
+        clear: "Limpiar",
+        savedRoutes: "Rutas Guardadas",
+        result: "Resultado",
+        saveRoute: "Guardar Ruta",
+        loadRoute: "Cargar ruta",
+        deleteRoute: "Eliminar ruta",
+        emptyState: "Completa el formulario y genera tu ruta para ver los resultados aquí",
+        analyzing: "Analizando la mejor ruta para tu viaje...",
+        waitTime: "Esto puede tardar 15-30 segundos",
+        route: "Ruta",
+        days: "días",
+        budget: "Presupuesto",
+        footerCredit: "Creado con ❤️ por Travio",
+        footerTagline: "Tu compañero inteligente de viajes",
+        languageLabel: "Idioma",
+        required: "*"
+      },
+      en: {
+        appName: "Travio",
+        tagline: "Your trip mate",
+        subtitle: "Plan, optimize and enjoy every kilometer",
+        travelData: "Travel Data",
+        startPoint: "Starting point",
+        startPointPlaceholder: "e.g: London",
+        endPoint: "End point",
+        endPointPlaceholder: "e.g: London (round trip)",
+        destinations: "Destinations to visit",
+        destinationsHint: "(comma separated)",
+        destinationsPlaceholder: "e.g: Edinburgh, Glasgow, Inverness",
+        tripType: "Trip type",
+        family: "👨‍👩‍👧‍👦 Family",
+        couple: "💑 Couple",
+        adventure: "🏔️ Adventure",
+        motorcycle: "🏍️ Motorcycle",
+        duration: "Duration (days)",
+        dailyBudget: "Daily budget (€)",
+        advancedOptions: "Advanced options",
+        customizeBudget: "Customize budget per day",
+        day: "Day",
+        tollPreference: "Toll preference",
+        withTolls: "⚡ With tolls (faster)",
+        withoutTolls: "🌄 Without tolls (scenic/economical)",
+        departureTime: "Departure time",
+        generateRoute: "Generate Route with AI",
+        generating: "Creating your perfect route...",
+        clear: "Clear",
+        savedRoutes: "Saved Routes",
+        result: "Result",
+        saveRoute: "Save Route",
+        loadRoute: "Load route",
+        deleteRoute: "Delete route",
+        emptyState: "Fill out the form and generate your route to see results here",
+        analyzing: "Analyzing the best route for your trip...",
+        waitTime: "This may take 15-30 seconds",
+        route: "Route",
+        days: "days",
+        budget: "Budget",
+        footerCredit: "Made with ❤️ by Travio",
+        footerTagline: "Your intelligent travel companion",
+        languageLabel: "Language",
+        required: "*"
+      },
+      ca: {
+        appName: "Travio",
+        tagline: "El teu company de viatge",
+        subtitle: "Planifica, optimitza i gaudeix de cada quilòmetre",
+        travelData: "Dades del Viatge",
+        startPoint: "Punt de partida",
+        startPointPlaceholder: "ex: Barcelona",
+        endPoint: "Punt final",
+        endPointPlaceholder: "ex: Barcelona (viatge circular)",
+        destinations: "Destinacions a visitar",
+        destinationsHint: "(separades per comes)",
+        destinationsPlaceholder: "ex: Girona, Figueres, Cadaqués",
+        tripType: "Tipus de viatge",
+        family: "👨‍👩‍👧‍👦 Familiar",
+        couple: "💑 En parella",
+        adventure: "🏔️ Aventura",
+        motorcycle: "🏍️ En moto",
+        duration: "Durada (dies)",
+        dailyBudget: "Pressupost diari (€)",
+        advancedOptions: "Opcions avançades",
+        customizeBudget: "Personalitzar pressupost per dia",
+        day: "Dia",
+        tollPreference: "Preferència de peatges",
+        withTolls: "⚡ Amb peatges (més ràpid)",
+        withoutTolls: "🌄 Sense peatges (econòmic/escènic)",
+        departureTime: "Hora de sortida",
+        generateRoute: "Generar Ruta amb IA",
+        generating: "Creant la teva ruta perfecta...",
+        clear: "Netejar",
+        savedRoutes: "Rutes Guardades",
+        result: "Resultat",
+        saveRoute: "Guardar Ruta",
+        loadRoute: "Carregar ruta",
+        deleteRoute: "Eliminar ruta",
+        emptyState: "Completa el formulari i genera la teva ruta per veure els resultats aquí",
+        analyzing: "Analitzant la millor ruta pel teu viatge...",
+        waitTime: "Això pot trigar 15-30 segons",
+        route: "Ruta",
+        days: "dies",
+        budget: "Pressupost",
+        footerCredit: "Creat amb ❤️ per Travio",
+        footerTagline: "El teu company intel·ligent de viatges",
+        languageLabel: "Idioma",
+        required: "*"
+      },
+      fr: {
+        appName: "Travio",
+        tagline: "Votre compagnon de voyage",
+        subtitle: "Planifiez, optimisez et profitez de chaque kilomètre",
+        travelData: "Données du Voyage",
+        startPoint: "Point de départ",
+        startPointPlaceholder: "ex: Paris",
+        endPoint: "Point d'arrivée",
+        endPointPlaceholder: "ex: Paris (voyage circulaire)",
+        destinations: "Destinations à visiter",
+        destinationsHint: "(séparées par des virgules)",
+        destinationsPlaceholder: "ex: Lyon, Marseille, Nice",
+        tripType: "Type de voyage",
+        family: "👨‍👩‍👧‍👦 Famille",
+        couple: "💑 Couple",
+        adventure: "🏔️ Aventure",
+        motorcycle: "🏍️ Moto",
+        duration: "Durée (jours)",
+        dailyBudget: "Budget quotidien (€)",
+        advancedOptions: "Options avancées",
+        customizeBudget: "Personnaliser le budget par jour",
+        day: "Jour",
+        tollPreference: "Préférence de péages",
+        withTolls: "⚡ Avec péages (plus rapide)",
+        withoutTolls: "🌄 Sans péages (économique/panoramique)",
+        departureTime: "Heure de départ",
+        generateRoute: "Générer l'Itinéraire avec IA",
+        generating: "Création de votre itinéraire parfait...",
+        clear: "Effacer",
+        savedRoutes: "Itinéraires Sauvegardés",
+        result: "Résultat",
+        saveRoute: "Sauvegarder l'Itinéraire",
+        loadRoute: "Charger l'itinéraire",
+        deleteRoute: "Supprimer l'itinéraire",
+        emptyState: "Remplissez le formulaire et générez votre itinéraire pour voir les résultats ici",
+        analyzing: "Analyse du meilleur itinéraire pour votre voyage...",
+        waitTime: "Cela peut prendre 15-30 secondes",
+        route: "Itinéraire",
+        days: "jours",
+        budget: "Budget",
+        footerCredit: "Créé avec ❤️ par Travio",
+        footerTagline: "Votre compagnon de voyage intelligent",
+        languageLabel: "Langue",
+        required: "*"
+      },
+      zh: {
+        appName: "Travio",
+        tagline: "您的旅行伙伴",
+        subtitle: "规划、优化并享受每一公里",
+        travelData: "旅行数据",
+        startPoint: "出发点",
+        startPointPlaceholder: "例如：北京",
+        endPoint: "终点",
+        endPointPlaceholder: "例如：北京（环形旅行）",
+        destinations: "要访问的目的地",
+        destinationsHint: "（用逗号分隔）",
+        destinationsPlaceholder: "例如：上海、杭州、苏州",
+        tripType: "旅行类型",
+        family: "👨‍👩‍👧‍👦 家庭",
+        couple: "💑 情侣",
+        adventure: "🏔️ 冒险",
+        motorcycle: "🏍️ 摩托车",
+        duration: "持续时间（天）",
+        dailyBudget: "每日预算（€）",
+        advancedOptions: "高级选项",
+        customizeBudget: "自定义每日预算",
+        day: "第",
+        tollPreference: "收费偏好",
+        withTolls: "⚡ 使用收费公路（更快）",
+        withoutTolls: "🌄 避免收费（经济/风景）",
+        departureTime: "出发时间",
+        generateRoute: "使用AI生成路线",
+        generating: "正在创建您的完美路线...",
+        clear: "清除",
+        savedRoutes: "已保存路线",
+        result: "结果",
+        saveRoute: "保存路线",
+        loadRoute: "加载路线",
+        deleteRoute: "删除路线",
+        emptyState: "填写表格并生成路线以在此处查看结果",
+        analyzing: "正在分析您旅行的最佳路线...",
+        waitTime: "这可能需要15-30秒",
+        route: "路线",
+        days: "天",
+        budget: "预算",
+        footerCredit: "由Travio用❤️制作",
+        footerTagline: "您的智能旅行伙伴",
+        languageLabel: "语言",
+        required: "*"
+      }
+    };
+
+    function Travio() {
+      // Estado para el idioma seleccionado
+      const [language, setLanguage] = React.useState('es');
+      const t = translations[language];
+
+      // Estado para el formulario
+      const [formData, setFormData] = React.useState({
+        puntoPartida: '',
+        puntoFinal: '',
+        destinos: '',
+        tipoViaje: 'familiar',
+        duracionDias: 3,
+        presupuestoDiario: 100,
+        presupuestoPersonalizado: false,
+        presupuestosPorDia: {},
+        preferenciaPeajes: 'con-peajes',
+        horaSalida: '09:00'
+      });
+
+      const [mostrarAvanzado, setMostrarAvanzado] = React.useState(false);
+      const [rutaGenerada, setRutaGenerada] = React.useState(null);
+      const [rutasGuardadas, setRutasGuardadas] = React.useState([]);
+      const [cargando, setCargando] = React.useState(false);
+
+      const handleChange = (e) => {
+        const { name, value, type, checked } = e.target;
+        setFormData(prev => ({
+          ...prev,
+          [name]: type === 'checkbox' ? checked : value
+        }));
+      };
+
+      const handlePresupuestoDia = (dia, valor) => {
+        setFormData(prev => ({
+          ...prev,
+          presupuestosPorDia: {
+            ...prev.presupuestosPorDia,
+            [dia]: parseFloat(valor) || 0
+          }
+        }));
+      };
+
+      const formularioValido = () => {
+        return formData.puntoPartida && 
+               formData.puntoFinal && 
+               formData.destinos && 
+               formData.duracionDias > 0 && 
+               formData.presupuestoDiario > 0;
+      };
+
+      const generarRuta = async () => {
+        if (!formularioValido()) return;
+        
+        setCargando(true);
+        
+        try {
+          const destinosArray = formData.destinos.split(',').map(d => d.trim());
+          
+          // Traducir el tipo de viaje al idioma seleccionado
+          const tipoViajeTraducido = {
+            es: { familiar: 'familiar', pareja: 'en pareja', aventura: 'aventura', moto: 'en moto' },
+            en: { familiar: 'family', pareja: 'couple', aventura: 'adventure', moto: 'motorcycle' },
+            ca: { familiar: 'familiar', pareja: 'en parella', aventura: 'aventura', moto: 'en moto' },
+            fr: { familiar: 'famille', pareja: 'couple', aventura: 'aventure', moto: 'moto' },
+            zh: { familiar: '家庭', pareja: '情侣', aventura: '冒险', moto: '摩托车' }
+          };
+
+          const prompt = `You are an expert travel planner. I need you to help me plan an optimized route with the following details.
+
+IMPORTANT: Please respond entirely in ${language === 'es' ? 'Spanish' : language === 'en' ? 'English' : language === 'ca' ? 'Catalan' : language === 'fr' ? 'French' : 'Simplified Chinese'}.
+
+**TRAVEL INFORMATION:**
+- Starting point: ${formData.puntoPartida}
+- End point: ${formData.puntoFinal}
+- Destinations to visit: ${destinosArray.join(', ')}
+- Trip type: ${tipoViajeTraducido[language][formData.tipoViaje]}
+- Duration: ${formData.duracionDias} days
+- Daily budget: €${formData.presupuestoDiario}
+- Toll preference: ${formData.preferenciaPeajes === 'con-peajes' ? 'Use toll highways (faster)' : 'Avoid tolls (more economical/scenic)'}
+- Departure time: ${formData.horaSalida}
+
+**WHAT I NEED:**
+
+1. **OPTIMIZED ROUTE**: Order the destinations logically to minimize distance and time. Consider toll preference.
+
+2. **DETAILED DAILY ITINERARY**: For each day of the trip, provide:
+   - Destinations to visit that day
+   - Approximate distance in km
+   - Estimated driving time
+   - Estimated arrival time at each point
+   - If there are tolls, mention them and estimate the approximate cost
+
+3. **COST BREAKDOWN**: For each day, estimate:
+   - Fuel (assume average consumption of 7L/100km and €1.50/liter)
+   - Tolls (if applicable)
+   - Suggested accommodation within budget
+   - Meals (breakfast, lunch, dinner)
+   - Total for the day vs available budget
+   - ALERT if budget is exceeded
+
+4. **PERSONALIZED SUGGESTIONS** according to trip type:
+${formData.tipoViaje === 'familiar' ? '   - Family-friendly restaurants\n   - Parks and attractions for children\n   - Hotels with family facilities' : ''}
+${formData.tipoViaje === 'pareja' ? '   - Romantic restaurants\n   - Viewpoints and special places\n   - Boutique or charming hotels' : ''}
+${formData.tipoViaje === 'aventura' ? '   - Hiking trails\n   - Outdoor activities\n   - Camping or budget hostels' : ''}
+${formData.tipoViaje === 'moto' ? '   - Scenic roads and mountain passes\n   - Technical stops for motorcycles\n   - Biker-friendly hostels\n   - Routes with interesting curves' : ''}
+
+5. **INTERMEDIATE STOPS**: Suggest beautiful towns or rest areas along the way.
+
+6. **FINAL SUMMARY**: 
+   - Total kilometers
+   - Total driving time
+   - Estimated total trip cost
+   - Comparison with total available budget
+
+Please structure the response clearly and professionally.`;
+
+          console.log('Llamando a la función...', '/.netlify/functions/generar-ruta');
+
+          const response = await fetch("/.netlify/functions/generar-ruta", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              prompt: prompt,
+              language: language
+            })
+          });
+
+          console.log('Respuesta recibida:', response.status, response.statusText);
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error('Error de la función:', errorText);
+            throw new Error(`Error ${response.status}: ${response.statusText}\n${errorText}`);
+          }
+
+          const data = await response.json();
+          console.log('Datos recibidos:', data);
+          
+          let respuestaCompleta = '';
+          for (const block of data.content) {
+            if (block.type === 'text') {
+              respuestaCompleta += block.text + '\n';
+            }
+          }
+
+          if (!respuestaCompleta) {
+            throw new Error('No se recibió ninguna respuesta del servidor');
+          }
+
+          const nuevaRuta = {
+            id: Date.now(),
+            fecha: new Date().toLocaleString(language === 'zh' ? 'zh-CN' : language === 'ca' ? 'ca-ES' : `${language}-${language.toUpperCase()}`),
+            datos: formData,
+            resultado: respuestaCompleta,
+            idioma: language
+          };
+          
+          setRutaGenerada(nuevaRuta);
+          
+        } catch (error) {
+          console.error('Error completo al generar ruta:', error);
+          alert(`ERROR: ${error.message}\n\nMira la consola (F12) para más detalles.`);
+        } finally {
+          setCargando(false);
+        }
+      };
+
+      const guardarRuta = () => {
+        if (rutaGenerada) {
+          setRutasGuardadas(prev => [rutaGenerada, ...prev]);
+          alert(t.saveRoute + ' ✓');
+        }
+      };
+
+      const cargarRuta = (ruta) => {
+        setFormData(ruta.datos);
+        setRutaGenerada(ruta);
+        if (ruta.idioma) {
+          setLanguage(ruta.idioma);
+        }
+      };
+
+      const eliminarRuta = (id) => {
+        setRutasGuardadas(prev => prev.filter(r => r.id !== id));
+      };
+
+      const limpiarFormulario = () => {
+        setFormData({
+          puntoPartida: '',
+          puntoFinal: '',
+          destinos: '',
+          tipoViaje: 'familiar',
+          duracionDias: 3,
+          presupuestoDiario: 100,
+          presupuestoPersonalizado: false,
+          presupuestosPorDia: {},
+          preferenciaPeajes: 'con-peajes',
+          horaSalida: '09:00'
+        });
+        setRutaGenerada(null);
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-emerald-50 to-teal-100 p-6">
+          <div className="max-w-6xl mx-auto">
+            
+            {/* Encabezado */}
+            <div className="bg-gradient-to-r from-emerald-600 to-teal-600 rounded-lg shadow-lg p-8 mb-6 text-white">
+              <div className="flex items-center justify-center gap-3 mb-3">
+                <span className="text-5xl">🗺️</span>
+                <h1 className="text-4xl font-bold">{t.appName}</h1>
+              </div>
+              <p className="text-center text-emerald-100 text-lg">{t.tagline}</p>
+              <p className="text-center text-emerald-200 text-sm mt-2">{t.subtitle}</p>
+              
+              {/* Selector de idioma debajo del logo */}
+              <div className="flex justify-center mt-6 language-selector">
+                <select
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
+                  className="bg-white/20 backdrop-blur-sm text-white px-4 py-2 rounded-lg border border-white/30 font-medium cursor-pointer focus:outline-none focus:ring-2 focus:ring-white/50 hover:bg-white/30 transition-all"
+                >
+                  <option value="es" className="bg-emerald-600">🇪🇸 Español</option>
+                  <option value="en" className="bg-emerald-600">🇬🇧 English</option>
+                  <option value="ca" className="bg-emerald-600">🏴 Català</option>
+                  <option value="fr" className="bg-emerald-600">🇫🇷 Français</option>
+                  <option value="zh" className="bg-emerald-600">🇨🇳 中文</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              
+              {/* Panel izquierdo - Formulario */}
+              <div className="lg:col-span-1">
+                <div className="bg-white rounded-lg shadow-lg p-6">
+                  <h2 className="text-xl font-semibold text-gray-800 mb-4">{t.travelData}</h2>
+                  
+                  {/* Punto de partida */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      📍 {t.startPoint} {t.required}
+                    </label>
+                    <input
+                      type="text"
+                      name="puntoPartida"
+                      value={formData.puntoPartida}
+                      onChange={handleChange}
+                      placeholder={t.startPointPlaceholder}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Punto final */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      📍 {t.endPoint} {t.required}
+                    </label>
+                    <input
+                      type="text"
+                      name="puntoFinal"
+                      value={formData.puntoFinal}
+                      onChange={handleChange}
+                      placeholder={t.endPointPlaceholder}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Destinos */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      {t.destinations} {t.required} <span className="text-xs text-gray-500">{t.destinationsHint}</span>
+                    </label>
+                    <textarea
+                      name="destinos"
+                      value={formData.destinos}
+                      onChange={handleChange}
+                      placeholder={t.destinationsPlaceholder}
+                      rows="3"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Tipo de viaje */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      {t.tripType} {t.required}
+                    </label>
+                    <select
+                      name="tipoViaje"
+                      value={formData.tipoViaje}
+                      onChange={handleChange}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    >
+                      <option value="familiar">{t.family}</option>
+                      <option value="pareja">{t.couple}</option>
+                      <option value="aventura">{t.adventure}</option>
+                      <option value="moto">{t.motorcycle}</option>
+                    </select>
+                  </div>
+
+                  {/* Duración */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      📅 {t.duration} {t.required}
+                    </label>
+                    <input
+                      type="number"
+                      name="duracionDias"
+                      value={formData.duracionDias}
+                      onChange={handleChange}
+                      min="1"
+                      max="30"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Presupuesto diario */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      💰 {t.dailyBudget} {t.required}
+                    </label>
+                    <input
+                      type="number"
+                      name="presupuestoDiario"
+                      value={formData.presupuestoDiario}
+                      onChange={handleChange}
+                      min="10"
+                      step="10"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Opciones avanzadas */}
+                  <div className="mb-4">
+                    <button
+                      type="button"
+                      onClick={() => setMostrarAvanzado(!mostrarAvanzado)}
+                      className="w-full flex items-center justify-between text-sm font-medium text-emerald-600 hover:text-emerald-800 py-2"
+                    >
+                      <span>{t.advancedOptions}</span>
+                      <span className="text-lg">{mostrarAvanzado ? '▲' : '▼'}</span>
+                    </button>
+                    
+                    {mostrarAvanzado && (
+                      <div className="mt-4 space-y-4 border-t pt-4">
+                        {/* Presupuesto personalizado */}
+                        <div>
+                          <label className="flex items-center text-sm font-medium text-gray-700 mb-2">
+                            <input
+                              type="checkbox"
+                              name="presupuestoPersonalizado"
+                              checked={formData.presupuestoPersonalizado}
+                              onChange={handleChange}
+                              className="mr-2"
+                            />
+                            {t.customizeBudget}
+                          </label>
+                          
+                          {formData.presupuestoPersonalizado && (
+                            <div className="ml-6 space-y-2">
+                              {[...Array(parseInt(formData.duracionDias))].map((_, i) => (
+                                <div key={i} className="flex items-center gap-2">
+                                  <span className="text-sm text-gray-600 w-16">{t.day} {i + 1}:</span>
+                                  <input
+                                    type="number"
+                                    value={formData.presupuestosPorDia[i + 1] || formData.presupuestoDiario}
+                                    onChange={(e) => handlePresupuestoDia(i + 1, e.target.value)}
+                                    min="10"
+                                    step="10"
+                                    className="flex-1 px-2 py-1 text-sm border border-gray-300 rounded focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                                  />
+                                  <span className="text-sm text-gray-600">€</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Preferencia de peajes */}
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            {t.tollPreference}
+                          </label>
+                          <select
+                            name="preferenciaPeajes"
+                            value={formData.preferenciaPeajes}
+                            onChange={handleChange}
+                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                          >
+                            <option value="con-peajes">{t.withTolls}</option>
+                            <option value="sin-peajes">{t.withoutTolls}</option>
+                          </select>
+                        </div>
+
+                        {/* Hora de salida */}
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            🕐 {t.departureTime}
+                          </label>
+                          <input
+                            type="time"
+                            name="horaSalida"
+                            value={formData.horaSalida}
+                            onChange={handleChange}
+                            className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Botones de acción */}
+                  <div className="space-y-2">
+                    <button
+                      onClick={generarRuta}
+                      disabled={!formularioValido() || cargando}
+                      className="w-full bg-emerald-600 text-white py-3 rounded-md font-semibold hover:bg-emerald-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {cargando ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                          {t.generating}
+                        </span>
+                      ) : (
+                        <span className="flex items-center justify-center gap-2">
+                          <span>✨</span>
+                          {t.generateRoute}
+                        </span>
+                      )}
+                    </button>
+                    
+                    <button
+                      onClick={limpiarFormulario}
+                      className="w-full bg-gray-200 text-gray-700 py-2 rounded-md font-medium hover:bg-gray-300 transition-colors"
+                    >
+                      {t.clear}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Rutas guardadas */}
+                {rutasGuardadas.length > 0 && (
+                  <div className="bg-white rounded-lg shadow-lg p-6 mt-6">
+                    <h3 className="text-lg font-semibold text-gray-800 mb-4">{t.savedRoutes}</h3>
+                    <div className="space-y-2">
+                      {rutasGuardadas.map(ruta => (
+                        <div key={ruta.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-md">
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-gray-800">
+                              {ruta.datos.puntoPartida} → {ruta.datos.puntoFinal}
+                            </p>
+                            <p className="text-xs text-gray-500">{ruta.fecha}</p>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => cargarRuta(ruta)}
+                              className="text-emerald-600 hover:text-emerald-800"
+                              title={t.loadRoute}
+                            >
+                              <span>🗺️</span>
+                            </button>
+                            <button
+                              onClick={() => eliminarRuta(ruta.id)}
+                              className="text-red-600 hover:text-red-800"
+                              title={t.deleteRoute}
+                            >
+                              <span>🗑️</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Panel derecho - Resultados */}
+              <div className="lg:col-span-2">
+                <div className="bg-white rounded-lg shadow-lg p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-xl font-semibold text-gray-800">{t.result}</h2>
+                    {rutaGenerada && (
+                      <button
+                        onClick={guardarRuta}
+                        className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 transition-colors"
+                      >
+                        <span>💾</span>
+                        {t.saveRoute}
+                      </button>
+                    )}
+                  </div>
+
+                  {!rutaGenerada && !cargando && (
+                    <div className="text-center py-12">
+                      <div className="text-6xl mb-4">🗺️</div>
+                      <p className="text-gray-500">{t.emptyState}</p>
+                    </div>
+                  )}
+
+                  {cargando && (
+                    <div className="text-center py-12">
+                      <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-emerald-600 mx-auto mb-4"></div>
+                      <p className="text-gray-600 font-medium">{t.analyzing}</p>
+                      <p className="text-gray-500 text-sm mt-2">{t.waitTime}</p>
+                    </div>
+                  )}
+
+                  {rutaGenerada && !cargando && (
+                    <div className="prose max-w-none">
+                      <div className="bg-emerald-50 border-l-4 border-emerald-600 p-4 mb-6">
+                        <h3 className="text-lg font-semibold text-emerald-900 mb-2">
+                          {t.route}: {rutaGenerada.datos.puntoPartida} → {rutaGenerada.datos.puntoFinal}
+                        </h3>
+                        <p className="text-sm text-emerald-700">
+                          {rutaGenerada.datos.duracionDias} {t.days} • {rutaGenerada.datos.tipoViaje} • 
+                          {t.budget}: €{rutaGenerada.datos.presupuestoDiario}/{t.days.slice(0,-1)}
+                        </p>
+                      </div>
+                      
+                      <div className="whitespace-pre-wrap text-gray-800 leading-relaxed">
+                        {rutaGenerada.resultado}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="mt-8 text-center text-gray-600">
+              <p className="text-sm">{t.footerCredit}</p>
+              <p className="text-xs mt-1 text-gray-500">{t.footerTagline}</p>
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    // Renderizar la aplicación
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<Travio />);
+  </script>
+  
+  <!-- Registrar Service Worker -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/service-worker.js')
+          .then((registration) => {
+            console.log('Service Worker registered successfully:', registration.scope);
+          })
+          .catch((error) => {
+            console.log('Service Worker registration error:', error);
+          });
+      });
+    }
+    
+    let deferredPrompt;
+    
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      console.log('App can be installed');
+    });
+    
+    window.addEventListener('appinstalled', () => {
+      console.log('PWA installed successfully!');
+      deferredPrompt = null;
+    });
+    
+    if (window.matchMedia('(display-mode: standalone)').matches) {
+      console.log('App running in standalone mode (installed)');
+    }
+  </script>
+</body>
+</html>
