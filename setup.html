@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Travio - Setup</title>
+    <link rel="stylesheet" href="fonts/fonts.css">
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:'DM Sans',sans-serif;background:#ECFDF5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+        .setup-card{background:#fff;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.12);padding:32px;max-width:400px;width:100%;text-align:center}
+        .setup-logo{font-size:48px;margin-bottom:8px}
+        .setup-title{font-size:22px;font-weight:700;color:#059669;margin-bottom:4px}
+        .setup-sub{font-size:13px;color:#777;margin-bottom:24px}
+        .form-group{display:flex;flex-direction:column;gap:4px;margin-bottom:14px;text-align:left}
+        .form-group label{font-size:12px;font-weight:600;color:#5a5a5a;text-transform:uppercase;letter-spacing:.3px}
+        .form-group input{padding:10px 12px;border:1px solid #d0d0d0;border-radius:6px;font-family:'DM Sans',sans-serif;font-size:14px}
+        .form-group input:focus{outline:none;border-color:#10B981}
+        .btn{display:inline-flex;align-items:center;justify-content:center;padding:12px 24px;border:none;border-radius:6px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer;width:100%;background:#10B981;color:#fff;transition:background .15s}
+        .btn:hover{background:#059669}
+        .btn:disabled{opacity:.5;cursor:not-allowed}
+        .msg{font-size:13px;padding:8px 12px;border-radius:6px;margin-top:12px;display:none}
+        .msg.ok{background:#e6f5ec;color:#006633;display:block}
+        .msg.err{background:rgba(239,68,68,.08);color:#EF4444;display:block}
+    </style>
+</head>
+<body>
+    <div class="setup-card">
+        <div class="setup-logo">&#x1F5FA;&#xFE0F;</div>
+        <div class="setup-title">Travio Setup</div>
+        <div class="setup-sub">Create the first admin account. This page can be deleted after setup.</div>
+
+        <div class="form-group">
+            <label>Name</label>
+            <input type="text" id="setupName" placeholder="Admin name">
+        </div>
+        <div class="form-group">
+            <label>Email</label>
+            <input type="email" id="setupEmail" placeholder="admin@example.com">
+        </div>
+        <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="setupPwd" placeholder="Min. 6 characters">
+        </div>
+        <button class="btn" id="setupBtn" onclick="doSetup()">Create Admin Account</button>
+        <div class="msg" id="setupMsg"></div>
+    </div>
+
+    <script src="vendor/firebase-app-compat.js"></script>
+    <script src="vendor/firebase-auth-compat.js"></script>
+    <script src="vendor/firebase-firestore-compat.js"></script>
+    <script src="js/firebase-config.js"></script>
+    <script>
+        async function doSetup() {
+            const name  = document.getElementById('setupName').value.trim();
+            const email = document.getElementById('setupEmail').value.trim();
+            const pwd   = document.getElementById('setupPwd').value;
+            const msg   = document.getElementById('setupMsg');
+            const btn   = document.getElementById('setupBtn');
+
+            msg.className = 'msg'; msg.style.display = 'none';
+
+            if (!name || !email || !pwd || pwd.length < 6) {
+                msg.textContent = 'Please fill all fields (password min. 6 chars).';
+                msg.className = 'msg err';
+                return;
+            }
+
+            btn.disabled = true; btn.textContent = 'Creating...';
+
+            try {
+                // Check if setup already done
+                const existing = await db.collection('users').limit(1).get();
+                if (!existing.empty) {
+                    msg.textContent = 'Setup already completed. An admin account exists.';
+                    msg.className = 'msg err';
+                    btn.disabled = false; btn.textContent = 'Create Admin Account';
+                    return;
+                }
+
+                // Create auth user
+                const cred = await auth.createUserWithEmailAndPassword(email, pwd);
+
+                // Create user doc
+                await db.collection('users').doc(cred.user.uid).set({
+                    email: email,
+                    displayName: name,
+                    role: 'admin',
+                    language: 'es',
+                    password: pwd,
+                    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                    createdBy: 'setup'
+                });
+
+                await auth.signOut();
+
+                msg.textContent = 'Admin account created! You can now open index.html and log in.';
+                msg.className = 'msg ok';
+                btn.style.display = 'none';
+            } catch (e) {
+                console.error('Setup error:', e);
+                msg.textContent = 'Error: ' + e.message;
+                msg.className = 'msg err';
+                btn.disabled = false; btn.textContent = 'Create Admin Account';
+            }
+        }
+    </script>
+</body>
+</html>

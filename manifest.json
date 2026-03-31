@@ -2,31 +2,24 @@
   "name": "Travio - Your Trip Mate",
   "short_name": "Travio",
   "description": "Your intelligent travel companion - optimize routes, budgets and discover amazing places",
-  "start_url": "/",
+  "start_url": ".",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#4f46e5",
+  "background_color": "#ECFDF5",
+  "theme_color": "#10b981",
   "orientation": "portrait-primary",
   "icons": [
     {
-      "src": "/icon-192.png",
+      "src": "icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/icon-512.png",
+      "src": "icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
     }
   ],
-  "categories": ["travel", "lifestyle", "productivity"],
-  "screenshots": [
-    {
-      "src": "/screenshot.png",
-      "sizes": "540x720",
-      "type": "image/png"
-    }
-  ]
+  "categories": ["travel", "lifestyle", "productivity"]
 }
