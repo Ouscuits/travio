@@ -5,7 +5,28 @@
 
    Wrapped in an IIFE so the classic <script> load order cannot collide with helper
    names defined by js/geo-provider.js. Exposed as window.TravioEngine (browser) and
-   module.exports (Node). */
+   module.exports (Node).
+
+   Optimisation: nearest neighbour seeded from the start, then 2-opt segment reversal,
+   then or-opt segment relocation (1..3 stops, forward or reversed), alternated until
+   neither helps. The result is always a 2-opt local optimum, but a local optimum is NOT
+   the global optimum — on random 6-stop instances it lands above the true optimum
+   roughly one time in five. It is deterministic, not exact.
+
+   Documented deviations from the contract (all reported through Plan.warnings):
+
+   - R1  Destinations that duplicate the start, the end or an earlier stop (normalised
+         name match) are dropped and reported as 'duplicate-stop-removed'. Keeping them
+         would break R3 (origin appearing twice on a one-way trip).
+   - R3  A round trip with no destinations returns order = [start] and 'empty-trip'
+         instead of a 0 km leg from the origin to itself.
+   - R4  input.days is coerced with Number(), so "5", " 4 ", [3] and true silently become
+         5, 4, 3 and 1. Anything that is not a finite number >= 1 — 0, -4, NaN, Infinity,
+         0.5, "5 days", null, undefined, {}, [] — collapses to a single day with a
+         'days-clamped' warning. Fractional counts above 1 are floored (3.7 -> 3), and
+         counts above MAX_DAYS (366) are clamped, both with a 'days-clamped' warning.
+   - R2  Above MAX_TWO_OPT_STOPS (60) stops the improvement passes are skipped
+         ('optimisation-limited') and the nearest-neighbour order is kept. */
 
 (function () {
     'use strict';
@@ -14,7 +35,10 @@
     const DEFAULT_MAX_DRIVE_MIN = 360;      // R6 — 6 h cap, Wanderlog bar B6
     const ROUND_TRIP_RADIUS_KM  = 5;        // R3 — origin/destination proximity match
     const ROAD_FACTOR           = 1.25;     // haversine -> road distance
-    const FALLBACK_SPEED_KMH    = 75;       // haversine fallback average speed
+    /* 90 km/h, not 75: the contract's live-OSRM calibration measured 75 km/h as 22–26%
+       pessimistic on long hauls (real average 87–92 km/h). A pessimistic speed inflates
+       driveMin, which over-splits days and manufactures false over-cap warnings. */
+    const FALLBACK_SPEED_KMH    = 90;       // haversine fallback average speed
     const EARTH_RADIUS_KM       = 6371.0088;
     const EPS                   = 1e-9;
     const MAX_DAYS              = 366;      // sanity clamp for absurd inputs (R8)
@@ -43,8 +67,28 @@
         return s.replace(/\s+/g, ' ').trim();
     }
 
+    /* Coordinates reach the engine from Firestore, from the AI enrichment and from form
+       input, so they can legitimately arrive as numeric strings. Coerce, then reject
+       anything outside the real world. */
+    function geoNum(value, limit) {
+        let n;
+        if (typeof value === 'number') n = value;
+        else if (typeof value === 'string' && value.trim() !== '') n = Number(value);
+        else return NaN;
+        if (!isFinite(n) || Math.abs(n) > limit) return NaN;
+        return n;
+    }
+
+    function latOf(p) {
+        return p ? geoNum(p.lat, 90) : NaN;
+    }
+
+    function lonOf(p) {
+        return p ? geoNum(p.lon, 180) : NaN;
+    }
+
     function hasCoords(p) {
-        return !!p && isFiniteNumber(p.lat) && isFiniteNumber(p.lon);
+        return !!p && isFiniteNumber(latOf(p)) && isFiniteNumber(lonOf(p));
     }
 
     function isPlaceLike(p) {
@@ -59,10 +103,14 @@
 
     function haversineKm(a, b) {
         if (!hasCoords(a) || !hasCoords(b)) return NaN;
-        const dLat = toRad(b.lat - a.lat);
-        const dLon = toRad(b.lon - a.lon);
-        const la1  = toRad(a.lat);
-        const la2  = toRad(b.lat);
+        const aLat = latOf(a);
+        const aLon = lonOf(a);
+        const bLat = latOf(b);
+        const bLon = lonOf(b);
+        const dLat = toRad(bLat - aLat);
+        const dLon = toRad(bLon - aLon);
+        const la1  = toRad(aLat);
+        const la2  = toRad(bLat);
         const h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
                   Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
         return 2 * EARTH_RADIUS_KM * Math.asin(Math.min(1, Math.sqrt(h)));
@@ -108,7 +156,14 @@
                 min[i].push(round2((d / FALLBACK_SPEED_KMH) * 60));
             }
         }
-        return { km: km, min: min, source: 'haversine' };
+        const offDiagonal = list.length * (list.length - 1);
+        return {
+            km: km,
+            min: min,
+            source: 'haversine',
+            osrmCells: 0,
+            filledCells: offDiagonal
+        };
     }
 
     /* ── Time of day (optional, derived from input.departureTime) ── */
@@ -175,11 +230,24 @@
             return isFiniteNumber(v) ? v : NaN;
         }
 
+        function flagUnknown() {
+            if (state.unknown) return;
+            state.unknown = true;
+            warnings.push('unknown-distance: at least one leg has no usable distance data ' +
+                '(place not resolved and no coordinates); it is counted as 0 km.');
+        }
+
         return function cost(a, b) {
             if (a === b || (a.mi >= 0 && a.mi === b.mi)) return { km: 0, min: 0 };
-            let dk = cell(km, a.mi, b.mi);
-            let dm = cell(min, a.mi, b.mi);
-            if (isFinite(dk) && isFinite(dm)) return { km: dk, min: dm };
+            const dk = cell(km, a.mi, b.mi);
+            const dm = cell(min, a.mi, b.mi);
+            if (isFinite(dk) && isFinite(dm)) {
+                /* A finite 0 between two different places is only believable when both
+                   have usable coordinates — otherwise it is the provider's placeholder
+                   for "unknown" and must not pass as a real 0 km leg. */
+                if (dk <= 0 && dm <= 0 && !(hasCoords(a.place) && hasCoords(b.place))) flagUnknown();
+                return { km: dk, min: dm };
+            }
 
             const hav = haversineKm(a.place, b.place);
             if (isFinite(hav)) {
@@ -192,11 +260,7 @@
                 return { km: d, min: (d / FALLBACK_SPEED_KMH) * 60 };
             }
 
-            if (!state.unknown) {
-                state.unknown = true;
-                warnings.push('unknown-distance: at least one leg has no distance data ' +
-                    '(place not resolved and no matrix entry); it is counted as 0 km.');
-            }
+            flagUnknown();
             return { km: 0, min: 0 };
         };
     }
@@ -261,6 +325,52 @@
                     }
                 }
             }
+        }
+        return best;
+    }
+
+    /* ── R2 — or-opt: relocate a run of 1..3 stops elsewhere in the sequence ──
+       2-opt can only reverse a segment in place, so a single stop sitting on the wrong
+       side of the itinerary stays stuck. Scanning order is fixed and the first strict
+       improvement wins, so the pass is deterministic. Endpoints never move. */
+    function findOrOptMove(seq, seqCost, cost, fixedTail) {
+        const last = seq.length - 1 - fixedTail;   // last index that may move
+        for (let len = 1; len <= 3 && len <= last; len++) {
+            for (let i = 1; i + len - 1 <= last; i++) {
+                const segment = seq.slice(i, i + len);
+                const rest = seq.slice(0, i).concat(seq.slice(i + len));
+                const maxPos = rest.length - fixedTail;
+                for (let pos = 1; pos <= maxPos; pos++) {
+                    for (let rev = 0; rev < 2; rev++) {
+                        if (rev === 1 && len === 1) continue;      // reversing 1 stop is a no-op
+                        if (rev === 0 && pos === i) continue;      // same place, same order
+                        const piece = rev ? segment.slice().reverse() : segment;
+                        const candidate = rest.slice(0, pos).concat(piece).concat(rest.slice(pos));
+                        const c = sequenceMinutes(candidate, cost);
+                        if (c < seqCost - 1e-6) return { seq: candidate, cost: c };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /* 2-opt and or-opt alternate until neither improves. The loop always exits on a
+       sequence that 2-opt cannot improve, so the 2-opt local-optimum property holds. */
+    function improveSequence(seq, cost, endPinned) {
+        const fixedTail = endPinned ? 1 : 0;
+        let best = twoOptImprove(seq, cost, endPinned);
+        let bestCost = sequenceMinutes(best, cost);
+        let rounds = 0;
+        while (rounds < MAX_TWO_OPT_PASSES) {
+            rounds++;
+            const move = findOrOptMove(best, bestCost, cost, fixedTail);
+            if (!move) break;
+            const reopt = twoOptImprove(move.seq, cost, endPinned);
+            const reoptCost = sequenceMinutes(reopt, cost);
+            if (reoptCost >= bestCost - 1e-6) break;   // no strict gain: keep the 2-opt optimum
+            best = reopt;
+            bestCost = reoptCost;
         }
         return best;
     }
@@ -341,6 +451,9 @@
     function emptyPlan(dayCount, warnings) {
         const days = [];
         for (let d = 0; d < dayCount; d++) {
+            // R5 — an empty day is always an explicitly flagged rest day, never a silent gap.
+            warnings.push('rest-day: day ' + (d + 1) + ' has no driving — there is nothing to ' +
+                'plan (no usable places were supplied).');
             days.push({
                 day: d + 1,
                 legs: [],
@@ -373,17 +486,34 @@
         const departMin = parseClock(inp.departureTime);
 
         const rawStops = Array.isArray(inp.stops) ? inp.stops : [];
+        const nRaw = rawStops.length;
         let start = isPlaceLike(inp.start) ? inp.start : null;
         let end = isPlaceLike(inp.end) ? inp.end : null;
+        const hadStart = !!start;
+        const hadEnd = !!end;
+        let promoted = null;        // where the origin came from: 'end' | 'stop' | null
+        let promotedIndex = -1;
 
-        if (!start && !end) {
-            warnings.push('no-places: no usable start or end point was supplied.');
-            return emptyPlan(dayCount, warnings);
-        }
-        if (!start) {
+        if (!start && end) {
             warnings.push('missing-start: no usable start point, using the end point as origin.');
             start = end;
             end = null;
+            promoted = 'end';
+        }
+        if (!start) {
+            /* No start and no end: promote the first usable destination to origin rather
+               than throwing every typed destination away (B1). */
+            for (let i = 0; i < nRaw; i++) {
+                if (isPlaceLike(rawStops[i])) { promotedIndex = i; break; }
+            }
+            if (promotedIndex === -1) {
+                warnings.push('no-places: no usable start point, end point or destination was supplied.');
+                return emptyPlan(dayCount, warnings);
+            }
+            start = rawStops[promotedIndex];
+            promoted = 'stop';
+            warnings.push('missing-start: no start or end point supplied, starting from "' +
+                (start.name || '?') + '".');
         }
         if (!end) {
             warnings.push('missing-end: no usable end point, the itinerary finishes at the last stop.');
@@ -405,37 +535,76 @@
             warnings.push('missing-matrix: no distance matrix supplied, distances are estimated ' +
                 'from coordinates.');
         }
-        if (matrix && matrix.source === 'haversine') {
-            warnings.push('distance-source: haversine estimates (no road graph available).');
+        /* Matrix.source describes the WHOLE matrix: 'osrm' only when every off-diagonal
+           cell came from the road graph. Anything else is degraded data and the user must
+           be told — a 'mixed' matrix can hide a straight line drawn across open sea. */
+        if (matrix && dim) {
+            const src = matrix.source;
+            const offDiagonal = dim * (dim - 1);
+            if (src === 'haversine') {
+                warnings.push('distance-source: no road data at all — every distance is a ' +
+                    'straight-line estimate, not a driving distance.');
+            } else if (src === 'mixed') {
+                const filled = isFiniteNumber(matrix.filledCells) ? matrix.filledCells : null;
+                warnings.push('distance-source: partial road data — ' +
+                    (filled === null ? 'some legs are' : filled + ' of ' + offDiagonal +
+                        ' matrix cells are') +
+                    ' straight-line estimates (unroutable pairs such as islands or ferries), ' +
+                    'not driving distances.');
+            } else if (src !== 'osrm') {
+                warnings.push('distance-source: unknown matrix source "' + String(src) +
+                    '"; the distances cannot be confirmed as road data.');
+            }
         }
 
-        const nRaw = rawStops.length;
-        const hasFullShape = dim === nRaw + 2;
-        const hasLoopShape = dim === nRaw + 1 && (roundTrip || !end);
-        if (dim && !hasFullShape && !hasLoopShape) {
+        let layout = 'none';
+        if (dim === nRaw + 2 && hadStart) layout = 'full';                                  // [start, ...stops, end]
+        else if (dim === nRaw + 1 && hadStart && (roundTrip || !hadEnd)) layout = 'loop';   // [start, ...stops]
+        else if (dim === nRaw + 1 && !hadStart && hadEnd) layout = 'no-start';              // [...stops, end]
+        else if (dim === nRaw && nRaw > 0 && !hadStart && !hadEnd) layout = 'stops-only';   // [...stops]
+        if (dim && layout === 'none') {
             warnings.push('matrix-size-mismatch: matrix is ' + dim + '×' + dim + ' but ' +
-                (nRaw + 2) + ' places were supplied; distances are estimated from coordinates.');
+                (nRaw + (hadStart ? 1 : 0) + (hadEnd ? 1 : 0)) +
+                ' places were supplied; distances are estimated from coordinates.');
         }
-        const positional = hasFullShape || hasLoopShape;
 
-        function indexFor(place, pos) {
+        function stopMatrixIndex(i) {
+            return (layout === 'no-start' || layout === 'stops-only') ? i : i + 1;
+        }
+
+        function endMatrixIndex() {
+            if (layout === 'loop') return 0;
+            if (layout === 'no-start') return nRaw;
+            return nRaw + 1;
+        }
+
+        function indexFor(place, kind, pos) {
             if (place && Number.isInteger(place.matrixIndex) &&
                 place.matrixIndex >= 0 && place.matrixIndex < dim) {
                 return place.matrixIndex;
             }
-            if (!positional) return -1;
-            if (pos === 'end') return hasLoopShape ? 0 : nRaw + 1;
-            return pos;
+            if (layout === 'none') return -1;
+            if (kind === 'start') {
+                if (promoted === 'end') return endMatrixIndex();
+                if (promoted === 'stop') return stopMatrixIndex(promotedIndex);
+                return 0;
+            }
+            if (kind === 'end') return endMatrixIndex();
+            return stopMatrixIndex(pos);
         }
 
-        const startNode = { place: start, mi: indexFor(start, 0) };
+        const startNode = { place: start, mi: indexFor(start, 'start') };
         const endNode = end ? { place: end, mi: indexFor(end, 'end') } : null;
 
         /* R1 — every destination appears exactly once. Entries that duplicate the start,
            the end, or an earlier stop (by normalised name) are dropped and reported. */
         const stopNodes = [];
-        const seen = {};
+        /* A Map, never a plain object: destination names such as "constructor",
+           "toString" or "__proto__" would otherwise hit Object.prototype and be dropped
+           as phantom duplicates. */
+        const seen = new Map();
         for (let i = 0; i < nRaw; i++) {
+            if (i === promotedIndex) continue;      // already promoted to origin
             const p = rawStops[i];
             if (!isPlaceLike(p)) {
                 warnings.push('stop-ignored: entry ' + (i + 1) + ' is not a usable place.');
@@ -450,12 +619,12 @@
                 warnings.push('duplicate-stop-removed: "' + p.name + '" is the end point.');
                 continue;
             }
-            if (key && seen[key]) {
+            if (key && seen.has(key)) {
                 warnings.push('duplicate-stop-removed: "' + p.name + '" is listed more than once.');
                 continue;
             }
-            if (key) seen[key] = true;
-            stopNodes.push({ place: p, mi: indexFor(p, i + 1) });
+            if (key) seen.set(key, true);
+            stopNodes.push({ place: p, mi: indexFor(p, 'stop', i) });
         }
 
         const allNodes = [startNode].concat(stopNodes);
@@ -469,7 +638,7 @@
 
         const cost = buildCostFn(matrix, dim, warnings, { fellBack: false, unknown: false });
 
-        /* R2 — nearest neighbour from the start, end pinned last, then 2-opt. */
+        /* R2 — nearest neighbour from the start, end pinned last, then 2-opt + or-opt. */
         let seq;
         if (stopNodes.length === 0) {
             seq = endNode ? [startNode, endNode] : [startNode];
@@ -479,9 +648,9 @@
             if (endNode) seq.push(endNode);
             if (stopNodes.length > MAX_TWO_OPT_STOPS) {
                 warnings.push('optimisation-limited: ' + stopNodes.length + ' stops exceed the ' +
-                    MAX_TWO_OPT_STOPS + '-stop 2-opt limit; nearest-neighbour order kept.');
+                    MAX_TWO_OPT_STOPS + '-stop optimisation limit; nearest-neighbour order kept.');
             } else {
-                seq = twoOptImprove(seq, cost, !!endNode);
+                seq = improveSequence(seq, cost, !!endNode);
             }
         }
 
@@ -559,6 +728,14 @@
 
         const order = [];
         for (let i = 0; i < seq.length; i++) order.push(seq[i].place);
+
+        /* A multi-stop itinerary that computes to 0 km is never a real answer — it means
+           the coordinates or the matrix were unusable. Never present it silently. */
+        if (legs.length > 0 && totalKm <= EPS && totalMin <= EPS) {
+            warnings.push('zero-distance: the whole itinerary computes to 0 km — the ' +
+                'coordinates or the distance matrix are unusable, so the numbers below ' +
+                'are not real.');
+        }
 
         return {
             days: days,
