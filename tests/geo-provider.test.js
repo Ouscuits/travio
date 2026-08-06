@@ -110,7 +110,24 @@ function assertMatrixInvariants(m, n, label) {
     assert.ok(m && Array.isArray(m.km) && Array.isArray(m.min), label + ': matrix shape');
     assert.strictEqual(m.km.length, n, label + ': km rows');
     assert.strictEqual(m.min.length, n, label + ': min rows');
-    assert.ok(m.source === 'osrm' || m.source === 'haversine', label + ': source flag');
+    assert.ok(m.source === 'osrm' || m.source === 'mixed' || m.source === 'haversine',
+        label + ': source flag is one of osrm|mixed|haversine');
+
+    /* D1: the flag must describe the WHOLE matrix, and the counts are contract fields. */
+    assert.strictEqual(typeof m.osrmCells, 'number', label + ': osrmCells is a contract field');
+    assert.strictEqual(typeof m.filledCells, 'number', label + ': filledCells is a contract field');
+    /* Counts are per off-diagonal CELL (both directions), matching the engine's
+       dim*(dim-1) denominator — the matrix is symmetric, so pairs contribute two. */
+    assert.strictEqual(m.osrmCells + m.filledCells, n < 2 ? 0 : n * (n - 1),
+        label + ': every off-diagonal cell is accounted for exactly once');
+    if (m.source === 'osrm') {
+        assert.strictEqual(m.filledCells, 0, label + ": 'osrm' means NOTHING was guessed");
+        assert.ok(m.osrmCells > 0, label + ": 'osrm' means road data exists");
+    } else if (m.source === 'mixed') {
+        assert.ok(m.osrmCells > 0 && m.filledCells > 0, label + ": 'mixed' means both kinds present");
+    } else {
+        assert.strictEqual(m.osrmCells, 0, label + ": 'haversine' means no road data at all");
+    }
     for (let i = 0; i < n; i++) {
         assert.strictEqual(m.km[i].length, n, label + ': km square row ' + i);
         assert.strictEqual(m.min[i].length, n, label + ': min square row ' + i);
@@ -237,6 +254,98 @@ test('geocode: expired cache entry is discarded and refetched', async function (
     assert.strictEqual(fetchImpl.calls.length, 1, 'stale entry forced a refetch');
     assert.strictEqual(out[0].lat, 38.72);
     assert.strictEqual(out[0].source, 'osm');
+});
+
+/* ── D3: the cache path validates exactly like the network path ── */
+
+test('geocode D3: out-of-range cached coordinates are rejected, not served', async function () {
+    /* Reported repro: a poisoned localStorage entry bypassed geoParseNominatim's range
+       check and its coordinates went straight into the OSRM URL. */
+    resetGeoRateLimit();
+    const seed = {};
+    seed[cacheKeyFor('T')] = JSON.stringify({ lat: 9999, lon: -77777, ts: Date.now() });
+    const storage = makeStorage(seed);
+    const fetchImpl = makeFetch(function () { return nominatimHit(41.9, 12.5, 'Real place'); });
+
+    const out = await geocodePlaces(['T'], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+    assert.strictEqual(fetchImpl.calls.length, 1, 'the poisoned entry did not short-circuit the lookup');
+    assert.strictEqual(out[0].lat, 41.9, 'the network answer replaced it');
+    assert.strictEqual(out[0].source, 'osm');
+    assert.strictEqual(storage._data.get(cacheKeyFor('T')) !== undefined, true, 'a valid entry replaced it');
+    assert.ok(String(storage._data.get(cacheKeyFor('T'))).indexOf('9999') === -1, 'poison evicted');
+});
+
+test('geocode D3: every out-of-range shape is refused by the cache', async function () {
+    const bad = [
+        { lat: 91, lon: 0 }, { lat: -91, lon: 0 }, { lat: 0, lon: 181 }, { lat: 0, lon: -181 },
+        { lat: 'abc', lon: 0 }, { lat: null, lon: 3 }, { lat: 1 }, { lon: 1 },
+        /* Number(true) is 1 and Number([]) is 0 — loose coercion would invent a point. */
+        { lat: true, lon: true }, { lat: [], lon: [] }, { lat: [40], lon: [-3] },
+        { lat: '', lon: '' }, { lat: {}, lon: {} }
+    ];
+    for (let i = 0; i < bad.length; i++) {
+        resetGeoRateLimit();
+        const name = 'Bad' + i;
+        const seed = {};
+        seed[cacheKeyFor(name)] = JSON.stringify(Object.assign({ ts: Date.now() }, bad[i]));
+        const storage = makeStorage(seed);
+        const fetchImpl = makeFetch(function () { return nominatimHit(10, 10, 'ok'); });
+        const out = await geocodePlaces([name], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+        assert.strictEqual(fetchImpl.calls.length, 1, JSON.stringify(bad[i]) + ' must not be served from cache');
+        assert.strictEqual(out[0].lat, 10);
+    }
+});
+
+test('geocode D3: a future-dated cache entry is treated as expired, not immortal', async function () {
+    /* (now - ts) > ttl is false forever when ts = 9e15, so the entry would never expire. */
+    resetGeoRateLimit();
+    const clock = makeClock(1700000000000);
+    const seed = {};
+    seed[cacheKeyFor('Future')] = JSON.stringify({ lat: 1, lon: 1, ts: 9e15 });
+    const storage = makeStorage(seed);
+    const fetchImpl = makeFetch(function () { return nominatimHit(48.85, 2.35, 'Paris'); });
+
+    const out = await geocodePlaces(['Future'], geoOpts({
+        fetchImpl: fetchImpl, storage: storage, now: clock.now, sleepImpl: clock.sleep
+    }));
+    assert.strictEqual(fetchImpl.calls.length, 1, 'the immortal entry was refetched');
+    assert.strictEqual(out[0].lat, 48.85);
+    assert.strictEqual(out[0].source, 'osm');
+});
+
+test('geocode D3: a small clock skew is tolerated, a large one is not', async function () {
+    const clock = makeClock(1700000000000);
+    const fresh = function (tsOffset) {
+        const seed = {};
+        seed[cacheKeyFor('Skew')] = JSON.stringify({ lat: 2, lon: 2, ts: clock.now() + tsOffset });
+        return makeStorage(seed);
+    };
+
+    resetGeoRateLimit();
+    const tolerated = makeFetch(function () { return nominatimHit(9, 9, 'net'); });
+    const a = await geocodePlaces(['Skew'], geoOpts({
+        fetchImpl: tolerated, storage: fresh(60 * 1000), now: clock.now, sleepImpl: clock.sleep
+    }));
+    assert.strictEqual(tolerated.calls.length, 0, '1 minute of drift still serves the cache');
+    assert.strictEqual(a[0].source, 'cache');
+
+    resetGeoRateLimit();
+    const refused = makeFetch(function () { return nominatimHit(9, 9, 'net'); });
+    const b = await geocodePlaces(['Skew'], geoOpts({
+        fetchImpl: refused, storage: fresh(60 * 60 * 1000), now: clock.now, sleepImpl: clock.sleep
+    }));
+    assert.strictEqual(refused.calls.length, 1, 'an hour in the future is not credible');
+    assert.strictEqual(b[0].source, 'osm');
+});
+
+test('geocode D3: out-of-range network answers are refused too (unchanged behaviour)', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function () { return [{ lat: '9999', lon: '-77777', display_name: 'Nowhere' }]; });
+    const storage = makeStorage();
+    const out = await geocodePlaces(['Bogus'], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+    assert.strictEqual(out[0].resolved, false);
+    assert.strictEqual(out[0].lat, null);
+    assert.strictEqual(storage._data.size, 0, 'nothing invalid was ever written');
 });
 
 test('geocode: corrupt cache entry is ignored, not fatal', async function () {
@@ -425,10 +534,10 @@ test('matrix: total OSRM failure falls back to haversine with the source flag', 
         assert.strictEqual(m.source, 'haversine', label + ': source flag');
         assert.strictEqual(m.osrmCells, 0, label + ': no osrm cells');
         assert.ok(m.km[0][1] > 500 && m.km[0][1] < 800, label + ': Madrid-Barcelona plausible (' + m.km[0][1] + ' km)');
-        /* haversine * 1.25 at 75 km/h */
+        /* haversine * 1.25 at 88 km/h (calibrated — see the D2 fixture test below) */
         const expectedKm = haversineKm(40.4168, -3.7038, 41.3874, 2.1686) * 1.25;
         assert.ok(Math.abs(m.km[0][1] - expectedKm) < 0.02, label + ': road factor applied');
-        assert.ok(Math.abs(m.min[0][1] - (expectedKm / 75) * 60) < 0.2, label + ': 75 km/h applied');
+        assert.ok(Math.abs(m.min[0][1] - (expectedKm / 88) * 60) < 0.2, label + ': 88 km/h applied');
     }
 });
 
@@ -451,29 +560,289 @@ test('matrix: partial null cells are filled per-cell, real values kept', async f
 
     const m = await distanceMatrix([MADRID, BARCELONA, VALENCIA], { fetchImpl: fetchImpl, storage: null });
     assertMatrixInvariants(m, 3, 'partial');
-    assert.strictEqual(m.source, 'osrm', 'real cells were used');
+    /* D1: 2 of 3 cells are real — that is 'mixed', NOT 'osrm'. The engine only warns
+       when the flag admits the guessing, so 'osrm' here would silently hide it. */
+    assert.strictEqual(m.source, 'mixed', 'partial road data must not claim to be osrm');
     assert.strictEqual(m.km[0][1], 620, 'real OSRM value kept');
     assert.strictEqual(m.min[1][2], 210, 'real OSRM value kept');
-    assert.strictEqual(m.osrmCells, 2);
-    assert.strictEqual(m.filledCells, 1, 'exactly the broken cell was filled');
+    assert.strictEqual(m.osrmCells, 4);
+    assert.strictEqual(m.filledCells, 2, 'exactly the broken pair was filled');
 
     const expected = haversineKm(40.4168, -3.7038, 39.4699, -0.3763) * 1.25;
     assert.ok(Math.abs(m.km[0][2] - expected) < 0.02, 'null cell filled from haversine');
     assert.ok(m.min[0][2] > 0);
 });
 
-test('matrix: NaN / negative / string cells are treated as broken and filled', async function () {
+test('matrix: numeric strings are accepted; non-numeric and negative cells are broken and filled', async function () {
+    /* Numeric strings ARE valid JSON numbers in disguise — Number('620000') is exact,
+       so they are consumed as road data. Only genuinely unusable cells are filled. */
+    const good = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, '620000'], ['620000', 0]],
+            durations: [[0, '21600'], ['21600', 0]]
+        };
+    });
+    const accepted = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: good, storage: null });
+    assertMatrixInvariants(accepted, 2, 'numeric strings');
+    assert.strictEqual(accepted.source, 'osrm');
+    assert.strictEqual(accepted.km[0][1], 620);
+    assert.strictEqual(accepted.min[0][1], 360);
+    assert.strictEqual(accepted.filledCells, 0);
+
+    /* Non-numeric text, negatives, NaN, Infinity and objects are not usable. */
+    const poisons = [
+        ['non-numeric text', 'oops'],
+        ['negative', -5],
+        ['NaN', NaN],
+        ['Infinity', Infinity],
+        ['object', { km: 1 }],
+        ['boolean', true]
+    ];
+    for (const [label, poison] of poisons) {
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, poison], [poison, 0]],
+                durations: [[0, poison], [poison, 0]]
+            };
+        });
+        const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null });
+        assertMatrixInvariants(m, 2, 'poison:' + label);
+        assert.strictEqual(m.source, 'haversine', label + ' must not count as road data');
+        assert.strictEqual(m.filledCells, 2, label + ' cell was filled');
+    }
+});
+
+/* ── D1: the source flag describes the whole matrix ── */
+
+test('matrix D1: source flag is osrm only when nothing was guessed', async function () {
+    const allReal = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 620000, 355000], [620000, 0, 350000], [355000, 350000, 0]],
+            durations: [[0, 21600, 12600], [21600, 0, 12000], [12600, 12000, 0]]
+        };
+    });
+    const m = await distanceMatrix([MADRID, BARCELONA, VALENCIA], { fetchImpl: allReal, storage: null });
+    assertMatrixInvariants(m, 3, 'all real');
+    assert.strictEqual(m.source, 'osrm');
+    assert.strictEqual(m.osrmCells, 6);
+    assert.strictEqual(m.filledCells, 0);
+});
+
+test('matrix D1: island repro — 3 of 10 real cells reports mixed, never osrm', async function () {
+    /* The exact reported failure: OSRM cannot route to the Balearics, so every
+       mainland<->island and island<->island pair comes back null. 7 of 10 cells are
+       straight lines across open sea; claiming 'osrm' would suppress the engine warning
+       and present "Palma -> Ibiza 161 km by road" as a driving distance. */
+    const PALMA = place('Palma', 39.5696, 2.6502);
+    const IBIZA = place('Ibiza', 38.9067, 1.4206);
+    const places = [MADRID, BARCELONA, VALENCIA, PALMA, IBIZA];
+    const N = 5;
+
+    const fetchImpl = makeFetch(function () {
+        const dist = [], dur = [];
+        for (let i = 0; i < N; i++) {
+            dist.push([]); dur.push([]);
+            for (let j = 0; j < N; j++) {
+                const island = i >= 3 || j >= 3;
+                if (i === j) { dist[i].push(0); dur[i].push(0); }
+                else if (island) { dist[i].push(null); dur[i].push(null); }
+                else { dist[i].push(400000); dur[i].push(14400); }
+            }
+        }
+        return { code: 'Ok', distances: dist, durations: dur };
+    });
+
+    const m = await distanceMatrix(places, { fetchImpl: fetchImpl, storage: null });
+    assertMatrixInvariants(m, N, 'islands');
+    assert.strictEqual(m.source, 'mixed', 'a 30%-real matrix must report mixed');
+    assert.strictEqual(m.osrmCells, 6, 'the three mainland pairs are real (6 cells)');
+    assert.strictEqual(m.filledCells, 14, 'the seven island pairs are straight-line guesses (14 cells)');
+    assert.ok(m.km[3][4] > 0 && Number.isFinite(m.km[3][4]), 'Palma-Ibiza is still finite');
+});
+
+test('matrix D1: a single good cell in a sea of nulls does not earn the osrm flag', async function () {
     const fetchImpl = makeFetch(function () {
         return {
             code: 'Ok',
-            distances: [[0, 'oops'], ['oops', 0]],
-            durations: [[0, -5], [-5, 0]]
+            distances: [[0, 620000, null], [620000, 0, null], [null, null, 0]],
+            durations: [[0, 21600, null], [21600, 0, null], [null, null, 0]]
+        };
+    });
+    const m = await distanceMatrix([MADRID, BARCELONA, VALENCIA], { fetchImpl: fetchImpl, storage: null });
+    assertMatrixInvariants(m, 3, 'one good cell');
+    assert.strictEqual(m.source, 'mixed');
+    assert.strictEqual(m.osrmCells, 2);
+    assert.strictEqual(m.filledCells, 4);
+});
+
+test('matrix D1: a cell needs BOTH distance and duration to count as road data', async function () {
+    const fetchImpl = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 620000], [620000, 0]],
+            durations: [[0, null], [null, 0]]
         };
     });
     const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null });
-    assertMatrixInvariants(m, 2, 'poison');
+    assertMatrixInvariants(m, 2, 'half a cell');
+    assert.strictEqual(m.km[0][1], 620, 'the real distance is kept');
+    assert.strictEqual(m.source, 'haversine', 'a guessed duration is still a guess');
+    assert.strictEqual(m.osrmCells, 0);
+    assert.strictEqual(m.filledCells, 2);
+});
+
+/* ── D2: fallback speed calibration ── */
+
+/*
+ * Fixtures: published motorway road distances between Spanish city pairs, and the
+ * reference OSRM duration band implied by the live measurement recorded in
+ * docs/ENGINE_CONTRACT.md ("real long-haul average is 87-92 km/h"). The engine enforces
+ * maxDriveMinPerDay on `min`, so a pessimistic fallback speed invents over-cap warnings
+ * and over-splits days. Durations are DERIVED from the road distance and that measured
+ * band — they are not independently measured here (this suite is network-free).
+ */
+const CALIBRATION = [
+    { from: 'Madrid',    to: 'Barcelona', a: [40.4168, -3.7038], b: [41.3874,  2.1686], roadKm: 621 },
+    { from: 'Madrid',    to: 'Sevilla',   a: [40.4168, -3.7038], b: [37.3891, -5.9845], roadKm: 531 },
+    { from: 'Madrid',    to: 'Valencia',  a: [40.4168, -3.7038], b: [39.4699, -0.3763], roadKm: 356 },
+    { from: 'Barcelona', to: 'Valencia',  a: [41.3874,  2.1686], b: [39.4699, -0.3763], roadKm: 350 },
+    { from: 'Madrid',    to: 'Bilbao',    a: [40.4168, -3.7038], b: [43.2630, -2.9350], roadKm: 395 },
+    { from: 'Madrid',    to: 'Malaga',    a: [40.4168, -3.7038], b: [36.7213, -4.4213], roadKm: 530 },
+    { from: 'Barcelona', to: 'Zaragoza',  a: [41.3874,  2.1686], b: [41.6488, -0.8891], roadKm: 314 }
+];
+
+const OSRM_SPEED_LO = 87;   // measured long-haul band, docs/ENGINE_CONTRACT.md
+const OSRM_SPEED_HI = 92;
+
+async function fallbackLeg(fx, speedKmh) {
+    const dead = makeFetch(function () { return new Error('offline'); });
+    const opts = { fetchImpl: dead, storage: null };
+    if (speedKmh) opts.speedKmh = speedKmh;
+    const m = await distanceMatrix([
+        place(fx.from, fx.a[0], fx.a[1]),
+        place(fx.to, fx.b[0], fx.b[1])
+    ], opts);
     assert.strictEqual(m.source, 'haversine');
-    assert.strictEqual(m.filledCells, 1);
+    return { km: m.km[0][1], min: m.min[0][1] };
+}
+
+test('matrix D2: offline fallback distance stays within 10% of real road distance', async function () {
+    let sumSigned = 0;
+    for (const fx of CALIBRATION) {
+        const leg = await fallbackLeg(fx);
+        const errPct = (leg.km - fx.roadKm) / fx.roadKm * 100;
+        sumSigned += errPct;
+        assert.ok(Math.abs(errPct) <= 10,
+            fx.from + '-' + fx.to + ' distance ' + leg.km.toFixed(0) + ' km vs road ' +
+            fx.roadKm + ' km = ' + errPct.toFixed(1) + '% (the 1.25 road factor)');
+    }
+    const meanSigned = sumSigned / CALIBRATION.length;
+    assert.ok(Math.abs(meanSigned) <= 5, 'mean signed distance error ' + meanSigned.toFixed(1) + '% is unbiased');
+});
+
+test('matrix D2: offline fallback duration lands inside the measured 87-92 km/h band', async function () {
+    for (const fx of CALIBRATION) {
+        const leg = await fallbackLeg(fx);
+        const bandFast = fx.roadKm / OSRM_SPEED_HI * 60;   // shortest plausible OSRM duration
+        const bandSlow = fx.roadKm / OSRM_SPEED_LO * 60;   // longest plausible OSRM duration
+        assert.ok(leg.min >= bandFast * 0.90 && leg.min <= bandSlow * 1.10,
+            fx.from + '-' + fx.to + ' fallback ' + leg.min.toFixed(0) + ' min vs OSRM band ' +
+            bandFast.toFixed(0) + '-' + bandSlow.toFixed(0) + ' min (+/-10%)');
+    }
+});
+
+test('matrix D2: 88 km/h roughly halves the error that 75 km/h produced', async function () {
+    /* Regression guard for the recalibration itself: at 75 km/h every fixture was
+       ~20% pessimistic, which is what manufactured false overDriveCap warnings. */
+    let err88 = 0, err75 = 0;
+    for (const fx of CALIBRATION) {
+        const mid = fx.roadKm / ((OSRM_SPEED_LO + OSRM_SPEED_HI) / 2) * 60;
+        const now = await fallbackLeg(fx);
+        const old = await fallbackLeg(fx, 75);
+        err88 += Math.abs(now.min - mid) / mid * 100;
+        err75 += Math.abs(old.min - mid) / mid * 100;
+    }
+    err88 /= CALIBRATION.length;
+    err75 /= CALIBRATION.length;
+    assert.ok(err88 < 8, 'mean duration error at the calibrated speed is ' + err88.toFixed(1) + '%');
+    assert.ok(err75 > 15, 'mean duration error at the old 75 km/h was ' + err75.toFixed(1) + '%');
+    assert.ok(err88 < err75 / 2, 'the recalibration more than halved the error');
+});
+
+/* ── D4: OSRM response dimensions must match the request ── */
+
+test('matrix D4: a table whose dimensions do not match the request is rejected', async function () {
+    const cases = [
+        ['5x5 answer to a 3-place question', function () {
+            const g = [];
+            for (let i = 0; i < 5; i++) {
+                g.push([]);
+                for (let j = 0; j < 5; j++) g[i].push(i === j ? 0 : 100000);
+            }
+            return { code: 'Ok', distances: g, durations: g };
+        }],
+        ['2x2 answer to a 3-place question', function () {
+            return { code: 'Ok', distances: [[0, 1000], [1000, 0]], durations: [[0, 60], [60, 0]] };
+        }],
+        ['ragged rows', function () {
+            return {
+                code: 'Ok',
+                distances: [[0, 1000, 2000], [1000, 0], [2000, 3000, 0]],
+                durations: [[0, 60, 120], [60, 0, 180], [120, 180, 0]]
+            };
+        }],
+        ['rows are not arrays', function () {
+            return { code: 'Ok', distances: [0, 1, 2], durations: [0, 1, 2] };
+        }],
+        ['distances is an object', function () {
+            return { code: 'Ok', distances: { '0': [0, 1, 2] }, durations: [[0, 60, 120], [60, 0, 180], [120, 180, 0]] };
+        }]
+    ];
+
+    for (const [label, handler] of cases) {
+        const fetchImpl = makeFetch(handler);
+        const m = await distanceMatrix([MADRID, BARCELONA, VALENCIA], { fetchImpl: fetchImpl, storage: null });
+        assertMatrixInvariants(m, 3, 'dims:' + label);
+        assert.strictEqual(m.source, 'haversine', label + ' must be rejected, not consumed');
+        assert.strictEqual(m.osrmCells, 0, label);
+        /* And the values are the honest straight-line estimate, not the bogus grid. */
+        const expected = haversineKm(40.4168, -3.7038, 41.3874, 2.1686) * 1.25;
+        assert.ok(Math.abs(m.km[0][1] - expected) < 0.02, label + ': haversine values used');
+    }
+});
+
+test('matrix D4: correct dimensions after unresolved places are excluded', async function () {
+    /* 4 places, 1 unresolved -> OSRM is asked about 3, so a 3x3 answer is correct
+       and a 4x4 answer (matching the input, not the request) must be rejected. */
+    const ghost = place('Atlantis', null, null);
+
+    const right = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 620000, 355000], [620000, 0, 350000], [355000, 350000, 0]],
+            durations: [[0, 21600, 12600], [21600, 0, 12000], [12600, 12000, 0]]
+        };
+    });
+    const ok = await distanceMatrix([MADRID, ghost, BARCELONA, VALENCIA], { fetchImpl: right, storage: null });
+    assertMatrixInvariants(ok, 4, 'ghost 3x3');
+    assert.strictEqual(ok.source, 'mixed');
+    assert.strictEqual(ok.osrmCells, 6, 'the three resolved pairs are real (6 cells)');
+    assert.strictEqual(ok.km[0][2], 620);
+
+    const wrong = makeFetch(function () {
+        const g = [];
+        for (let i = 0; i < 4; i++) {
+            g.push([]);
+            for (let j = 0; j < 4; j++) g[i].push(i === j ? 0 : 100000);
+        }
+        return { code: 'Ok', distances: g, durations: g };
+    });
+    const bad = await distanceMatrix([MADRID, ghost, BARCELONA, VALENCIA], { fetchImpl: wrong, storage: null });
+    assertMatrixInvariants(bad, 4, 'ghost 4x4');
+    assert.strictEqual(bad.source, 'haversine', 'a 4x4 answer to a 3-place request is misaligned');
 });
 
 test('matrix: unresolved places still get finite cells (centroid strategy) and are not sent to OSRM', async function () {
@@ -487,7 +856,9 @@ test('matrix: unresolved places still get finite cells (centroid strategy) and a
 
     const m = await distanceMatrix([MADRID, ghost, BARCELONA], { fetchImpl: fetchImpl, storage: null });
     assertMatrixInvariants(m, 3, 'unresolved');
-    assert.strictEqual(m.source, 'osrm');
+    /* Two of three cells are centroid guesses, so the matrix is 'mixed' — an unresolved
+       place can never leave the matrix flagged as pure road data. */
+    assert.strictEqual(m.source, 'mixed');
     assert.strictEqual(m.km[0][2], 620, 'the resolved pair keeps its road distance');
     assert.ok(Number.isFinite(m.km[0][1]) && m.km[0][1] > 0, 'ghost row is finite and positive');
     assert.ok(Number.isFinite(m.min[1][2]) && m.min[1][2] > 0);
@@ -546,8 +917,66 @@ test('matrix: invariants hold on a larger mixed input (resolved + unresolved, pa
     });
     const m = await distanceMatrix(places, { fetchImpl: fetchImpl, storage: null });
     assertMatrixInvariants(m, 5, 'mixed');
+    assert.strictEqual(m.source, 'mixed');
     assert.ok(m.osrmCells >= 1, 'some real road data survived');
     assert.ok(m.filledCells >= 1, 'the rest was filled');
+});
+
+/* ── Hostile fuzz: the matrix guarantee and the flag law must survive anything ── */
+
+test('matrix: 600 hostile OSRM responses keep every invariant and an honest flag', async function () {
+    /* Deterministic LCG so a failure is reproducible from the seed alone. */
+    let seed = 20260806;
+    const rnd = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const pick = function (arr) { return arr[Math.floor(rnd() * arr.length) % arr.length]; };
+
+    const POISON = [null, undefined, NaN, Infinity, -Infinity, -1, 'x', '', {}, [], true, false, 1e308 * 10];
+    let sawOsrm = 0, sawMixed = 0, sawHaversine = 0;
+
+    for (let iter = 0; iter < 600; iter++) {
+        const n = 2 + Math.floor(rnd() * 5);           // 2..6 places
+        const places = [];
+        for (let i = 0; i < n; i++) {
+            const r = rnd();
+            if (r < 0.15) places.push(place('ghost' + i, null, null));
+            else if (r < 0.2) places.push({ name: 'weird' + i, lat: 9999, lon: -77777, resolved: true });
+            else places.push(place('p' + i, -85 + rnd() * 170, -175 + rnd() * 350));
+        }
+
+        const realCount = places.filter(function (p) {
+            return p.resolved && Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180;
+        }).length;
+
+        const mode = rnd();
+        const fetchImpl = makeFetch(function () {
+            if (mode < 0.1) return new Error('boom');
+            if (mode < 0.2) return jsonResponse({}, 500);
+            if (mode < 0.25) return { code: 'NoTable' };
+            if (mode < 0.3) return null;
+            /* Sometimes answer with the wrong dimensions on purpose. */
+            const dim = mode < 0.4 ? Math.max(1, realCount + (rnd() < 0.5 ? 1 : -1)) : realCount;
+            const dist = [], dur = [];
+            for (let i = 0; i < dim; i++) {
+                dist.push([]); dur.push([]);
+                for (let j = 0; j < dim; j++) {
+                    if (i === j) { dist[i].push(0); dur[i].push(0); continue; }
+                    dist[i].push(rnd() < 0.5 ? Math.floor(rnd() * 900000) : pick(POISON));
+                    dur[i].push(rnd() < 0.5 ? Math.floor(rnd() * 40000) : pick(POISON));
+                }
+            }
+            return { code: 'Ok', distances: dist, durations: dur };
+        });
+
+        const m = await distanceMatrix(places, { fetchImpl: fetchImpl, storage: null });
+        assertMatrixInvariants(m, n, 'fuzz#' + iter);
+        if (m.source === 'osrm') sawOsrm++;
+        else if (m.source === 'mixed') sawMixed++;
+        else sawHaversine++;
+    }
+
+    assert.ok(sawOsrm > 0 && sawMixed > 0 && sawHaversine > 0,
+        'all three source states were exercised (osrm=' + sawOsrm + ', mixed=' + sawMixed +
+        ', haversine=' + sawHaversine + ')');
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -609,6 +1038,55 @@ test('geometry: unresolved places are skipped and thin input needs no request', 
     assert.deepStrictEqual(one, [[40.4168, -3.7038]]);
     assert.strictEqual(one.source, 'straight');
     assert.strictEqual(fetchImpl.calls.length, 0);
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   D5: browser surface — IIFE, no helper leakage, safe to load twice
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const DOCUMENTED_GLOBALS = [
+    'TravioGeo', 'geocodePlaces', 'distanceMatrix', 'routeGeometry', 'decodePolyline',
+    'haversineKm', 'normalisePlaceName', 'clearGeoCache', 'resetGeoRateLimit'
+];
+
+function loadInFakeBrowser(times) {
+    const fs = require('node:fs');
+    const vm = require('node:vm');
+    const src = fs.readFileSync(PROVIDER_PATH, 'utf8');
+    const win = {};
+    const ctx = vm.createContext({ window: win, setTimeout: setTimeout, clearTimeout: clearTimeout });
+    for (let i = 0; i < (times || 1); i++) {
+        vm.runInContext(src, ctx, { filename: 'geo-provider.js' });
+    }
+    return { win: win, ctx: ctx };
+}
+
+test('D5: browser load exposes only the documented API, no geo* helpers', function () {
+    const loaded = loadInFakeBrowser(1);
+    const keys = Object.keys(loaded.win).sort();
+    assert.deepStrictEqual(keys, DOCUMENTED_GLOBALS.slice().sort(),
+        'exactly the documented names are exposed');
+    const leaked = keys.filter(function (k) { return /^geo[A-Z]/.test(k) || /^GEO_/.test(k); });
+    assert.deepStrictEqual(leaked, [], 'no internal helper or constant leaked');
+    assert.strictEqual(typeof loaded.win.TravioGeo.distanceMatrix, 'function', 'namespace object works');
+    assert.strictEqual(loaded.win.TravioGeo.GEO_SPEED_KMH, 88, 'calibrated speed is published');
+});
+
+test('D5: a duplicated <script> tag re-runs without throwing', function () {
+    assert.doesNotThrow(function () { loadInFakeBrowser(3); },
+        'no "Identifier ... has already been declared"');
+    const loaded = loadInFakeBrowser(2);
+    assert.strictEqual(typeof loaded.win.geocodePlaces, 'function', 'still usable after a second load');
+});
+
+test('D5: the browser build degrades to haversine when fetch is absent', async function () {
+    const loaded = loadInFakeBrowser(1);
+    const m = await loaded.win.distanceMatrix(
+        [{ name: 'a', lat: 40, lon: -3, resolved: true }, { name: 'b', lat: 41, lon: 2, resolved: true }],
+        { storage: null }
+    );
+    assert.strictEqual(m.source, 'haversine');
+    assert.ok(Number.isFinite(m.km[0][1]) && m.km[0][1] > 0);
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
