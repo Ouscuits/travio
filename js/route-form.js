@@ -1,157 +1,244 @@
-/* ── Route Form & Claude API ── */
+/* ── Route Form ── compute-then-enrich pipeline ──
+ *
+ * The route is COMPUTED, not narrated:
+ *   1. parse destinations
+ *   2. geocode every place (geo-provider, rate limited — progress is shown)
+ *   3. build the road distance matrix (geo-provider)
+ *   4. planRoute() (route-engine, pure + deterministic) -> the itinerary skeleton
+ *   5. compute costs in JS and render the itinerary
+ *   6. ONLY THEN ask Claude to enrich that fixed skeleton with prose
+ *
+ * The model can never change the order, the days, the distances or the times:
+ * steps 1-5 finish and are already on screen before step 6 is even sent.
+ */
+
 const CLAUDE_PROXY = 'https://sitoclaude-proxy.sito041971.workers.dev';
+const CLAUDE_MODEL = 'claude-opus-5';
+const MAX_DRIVE_MIN_PER_DAY = 360;      // quality bar B6 — 6 h/day cap
 
 let currentRoute = null;
 let isGenerating = false;
 
+/* ── Small helpers ── */
+function itin() {
+    return (typeof window !== 'undefined' && window.TravioItinerary) ? window.TravioItinerary : null;
+}
+function trCtx() {
+    return { t: t, tf: (typeof tf === 'function' ? tf : null) };
+}
+function el(id) { return document.getElementById(id); }
+function numVal(id, def) {
+    const node = el(id);
+    if (!node) return def;
+    const n = Number(node.value);
+    return isFinite(n) && n > 0 ? n : def;
+}
+
 /* ── Initialization ── */
 function initRouteForm() {
-    const advBtn = document.getElementById('advancedToggle');
+    const advBtn = el('advancedToggle');
     if (advBtn) advBtn.onclick = toggleAdvancedOptions;
 
-    const genBtn = document.getElementById('generateBtn');
+    const genBtn = el('generateBtn');
     if (genBtn) genBtn.onclick = generateRoute;
 
-    const clrBtn = document.getElementById('clearBtn');
+    const clrBtn = el('clearBtn');
     if (clrBtn) clrBtn.onclick = clearForm;
 
-    const saveBtn = document.getElementById('saveRouteBtn');
+    const saveBtn = el('saveRouteBtn');
     if (saveBtn) saveBtn.onclick = saveCurrentRoute;
 
-    const durInput = document.getElementById('rfDuration');
+    const durInput = el('rfDuration');
     if (durInput) durInput.addEventListener('change', renderBudgetPerDay);
 
-    const customChk = document.getElementById('rfCustomBudget');
+    const customChk = el('rfCustomBudget');
     if (customChk) customChk.addEventListener('change', renderBudgetPerDay);
 }
 
 /* ── Advanced Options ── */
 function toggleAdvancedOptions() {
-    const panel = document.getElementById('advancedPanel');
-    const icon  = document.getElementById('advancedIcon');
+    const panel = el('advancedPanel');
+    const icon  = el('advancedIcon');
     if (!panel) return;
     const show = panel.style.display === 'none';
     panel.style.display = show ? '' : 'none';
-    if (icon) icon.textContent = show ? '\u25B2' : '\u25BC';
+    if (icon) icon.textContent = show ? '▲' : '▼';
 }
 
-/* ── Budget per day ── */
+/* ── Budget per day (the rfBudgetDay{i} inputs are now actually read) ── */
 function renderBudgetPerDay() {
-    const container = document.getElementById('budgetPerDayContainer');
-    const chk = document.getElementById('rfCustomBudget');
+    const container = el('budgetPerDayContainer');
+    const chk = el('rfCustomBudget');
     if (!container || !chk) return;
     if (!chk.checked) { container.innerHTML = ''; return; }
 
-    const days = parseInt(document.getElementById('rfDuration').value) || 3;
-    const base = parseInt(document.getElementById('rfDailyBudget').value) || 100;
+    const days = parseInt(el('rfDuration').value) || 3;
+    const base = parseInt(el('rfDailyBudget').value) || 100;
+    const previous = readPerDayBudgets(days);
     let html = '';
     for (let i = 1; i <= days; i++) {
+        const value = previous[i - 1] === null ? base : previous[i - 1];
         html += `<div class="budget-day-row">
-            <span>${t('form.day')} ${i}:</span>
-            <input type="number" id="rfBudgetDay${i}" value="${base}" min="10" step="10" class="budget-day-input">
-            <span>EUR</span>
+            <span>${escapeHtml(t('form.day'))} ${i}:</span>
+            <input type="number" id="rfBudgetDay${i}" value="${value}" min="0" step="10" class="budget-day-input">
+            <span class="mono">EUR</span>
         </div>`;
     }
     container.innerHTML = html;
 }
 
+/* Reads rfBudgetDay1..N; null where the input is missing or unusable. */
+function readPerDayBudgets(days) {
+    const out = [];
+    for (let i = 1; i <= days; i++) {
+        const node = el('rfBudgetDay' + i);
+        if (!node) { out.push(null); continue; }
+        const n = Number(node.value);
+        out.push(isFinite(n) && n >= 0 ? n : null);
+    }
+    return out;
+}
+
 /* ── Validation ── */
 function validateForm() {
-    const s = document.getElementById('rfStartPoint').value.trim();
-    const e = document.getElementById('rfEndPoint').value.trim();
-    const d = document.getElementById('rfDestinations').value.trim();
-    const dur = parseInt(document.getElementById('rfDuration').value);
-    const bud = parseInt(document.getElementById('rfDailyBudget').value);
-    return s && e && d && dur > 0 && bud > 0;
+    const s = el('rfStartPoint').value.trim();
+    const e = el('rfEndPoint').value.trim();
+    const d = el('rfDestinations').value.trim();
+    const dur = parseInt(el('rfDuration').value);
+    const bud = parseInt(el('rfDailyBudget').value);
+    return !!(s && e && d && dur > 0 && bud > 0);
 }
 
 /* ── Collect form data ── */
 function collectFormData() {
+    const duration = parseInt(el('rfDuration').value) || 3;
+    const chk = el('rfCustomBudget');
+    const D = (itin() && itin().ITIN_DEFAULTS) || { consumption: 7, fuelPrice: 1.5, lodgingPerNight: 60, mealsPerDay: 35 };
     return {
-        startPoint:      document.getElementById('rfStartPoint').value.trim(),
-        endPoint:        document.getElementById('rfEndPoint').value.trim(),
-        destinations:    document.getElementById('rfDestinations').value.trim(),
-        tripType:        document.getElementById('rfTripType').value,
-        duration:        parseInt(document.getElementById('rfDuration').value) || 3,
-        dailyBudget:     parseInt(document.getElementById('rfDailyBudget').value) || 100,
-        tollPreference:  document.getElementById('rfTolls') ? document.getElementById('rfTolls').value : 'with-tolls',
-        departureTime:   document.getElementById('rfDepartureTime') ? document.getElementById('rfDepartureTime').value : '09:00',
+        startPoint:      el('rfStartPoint').value.trim(),
+        endPoint:        el('rfEndPoint').value.trim(),
+        destinations:    el('rfDestinations').value.trim(),
+        tripType:        el('rfTripType').value,
+        duration:        duration,
+        dailyBudget:     parseInt(el('rfDailyBudget').value) || 100,
+        budgets:         (chk && chk.checked) ? readPerDayBudgets(duration) : [],
+        customBudget:    !!(chk && chk.checked),
+        tollPreference:  el('rfTolls') ? el('rfTolls').value : 'with-tolls',
+        departureTime:   el('rfDepartureTime') ? el('rfDepartureTime').value : '09:00',
+        consumption:     numVal('rfConsumption', D.consumption),
+        fuelPrice:       numVal('rfFuelPrice', D.fuelPrice),
+        lodgingPerNight: numVal('rfLodging', D.lodgingPerNight),
+        mealsPerDay:     numVal('rfMeals', D.mealsPerDay),
         language:        currentLang
     };
 }
 
-/* ── Build prompt for Claude ── */
-function buildPrompt(fd) {
+/* ── Enrichment prompt — describes the FIXED skeleton and asks for strict JSON ── */
+function buildEnrichmentPrompt(fd, plan) {
+    const I = itin();
     const langName = { es: 'Spanish', en: 'English', ca: 'Catalan', fr: 'French', zh: 'Simplified Chinese' }[fd.language] || 'English';
-    const tripLabel = t('tripTypeLabel.' + fd.tripType) || fd.tripType;
-    const tollText  = fd.tollPreference === 'with-tolls'
-        ? 'Use toll highways (faster)'
-        : 'Avoid tolls (more economical/scenic)';
+    const tripLabel = { familiar: 'family', pareja: 'couple', aventura: 'adventure', moto: 'motorcycle' }[fd.tripType] || fd.tripType;
+    const tollText = fd.tollPreference === 'with-tolls'
+        ? 'The traveller accepts toll motorways.'
+        : 'The traveller avoids tolls, so tollsEur must be 0 for every day.';
 
-    const suggestions = {
-        familiar: '   - Family-friendly restaurants\n   - Parks and attractions for children\n   - Hotels with family facilities',
-        pareja:   '   - Romantic restaurants\n   - Viewpoints and special places\n   - Boutique or charming hotels',
-        aventura: '   - Hiking trails\n   - Outdoor activities\n   - Camping or budget hostels',
-        moto:     '   - Scenic roads and mountain passes\n   - Technical stops for motorcycles\n   - Biker-friendly hostels\n   - Routes with interesting curves'
-    };
+    const lines = [];
+    for (let i = 0; i < plan.days.length; i++) {
+        const d = plan.days[i];
+        const from = (d.startPlace && d.startPlace.name) || '?';
+        const to = (d.endPlace && d.endPlace.name) || '?';
+        if (!d.legs || d.legs.length === 0) {
+            lines.push('DAY ' + d.day + ': rest / exploration day at ' + to + ' — no driving.');
+            continue;
+        }
+        const stops = d.stops.map(function (s) { return s && s.name; }).filter(Boolean).join(', ');
+        lines.push('DAY ' + d.day + ': ' + from + ' -> ' + to +
+            ' | ' + Math.round(d.km) + ' km | ' + Math.round(d.driveMin) + ' min driving' +
+            (d.startTime ? ' | departs ' + d.startTime + ', arrives ' + d.endTime : '') +
+            '\n  stops today: ' + (stops || to) + '\n  overnight: ' + to);
+    }
 
-    return `You are an expert travel planner. I need you to help me plan an optimized route with the following details.
-
-IMPORTANT: Please respond entirely in ${langName}.
-
-**TRAVEL INFORMATION:**
-- Starting point: ${fd.startPoint}
-- End point: ${fd.endPoint}
-- Destinations to visit: ${fd.destinations}
-- Trip type: ${tripLabel}
-- Duration: ${fd.duration} days
-- Daily budget: EUR${fd.dailyBudget}
-- Toll preference: ${tollText}
-- Departure time: ${fd.departureTime}
-
-**WHAT I NEED:**
-
-1. **OPTIMIZED ROUTE**: Order the destinations logically to minimize distance and time. Consider toll preference.
-
-2. **DETAILED DAILY ITINERARY**: For each day of the trip, provide:
-   - Destinations to visit that day
-   - Approximate distance in km
-   - Estimated driving time
-   - Estimated arrival time at each point
-   - If there are tolls, mention them and estimate the approximate cost
-
-3. **COST BREAKDOWN**: For each day, estimate:
-   - Fuel (assume average consumption of 7L/100km and EUR1.50/liter)
-   - Tolls (if applicable)
-   - Suggested accommodation within budget
-   - Meals (breakfast, lunch, dinner)
-   - Total for the day vs available budget
-   - ALERT if budget is exceeded
-
-4. **PERSONALIZED SUGGESTIONS** according to trip type:
-${suggestions[fd.tripType] || suggestions.familiar}
-
-5. **INTERMEDIATE STOPS**: Suggest beautiful towns or rest areas along the way.
-
-6. **FINAL SUMMARY**:
-   - Total kilometers
-   - Total driving time
-   - Estimated total trip cost
-   - Comparison with total available budget
-
-Please structure the response clearly and professionally.`;
+    return 'You are a local travel expert. The itinerary below has ALREADY been computed from real road data. ' +
+        'It is FIXED: do not reorder it, do not add or remove stops or days, do not restate or change any distance or time.\n\n' +
+        'Trip type: ' + tripLabel + '. Daily budget: EUR ' + fd.dailyBudget + '. ' + tollText + '\n' +
+        'Write every piece of text in ' + langName + '.\n\n' +
+        lines.join('\n') + '\n\n' +
+        'For EACH of the ' + plan.days.length + ' days give: 2-4 activities suited to the trip type and to the places listed, ' +
+        'breakfast / lunch / dinner ideas, one lodging suggestion that fits the daily budget, one short local tip, ' +
+        'and "tollsEur" = your estimate of the motorway tolls for that day\'s driving, in euros (0 if none).\n\n' +
+        'Respond with a single JSON object and nothing else: no prose, no explanation, no markdown fences. Shape:\n' +
+        '{"days":[{"day":1,"activities":["...","..."],"meals":{"breakfast":"...","lunch":"...","dinner":"..."},' +
+        '"lodging":"...","tip":"...","tollsEur":0}]}';
 }
 
-/* ── Generate route via Claude API ── */
+const ENRICH_SCHEMA = {
+    type: 'object',
+    properties: {
+        days: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    day: { type: 'integer' },
+                    activities: { type: 'array', items: { type: 'string' } },
+                    meals: {
+                        type: 'object',
+                        properties: {
+                            breakfast: { type: 'string' },
+                            lunch: { type: 'string' },
+                            dinner: { type: 'string' }
+                        },
+                        required: ['breakfast', 'lunch', 'dinner'],
+                        additionalProperties: false
+                    },
+                    lodging: { type: 'string' },
+                    tip: { type: 'string' },
+                    tollsEur: { type: 'number' }
+                },
+                required: ['day', 'activities', 'meals', 'lodging', 'tip', 'tollsEur'],
+                additionalProperties: false
+            }
+        }
+    },
+    required: ['days'],
+    additionalProperties: false
+};
+
+async function callClaude(prompt) {
+    const resp = await fetch(CLAUDE_PROXY, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model: CLAUDE_MODEL,
+            max_tokens: 8000,
+            output_config: { effort: 'low', format: { type: 'json_schema', schema: ENRICH_SCHEMA } },
+            messages: [{ role: 'user', content: prompt }]
+        })
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    let text = '';
+    if (data && Array.isArray(data.content)) {
+        for (let i = 0; i < data.content.length; i++) {
+            if (data.content[i] && data.content[i].type === 'text') text += data.content[i].text;
+        }
+    }
+    if (!text) throw new Error('empty-response');
+    return text;
+}
+
+/* ── The pipeline ── */
 async function generateRoute() {
-    if (!validateForm()) {
-        showFormMsg(t('form.required'), 'err');
+    if (!validateForm()) { showFormMsg(t('form.required'), 'err'); return; }
+    if (isGenerating) return;
+    const I = itin();
+    if (!I || typeof window.planRoute !== 'function' || typeof window.geocodePlaces !== 'function') {
+        showRouteError(t('result.error'));
         return;
     }
-    if (isGenerating) return;
-    isGenerating = true;
 
-    const genBtn = document.getElementById('generateBtn');
+    isGenerating = true;
+    const genBtn = el('generateBtn');
     genBtn.disabled = true;
     genBtn.textContent = t('form.generating');
     showLoadingState();
@@ -159,28 +246,78 @@ async function generateRoute() {
     const fd = collectFormData();
 
     try {
-        const resp = await fetch(CLAUDE_PROXY, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
-                max_tokens: 4096,
-                messages: [{ role: 'user', content: buildPrompt(fd) }]
-            })
+        /* 1 — destinations */
+        const stopNames = I.parseDestinations(fd.destinations);
+        const names = [fd.startPoint].concat(stopNames, [fd.endPoint]);
+
+        /* 2 — geocoding, one name at a time so the progress bar is honest.
+               geo-provider serialises and rate-limits every request globally. */
+        const geoOpts = { language: currentLang };
+        const places = [];
+        for (let i = 0; i < names.length; i++) {
+            setProgress((i / (names.length + 2)) * 100, t('progress.geocoding'),
+                tf('progress.geocodingItem', { done: i + 1, total: names.length, name: names[i] }));
+            const one = await geocodePlaces([names[i]], geoOpts);
+            places.push(one && one[0] ? one[0] : { name: names[i], lat: null, lon: null, resolved: false, source: 'osm' });
+        }
+
+        /* 3 — road distance matrix */
+        setProgress((names.length / (names.length + 2)) * 100, t('progress.matrix'), '');
+        const matrix = await distanceMatrix(places, geoOpts);
+
+        /* 4 — the deterministic skeleton: THIS is the route */
+        setProgress(((names.length + 1) / (names.length + 2)) * 100, t('progress.planning'), '');
+        const plan = planRoute({
+            start: places[0],
+            end: places[places.length - 1],
+            stops: places.slice(1, places.length - 1),
+            matrix: matrix,
+            days: fd.duration,
+            departureTime: fd.departureTime,
+            maxDriveMinPerDay: MAX_DRIVE_MIN_PER_DAY
         });
 
-        if (!resp.ok) throw new Error('Error ' + resp.status);
+        /* 5 — costs + render, with no model involvement whatsoever */
+        const viewArgs = {
+            plan: plan,
+            requestedStops: stopNames,
+            startName: fd.startPoint,
+            endName: fd.endPoint,
+            places: places,
+            matrixSource: matrix.source,
+            maxDriveMin: MAX_DRIVE_MIN_PER_DAY,
+            tripType: fd.tripType,
+            departureTime: fd.departureTime,
+            dailyBudget: fd.dailyBudget,
+            budgets: fd.budgets,
+            consumption: fd.consumption,
+            fuelPrice: fd.fuelPrice,
+            lodgingPerNight: fd.lodgingPerNight,
+            mealsPerDay: fd.mealsPerDay,
+            tollsEnabled: fd.tollPreference === 'with-tolls',
+            tollPreference: fd.tollPreference,
+            t: t, tf: tf
+        };
+        const baseView = I.buildItineraryView(viewArgs);
+        currentRoute = makeRoute(fd, baseView);
+        setProgress(100, t('progress.done'), '');
+        displayRoute(currentRoute);
 
-        const data = await resp.json();
-        let result = '';
-        if (data.content) {
-            for (const block of data.content) {
-                if (block.type === 'text') result += block.text + '\n';
-            }
+        /* 6 — enrichment. Failure here changes nothing about the itinerary. */
+        setEnrichBusy(true);
+        let enrichment = null;
+        try {
+            const raw = await callClaude(buildEnrichmentPrompt(fd, plan));
+            enrichment = I.parseEnrichment(raw, plan.days.length);
+        } catch (e) {
+            console.warn('Enrichment unavailable:', e);
+            enrichment = I.parseEnrichment(null, plan.days.length);
+            enrichment.error = 'unavailable';
         }
-        if (!result) throw new Error('Empty response');
-
-        currentRoute = { formData: fd, result: result, language: currentLang };
+        viewArgs.enrichment = enrichment;
+        const finalView = I.buildItineraryView(viewArgs);
+        currentRoute = makeRoute(fd, finalView);
+        setEnrichBusy(false);
         displayRoute(currentRoute);
 
     } catch (e) {
@@ -194,83 +331,137 @@ async function generateRoute() {
     }
 }
 
-/* ── Display route result ── */
+function makeRoute(fd, view) {
+    const I = itin();
+    return {
+        formData: fd,
+        view: view,
+        structured: I.serialiseView(view),
+        result: I.buildPlainSummary(view, trCtx()),
+        language: currentLang
+    };
+}
+
+/* ── Display ── */
 function displayRoute(route) {
-    const empty   = document.getElementById('resultEmpty');
-    const loading = document.getElementById('resultLoading');
-    const content = document.getElementById('resultContent');
-    const saveBtn = document.getElementById('saveRouteBtn');
+    const empty   = el('resultEmpty');
+    const loading = el('resultLoading');
+    const content = el('resultContent');
+    const saveBtn = el('saveRouteBtn');
+    const errDiv  = el('resultError');
 
     if (empty)   empty.style.display = 'none';
     if (loading) loading.style.display = 'none';
-    if (content) {
-        content.style.display = '';
-        // Route header
-        document.getElementById('resultHeader').innerHTML =
-            `<strong>${t('result.route')}:</strong> ${escapeHtml(route.formData.startPoint)} &rarr; ${escapeHtml(route.formData.endPoint)}` +
-            `<br><span class="result-meta">${route.formData.duration} ${t('result.days')} &bull; ${escapeHtml(t('form.' + route.formData.tripType) || route.formData.tripType)} &bull; ${t('result.budget')}: EUR${route.formData.dailyBudget}/${t('result.days')}</span>`;
-        // Route body — preserve whitespace for formatted AI response
-        document.getElementById('resultBody').textContent = route.result;
+    if (errDiv)  errDiv.style.display = 'none';
+    if (!content) return;
+    content.style.display = '';
+
+    const fdta = route.formData || {};
+    const days = (route.view && route.view.plan && route.view.plan.days.length) || fdta.duration || 0;
+    const header = el('resultHeader');
+    if (header) {
+        header.innerHTML =
+            `<strong>${escapeHtml(t('result.route'))}:</strong> ${escapeHtml(fdta.startPoint || '')} &rarr; ${escapeHtml(fdta.endPoint || '')}` +
+            `<br><span class="result-meta">${days} ${escapeHtml(t('result.days'))} &bull; ` +
+            `${escapeHtml(t('tripTypeLabel.' + fdta.tripType) || fdta.tripType || '')} &bull; ` +
+            `${escapeHtml(t('result.budget'))}: EUR ${escapeHtml(String(fdta.dailyBudget || 0))}/${escapeHtml(t('form.day')).toLowerCase()}</span>`;
     }
+
+    const structuredEl = el('resultItinerary');
+    const bodyEl = el('resultBody');
+    const I = itin();
+    if (route.view && I) {
+        if (structuredEl) {
+            structuredEl.innerHTML = I.renderItineraryHtml(route.view, trCtx());
+            structuredEl.style.display = '';
+        }
+        if (bodyEl) { bodyEl.textContent = ''; bodyEl.style.display = 'none'; }
+    } else {
+        /* Legacy plain-text route (saved before the routing engine existed). */
+        if (structuredEl) { structuredEl.innerHTML = ''; structuredEl.style.display = 'none'; }
+        if (bodyEl) { bodyEl.textContent = route.result || ''; bodyEl.style.display = ''; }
+    }
+
     if (saveBtn) saveBtn.style.display = '';
 }
 
+/* ── Progress / loading ── */
 function showLoadingState() {
-    const empty   = document.getElementById('resultEmpty');
-    const loading = document.getElementById('resultLoading');
-    const content = document.getElementById('resultContent');
+    const empty   = el('resultEmpty');
+    const loading = el('resultLoading');
+    const content = el('resultContent');
     if (empty)   empty.style.display = 'none';
     if (content) content.style.display = 'none';
     if (loading) loading.style.display = '';
+    setProgress(0, t('progress.geocoding'), '');
+    const note = el('progressNote');
+    if (note) note.textContent = t('progress.ratePolicy');
 }
 
 function hideLoadingState() {
-    const loading = document.getElementById('resultLoading');
+    const loading = el('resultLoading');
     if (loading) loading.style.display = 'none';
 }
 
+function setProgress(pct, title, detail) {
+    const bar = el('progressBar');
+    if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    const step = el('progressStep');
+    if (step) step.textContent = title || '';
+    const det = el('progressDetail');
+    if (det) det.textContent = detail || '';
+}
+
+function setEnrichBusy(busy) {
+    const banner = el('enrichStatus');
+    if (!banner) return;
+    banner.style.display = busy ? '' : 'none';
+    if (busy) banner.textContent = t('progress.enriching');
+}
+
 function showRouteError(msg) {
-    const content = document.getElementById('resultContent');
-    const empty   = document.getElementById('resultEmpty');
+    const content = el('resultContent');
+    const empty   = el('resultEmpty');
+    const loading = el('resultLoading');
     if (content) content.style.display = 'none';
     if (empty)   empty.style.display = 'none';
-    const loading = document.getElementById('resultLoading');
     if (loading) loading.style.display = 'none';
 
-    const errDiv = document.getElementById('resultError');
+    const errDiv = el('resultError');
     if (errDiv) {
         errDiv.style.display = '';
         errDiv.textContent = msg;
-        setTimeout(() => { errDiv.style.display = 'none'; }, 8000);
     }
 }
 
 function showFormMsg(msg, type) {
-    const el = document.getElementById('formMsg');
-    if (!el) return;
-    el.textContent = msg;
-    el.className = 'form-msg ' + type;
-    el.style.display = '';
-    setTimeout(() => { el.style.display = 'none'; }, 4000);
+    const node = el('formMsg');
+    if (!node) return;
+    node.textContent = msg;
+    node.className = 'form-msg ' + type;
+    node.style.display = '';
+    setTimeout(function () { node.style.display = 'none'; }, 4000);
 }
 
 /* ── Save route to Firestore ── */
 async function saveCurrentRoute() {
     if (!currentRoute || !currentUser) return;
-    const btn = document.getElementById('saveRouteBtn');
+    const btn = el('saveRouteBtn');
     btn.disabled = true;
     try {
+        const fd = currentRoute.formData || {};
         await fsSaveRoute({
-            startPoint:     currentRoute.formData.startPoint,
-            endPoint:       currentRoute.formData.endPoint,
-            destinations:   currentRoute.formData.destinations,
-            tripType:       currentRoute.formData.tripType,
-            duration:       currentRoute.formData.duration,
-            dailyBudget:    currentRoute.formData.dailyBudget,
-            tollPreference: currentRoute.formData.tollPreference,
-            departureTime:  currentRoute.formData.departureTime,
-            result:         currentRoute.result,
-            language:       currentRoute.language
+            startPoint:     fd.startPoint || '',
+            endPoint:       fd.endPoint || '',
+            destinations:   fd.destinations || '',
+            tripType:       fd.tripType || 'familiar',
+            duration:       fd.duration || 0,
+            dailyBudget:    fd.dailyBudget || 0,
+            tollPreference: fd.tollPreference || 'with-tolls',
+            departureTime:  fd.departureTime || '09:00',
+            result:         currentRoute.result || '',
+            structured:     currentRoute.structured || null,
+            language:       currentRoute.language || currentLang
         });
         showFormMsg(t('result.routeSaved'), 'ok');
     } catch (e) {
@@ -283,51 +474,53 @@ async function saveCurrentRoute() {
 
 /* ── Clear form ── */
 function clearForm() {
-    document.getElementById('rfStartPoint').value = '';
-    document.getElementById('rfEndPoint').value = '';
-    document.getElementById('rfDestinations').value = '';
-    document.getElementById('rfTripType').value = 'familiar';
-    document.getElementById('rfDuration').value = '3';
-    document.getElementById('rfDailyBudget').value = '100';
-    const tolls = document.getElementById('rfTolls');
+    el('rfStartPoint').value = '';
+    el('rfEndPoint').value = '';
+    el('rfDestinations').value = '';
+    el('rfTripType').value = 'familiar';
+    el('rfDuration').value = '3';
+    el('rfDailyBudget').value = '100';
+    const tolls = el('rfTolls');
     if (tolls) tolls.value = 'with-tolls';
-    const time = document.getElementById('rfDepartureTime');
+    const time = el('rfDepartureTime');
     if (time) time.value = '09:00';
-    const chk = document.getElementById('rfCustomBudget');
+    const chk = el('rfCustomBudget');
     if (chk) { chk.checked = false; renderBudgetPerDay(); }
 
     currentRoute = null;
-    document.getElementById('resultEmpty').style.display = '';
-    document.getElementById('resultContent').style.display = 'none';
-    document.getElementById('resultLoading').style.display = 'none';
-    const saveBtn = document.getElementById('saveRouteBtn');
+    el('resultEmpty').style.display = '';
+    el('resultContent').style.display = 'none';
+    el('resultLoading').style.display = 'none';
+    const structuredEl = el('resultItinerary');
+    if (structuredEl) structuredEl.innerHTML = '';
+    const saveBtn = el('saveRouteBtn');
     if (saveBtn) saveBtn.style.display = 'none';
-    const errDiv = document.getElementById('resultError');
+    const errDiv = el('resultError');
     if (errDiv) errDiv.style.display = 'none';
 }
 
-/* ── Load saved routes list ── */
+/* ── Saved routes ── */
 async function loadSavedRoutesList() {
     if (!currentUser) return;
-    const container = document.getElementById('savedRoutesList');
+    const container = el('savedRoutesList');
     if (!container) return;
 
     try {
         const routes = await fsGetUserRoutes(currentUser.uid);
         if (routes.length === 0) {
-            container.innerHTML = `<p class="empty-text" data-i18n="routes.noRoutes">${t('routes.noRoutes')}</p>`;
+            container.innerHTML = `<p class="empty-text" data-i18n="routes.noRoutes">${escapeHtml(t('routes.noRoutes'))}</p>`;
             return;
         }
-        container.innerHTML = routes.map(r => {
+        container.innerHTML = routes.map(function (r) {
             const date = r.createdAt && r.createdAt.toDate ? r.createdAt.toDate().toLocaleDateString() : '';
             return `<div class="route-card">
                 <div class="route-card-info">
                     <strong>${escapeHtml(r.startPoint)} &rarr; ${escapeHtml(r.endPoint)}</strong>
-                    <span class="route-card-meta">${r.duration} ${t('result.days')} &bull; ${date}</span>
+                    <span class="route-card-meta">${r.duration} ${escapeHtml(t('result.days'))} &bull; ${escapeHtml(date)}</span>
                 </div>
                 <div class="route-card-actions">
-                    <button class="btn btn-sm btn-outline" onclick="viewSavedRoute('${r.id}')">${t('routes.load')}</button>
-                    <button class="btn btn-sm btn-ghost" onclick="deleteSavedRoute('${r.id}')">${t('routes.delete')}</button>
+                    <button class="btn btn-sm btn-outline" onclick="viewSavedRoute('${r.id}')">${escapeHtml(t('routes.load'))}</button>
+                    <button class="btn btn-sm btn-ghost" onclick="deleteSavedRoute('${r.id}')">${escapeHtml(t('routes.delete'))}</button>
                 </div>
             </div>`;
         }).join('');
@@ -342,19 +535,23 @@ async function viewSavedRoute(routeId) {
         const doc = await db.collection('routes').doc(routeId).get();
         if (!doc.exists) return;
         const r = doc.data();
-        currentRoute = { formData: r, result: r.result, language: r.language };
+        const I = itin();
+        /* New saves carry a structured plan; older ones only have the plain text. */
+        const view = (I && I.isStructuredRoute(r)) ? I.viewFromSaved(r) : null;
+        currentRoute = { formData: r, view: view, structured: r.structured || null, result: r.result || '', language: r.language };
 
-        // Fill form
-        document.getElementById('rfStartPoint').value   = r.startPoint || '';
-        document.getElementById('rfEndPoint').value     = r.endPoint || '';
-        document.getElementById('rfDestinations').value = r.destinations || '';
-        document.getElementById('rfTripType').value     = r.tripType || 'familiar';
-        document.getElementById('rfDuration').value     = r.duration || 3;
-        document.getElementById('rfDailyBudget').value  = r.dailyBudget || 100;
+        el('rfStartPoint').value   = r.startPoint || '';
+        el('rfEndPoint').value     = r.endPoint || '';
+        el('rfDestinations').value = r.destinations || '';
+        el('rfTripType').value     = r.tripType || 'familiar';
+        el('rfDuration').value     = r.duration || 3;
+        el('rfDailyBudget').value  = r.dailyBudget || 100;
+        if (el('rfTolls') && r.tollPreference) el('rfTolls').value = r.tollPreference;
+        if (el('rfDepartureTime') && r.departureTime) el('rfDepartureTime').value = r.departureTime;
 
-        displayRoute(currentRoute);
         showView('userHomeView');
         applyTranslations();
+        displayRoute(currentRoute);
     } catch (e) {
         console.error('View route error:', e);
     }

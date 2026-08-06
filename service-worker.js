@@ -1,5 +1,5 @@
 // Service Worker for Travio PWA
-const CACHE_NAME = 'travio-v2';
+const CACHE_NAME = 'travio-v3';
 const urlsToCache = [
     './',
     'index.html',
@@ -11,6 +11,9 @@ const urlsToCache = [
     'js/firebase-config.js',
     'js/i18n.js',
     'js/firestore.js',
+    'js/route-engine.js',
+    'js/geo-provider.js',
+    'js/itinerary-render.js',
     'js/route-form.js',
     'js/auth.js',
     'icon-192.png'

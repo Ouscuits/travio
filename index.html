@@ -158,6 +158,80 @@ input,select,textarea{font-size:16px!important}
 .result-body{white-space:pre-wrap;font-size:14px;line-height:1.7;color:var(--dark)}
 .result-error{background:var(--red-light);color:var(--red);padding:12px;border-radius:var(--radius);display:none}
 
+/* ── Progress ── */
+.progress-step{font-weight:600;color:var(--dark);font-size:14px}
+.progress-track{height:6px;background:var(--border-light);border-radius:3px;overflow:hidden;margin:12px auto 8px;max-width:320px}
+.progress-bar{height:100%;width:0;background:var(--primary);transition:width .25s ease}
+.progress-detail{font-size:12px;color:var(--label);min-height:16px;word-break:break-word}
+.progress-note{font-size:11px;color:var(--mid);margin-top:10px;max-width:340px;margin-left:auto;margin-right:auto}
+
+/* ── Itinerary ── */
+.notice-list{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.notice{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-radius:var(--radius);font-size:13px;line-height:1.45}
+.notice-info{background:var(--primary-light);color:var(--primary-darker)}
+.notice-warn{background:var(--yellow-light);color:#8a5a00}
+.notice-icon{flex:0 0 auto}
+.notice-text{flex:1 1 auto}
+
+.summary-card{background:var(--green-light);border:1px solid rgba(16,185,129,.35);border-radius:8px;padding:14px 16px;margin-bottom:16px}
+.summary-card.summary-over{background:var(--red-light);border-color:rgba(239,68,68,.35)}
+.summary-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:10px}
+.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+@media(max-width:640px){.summary-grid{grid-template-columns:repeat(2,1fr)}}
+.summary-cell{display:flex;flex-direction:column;gap:2px}
+.summary-value{font-size:16px;font-weight:700;color:var(--dark)}
+.summary-label{font-size:11px;color:var(--label);text-transform:uppercase;letter-spacing:.3px}
+.summary-flag{margin-top:10px;font-size:13px;font-weight:600}
+.summary-source{margin-top:6px;font-size:11px;color:var(--mid)}
+.flag-ok{color:var(--green)}
+.flag-over{color:var(--red)}
+
+.day-list{display:flex;flex-direction:column;gap:12px}
+.day-card{background:var(--surface);border:1px solid var(--border-light);border-left:4px solid var(--primary);border-radius:var(--radius);padding:14px 16px}
+.day-card.day-over{border-left-color:var(--red)}
+.day-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px}
+.day-num{background:var(--primary);color:#fff;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700}
+.day-route{font-weight:700;font-size:15px}
+.day-badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px}
+.badge-warn{background:var(--yellow-light);color:#8a5a00}
+.badge-rest{background:var(--primary-light);color:var(--primary-darker)}
+.day-stats{display:flex;flex-wrap:wrap;gap:18px;padding:8px 0 10px;border-bottom:1px dashed var(--border-light);margin-bottom:10px}
+.stat{display:flex;flex-direction:column}
+.stat-value{font-size:14px;font-weight:700;color:var(--dark)}
+.stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.3px;color:var(--label)}
+.leg-list{list-style:none;margin:0 0 10px;padding:0}
+.leg{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;padding:6px 0 6px 14px;position:relative;font-size:13px;border-bottom:1px solid var(--border-light)}
+.leg:last-child{border-bottom:none}
+.leg::before{content:"";position:absolute;left:2px;top:13px;width:6px;height:6px;border-radius:50%;background:var(--primary)}
+.leg-name{font-weight:600}
+.leg-meta{color:var(--label);font-size:12px}
+.day-overnight{font-size:12px;color:var(--primary-darker);margin-bottom:10px}
+.day-rest-text{font-size:13px;color:var(--label);margin-bottom:10px}
+
+.day-enrich{background:var(--bg);border-radius:var(--radius);padding:10px 12px;margin-bottom:10px}
+.enrich-group{margin-bottom:8px}
+.enrich-group:last-child{margin-bottom:0}
+.enrich-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;color:var(--primary-darker);margin-bottom:4px}
+.enrich-list{margin:0;padding-left:18px;font-size:13px;line-height:1.55}
+.enrich-text{font-size:13px;line-height:1.55}
+.enrich-tip{display:flex;gap:8px;font-size:13px;line-height:1.5;background:var(--yellow-light);border-radius:var(--radius);padding:8px 10px;margin-top:8px}
+.enrich-status{background:var(--primary-light);color:var(--primary-darker);font-size:12px;padding:6px 10px;border-radius:var(--radius);margin-bottom:12px}
+
+.day-cost{border-top:1px dashed var(--border-light);padding-top:8px}
+.cost-table{width:100%;border-collapse:collapse;font-size:13px}
+.cost-table td{padding:3px 0}
+.cost-table td:last-child{text-align:right}
+.cost-table .cost-total td{font-weight:700;border-top:1px solid var(--border-light);padding-top:6px}
+.cost-table .cost-budget td{color:var(--label)}
+.est-flag{font-size:10px;color:var(--mid)}
+.cost-flag{margin-top:6px;font-size:12px;font-weight:600;text-align:right}
+.rates-note{margin-top:12px;font-size:11px;color:var(--mid);text-align:center}
+
+/* ── Cost assumptions (advanced panel) ── */
+.cost-assumptions{border-top:1px solid var(--border-light);margin-top:8px;padding-top:10px}
+.cost-assumptions-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:8px}
+.cost-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
+
 /* ── Saved Routes ── */
 .route-card{
     display:flex;align-items:center;justify-content:space-between;
@@ -338,6 +412,28 @@ input,select,textarea{font-size:16px!important}
                             <label>&#x1F552; <span data-i18n="form.departureTime">Departure time</span></label>
                             <input type="time" id="rfDepartureTime" value="09:00">
                         </div>
+
+                        <div class="cost-assumptions">
+                            <div class="cost-assumptions-title" data-i18n="form.costAssumptions">Cost assumptions</div>
+                            <div class="cost-grid">
+                                <div class="form-group">
+                                    <label data-i18n="form.consumption">Fuel consumption (L/100 km)</label>
+                                    <input type="number" id="rfConsumption" value="7" min="1" max="40" step="0.1">
+                                </div>
+                                <div class="form-group">
+                                    <label data-i18n="form.fuelPrice">Fuel price (EUR/L)</label>
+                                    <input type="number" id="rfFuelPrice" value="1.50" min="0.1" max="10" step="0.01">
+                                </div>
+                                <div class="form-group">
+                                    <label data-i18n="form.lodgingPerNight">Lodging per night (EUR)</label>
+                                    <input type="number" id="rfLodging" value="60" min="0" step="5">
+                                </div>
+                                <div class="form-group">
+                                    <label data-i18n="form.mealsPerDay">Meals per day (EUR)</label>
+                                    <input type="number" id="rfMeals" value="35" min="0" step="5">
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Actions -->
@@ -363,17 +459,21 @@ input,select,textarea{font-size:16px!important}
                         <p data-i18n="result.emptyState">Fill out the form and generate your route to see results here</p>
                     </div>
 
-                    <!-- Loading State -->
+                    <!-- Loading State (real progress: geocode -> matrix -> plan) -->
                     <div id="resultLoading" class="result-loading" style="display:none">
                         <div class="loading-spinner"></div>
-                        <p style="font-weight:600;color:var(--dark)" data-i18n="result.analyzing">Analyzing the best route...</p>
-                        <p style="font-size:12px;color:var(--mid);margin-top:4px" data-i18n="result.waitTime">This may take 15-30 seconds</p>
+                        <p id="progressStep" class="progress-step"></p>
+                        <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+                        <p id="progressDetail" class="progress-detail mono"></p>
+                        <p id="progressNote" class="progress-note"></p>
                     </div>
 
                     <!-- Result Content -->
                     <div id="resultContent" style="display:none">
                         <div class="result-header" id="resultHeader"></div>
-                        <div class="result-body" id="resultBody"></div>
+                        <div class="enrich-status" id="enrichStatus" style="display:none"></div>
+                        <div id="resultItinerary"></div>
+                        <div class="result-body" id="resultBody" style="display:none"></div>
                     </div>
 
                     <!-- Error -->
@@ -496,6 +596,9 @@ input,select,textarea{font-size:16px!important}
 <script src="js/firebase-config.js"></script>
 <script src="js/i18n.js"></script>
 <script src="js/firestore.js"></script>
+<script src="js/route-engine.js"></script><!-- pure planner -->
+<script src="js/geo-provider.js"></script><!-- geocoding + road distances -->
+<script src="js/itinerary-render.js"></script><!-- costs + rendering -->
 <script src="js/route-form.js"></script>
 <script src="js/auth.js"></script><!-- MUST BE LAST -->
 
