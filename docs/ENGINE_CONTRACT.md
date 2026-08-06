@@ -14,7 +14,8 @@ No ES module syntax, no bundler, no npm dependency in the shipped files.
 
 ```
 Place    = { name: string, lat: number, lon: number, resolved: boolean, source: 'osm'|'ai'|'manual'|'cache' }
-Matrix   = { km: number[][], min: number[][], source: 'osrm'|'haversine' }   // square, index-aligned to the Place[] passed in
+Matrix   = { km: number[][], min: number[][], source: 'osrm'|'mixed'|'haversine',
+             osrmCells: number, filledCells: number }   // square, index-aligned to the Place[] passed in
 Leg      = { from: Place, to: Place, km: number, min: number }
 DayPlan  = { day: number, legs: Leg[], stops: Place[], driveMin: number, km: number,
              startPlace: Place, endPlace: Place, overDriveCap: boolean }
@@ -31,8 +32,22 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
   with `resolved: false` — never throw, never drop the entry, preserve input order.
 - `distanceMatrix(places: Place[]) -> Promise<Matrix>`
   OSRM public `table` service (`/table/v1/driving/{lon,lat;...}?annotations=duration,distance`).
-  On any failure fall back to haversine × 1.25 road factor at 75 km/h and set
-  `source: 'haversine'`. Symmetric, zero diagonal, no `null`/`Infinity` cells.
+  On any failure fall back to haversine × road factor and set the source flag.
+  Symmetric, zero diagonal, no `null`/`Infinity` cells.
+
+  **`source` must describe the whole matrix, not one lucky cell** (this was a real bug —
+  a 70%-guessed matrix reported `'osrm'` and suppressed the engine's warning):
+  - `'osrm'` — **every** off-diagonal cell came from the road graph (`filledCells === 0`)
+  - `'mixed'` — some real, some haversine-filled (islands, ferries, unroutable pairs)
+  - `'haversine'` — no cell came from the road graph
+  `osrmCells` / `filledCells` carry the counts and are part of the contract, not extras.
+
+  **Speed calibration.** The haversine fallback must not manufacture false over-cap
+  warnings. Measured against live OSRM on five long Spanish routes, a 1.25 road factor
+  is well calibrated (−0.1% to +8.5% on distance) but 75 km/h is 22–26% pessimistic on
+  time; real long-haul average is 87–92 km/h. The engine enforces `maxDriveMinPerDay` on
+  `min`, so a pessimistic speed over-splits days — the exact bug class this project set
+  out to fix.
 - `routeGeometry(places: Place[]) -> Promise<[lat,lon][]>` — OSRM `route` overview
   polyline decoded to points, for the map. Falls back to straight lines between places.
 
