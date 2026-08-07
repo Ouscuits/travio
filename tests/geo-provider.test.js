@@ -1680,6 +1680,143 @@ test('matrix D12: no average-speed threshold could have separated these from jun
     assert.strictEqual(bogus.source, 'haversine', '7.4 km/h over 620 km is not a road journey');
 });
 
+/* ══════════════════════════════════════════════════════════════════════════
+   D16: wrong-pair answers are detected from OSRM's own snap distance
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function tableWithSnap(roadKm, minutes, snapAkm, snapBkm) {
+    return makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, roadKm * 1000], [roadKm * 1000, 0]],
+            durations: [[0, minutes * 60], [minutes * 60, 0]],
+            sources: [{ distance: snapAkm * 1000 }, { distance: snapBkm * 1000 }],
+            destinations: [{ distance: snapAkm * 1000 }, { distance: snapBkm * 1000 }]
+        };
+    });
+}
+
+test('matrix D16: a far-snapped waypoint condemns every cell that touches it', async function () {
+    /* Reported repro: Melilla is a Spanish exclave in North Africa. OSRM cannot reach it
+       by road, snaps it 155.8 km ACROSS THE MEDITERRANEAN and answers about Almeria ->
+       Madrid. The resulting 556 km against a 574 km great circle is x0.97, which sails
+       through the shortfall guard, so it shipped as source 'osrm' with no warning — the
+       user is told 6h25 for a journey that is a ~7 h ferry plus that drive.
+       The signal was in the response all along: sources[].distance. */
+    const cases = [
+        /* label, aLat,aLon, bLat,bLon, roadKm, min, snapA, snapB, ratio-vs-crow */
+        ['Melilla-Madrid',    35.2923, -2.9381, 40.4168, -3.7038, 556, 385, 155.76, 0.09],
+        ['Ceuta-Madrid',      35.8894, -5.3213, 40.4168, -3.7038, 672, 470,  22.49, 0.09],
+        ['Algeciras-Ceuta',   36.1408, -5.4526, 35.8894, -5.3213,  12,  18,   0.03, 22.49],
+        ['Gibraltar-Tanger',  36.1408, -5.3536, 35.7595, -5.8340,  49,  45,   0.02, 33.99],
+        ['Trapani-Tunis',     38.0176, 12.5365, 36.8065, 10.1815, 162, 120,   0.00, 155.73]
+    ];
+    for (const [label, aLat, aLon, bLat, bLon, roadKm, minutes, snapA, snapB] of cases) {
+        const fetchImpl = tableWithSnap(roadKm, minutes, snapA, snapB);
+        const m = await distanceMatrix([place('A', aLat, aLon), place('B', bLat, bLon)],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D16 ' + label);
+        assert.strictEqual(m.source, 'haversine',
+            label + ' snapped ' + Math.max(snapA, snapB).toFixed(1) + ' km — a different place');
+        assert.strictEqual(m.osrmCells, 0, label);
+        assert.notStrictEqual(m.min[0][1], minutes, label + ': the wrong duration is not shipped');
+    }
+
+    /* Two of those clear the shortfall ratio outright, which is why the proxy failed.
+       Note Ceuta appears in both directions: the SAME mis-snapped waypoint was caught
+       one way (x0.39) and missed the other (x1.29). */
+    const crowMelilla = haversineKm(35.2923, -2.9381, 40.4168, -3.7038);
+    assert.ok(556 >= crowMelilla * 0.90, 'Melilla clears the shortfall guard (x' +
+        (556 / crowMelilla).toFixed(2) + ') — only the snap distance catches it');
+});
+
+test('matrix D16: a legitimately remote place is NOT condemned', async function () {
+    /* The threshold has to keep real answers. Measured legitimate snaps: ordinary town
+       geocodes <= 0.5 km over 60+ routes, remote fjord quays 1.35 km, Ben Nevis summit
+       2.16, Preikestolen 2.48, Mont Blanc summit 4.44 — where driving to the vicinity is
+       genuinely the right answer for a road trip. */
+    const keep = [
+        ['Mont Blanc summit', 4.44],
+        ['Preikestolen', 2.48],
+        ['Ben Nevis', 2.16],
+        ['remote fjord quay', 1.35],
+        ['ordinary town', 0.09]
+    ];
+    for (const [label, snapKm] of keep) {
+        const fetchImpl = tableWithSnap(617, 375, snapKm, 0.02);
+        const m = await distanceMatrix([MADRID, BARCELONA],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D16 keep ' + label);
+        assert.strictEqual(m.source, 'osrm', label + ' (snap ' + snapKm + ' km) must survive');
+        assert.strictEqual(m.km[0][1], 617);
+    }
+});
+
+test('matrix D16: missing snap fields condemn nothing', async function () {
+    /* Never condemn on absent evidence — a proxy, or an older OSRM, may not report it.
+       Every fixture in this file omits sources/destinations, so this is also what keeps
+       the other 70-odd tests meaningful. */
+    const noFields = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 617000], [617000, 0]],
+            durations: [[0, 22500], [22500, 0]]
+        };
+    });
+    const a = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: noFields, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(a.source, 'osrm', 'absent snap fields are not evidence of anything');
+
+    /* Junk in the fields is also not evidence. */
+    for (const junk of [null, undefined, 'x', {}, [], true, NaN, -5, Infinity]) {
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, 617000], [617000, 0]],
+                durations: [[0, 22500], [22500, 0]],
+                sources: [{ distance: junk }, { distance: junk }],
+                destinations: [{ distance: junk }, { distance: junk }]
+            };
+        });
+        const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D16 junk snap ' + String(junk));
+        assert.strictEqual(m.source, 'osrm', String(junk) + ' in sources[].distance proves nothing');
+    }
+});
+
+test('matrix D16: only the misplaced place loses its cells, not the whole matrix', async function () {
+    /* The verdict is per WAYPOINT, so a three-place matrix with one exclave keeps the
+       road data for the pair that is fine. */
+    const fetchImpl = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 617000, 556000], [617000, 0, 349000], [556000, 349000, 0]],
+            durations: [[0, 22500, 23100], [22500, 0, 20940], [23100, 20940, 0]],
+            sources: [{ distance: 90 }, { distance: 20 }, { distance: 155760 }],
+            destinations: [{ distance: 90 }, { distance: 20 }, { distance: 155760 }]
+        };
+    });
+    const m = await distanceMatrix([MADRID, BARCELONA, place('Melilla', 35.2923, -2.9381)],
+        { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(m, 3, 'D16 partial');
+    assert.strictEqual(m.source, 'mixed');
+    assert.strictEqual(m.km[0][1], 617, 'Madrid-Barcelona is untouched');
+    assert.strictEqual(m.osrmCells, 2, 'exactly the one good pair');
+    assert.strictEqual(m.filledCells, 4, 'both pairs touching the exclave are filled');
+});
+
+test('matrix D16: every measured route survives with its real snap distances attached', async function () {
+    /* The 69-route fixture with realistic snaps — none of the measured legitimate routes
+       exceeded 1.35 km — must be entirely unaffected by the new guard. */
+    for (const [name, aLat, aLon, bLat, bLon, roadKm, minutes] of FERRY_ROUTES) {
+        const fetchImpl = tableWithSnap(roadKm, minutes, 1.35, 0.5);
+        const m = await distanceMatrix([place('A', aLat, aLon), place('B', bLat, bLon)],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D16 fixture ' + name);
+        assert.strictEqual(m.source, 'osrm', name + ' must not be newly rejected');
+        assert.strictEqual(m.min[0][1], minutes, name + ': duration kept');
+    }
+});
+
 test('matrix D15: the detour ceiling is a loose sanity bound, not a fitted one', async function () {
     /* Reported repro: at x10 the ceiling destroyed real routes. Enclosed seas produce the
        HIGHEST ratios at LONG crow lines — the crossing is short but OSRM declines the

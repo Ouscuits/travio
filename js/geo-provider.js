@@ -20,8 +20,8 @@
  *
  * Injection seam — every network/time/storage dependency can be stubbed:
  *   opts = { fetchImpl, sleepImpl, now, storage, minIntervalMs, cacheTtlMs,
- *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, roadFactor,
- *            speedKmh, userAgent, language }
+ *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, maxSnapKm,
+ *            roadFactor, speedKmh, userAgent, language }
  *
  * RATE LIMITING — ONE queue, ALL THREE network entry points.
  *   geocodePlaces (Nominatim), distanceMatrix (OSRM /table) and routeGeometry (OSRM
@@ -66,6 +66,45 @@
  *   days on `min`, a zero-minute leg packs the trip into too few days — the exact
  *   day-splitting bug this branch exists to kill.
  *
+ *   WRONG-PAIR ANSWERS — READ THE SIGNAL, DO NOT INFER IT. OSRM answers about the nearest
+ *   road, not about the coordinate you sent, and when nothing is reachable it will drag a
+ *   waypoint an arbitrary distance to find one. It reports exactly how far in
+ *   sources[k].distance / destinations[k].distance, in metres. This module inferred the
+ *   same thing from a distance-ratio PROXY instead, and the proxy fails whenever the
+ *   wrong place happens to sit at a plausible distance:
+ *       Melilla -> Madrid   snap 155.8 km   ratio x0.97   MISSED, shipped as measured
+ *       Ceuta   -> Madrid   snap  22.5 km   ratio x1.29   MISSED, shipped as measured
+ *       Algeciras -> Ceuta  snap  22.5 km   ratio x0.39   caught, by luck
+ *   Melilla is a Spanish exclave in North Africa: OSRM snapped it across the
+ *   Mediterranean and answered about Almería, understating the journey by roughly half a
+ *   day. Note the second line — the SAME mis-snapped waypoint was caught in one direction
+ *   and missed in another, so the proxy's coverage was direction-dependent, which is what
+ *   a proxy looks like when it is standing in for the thing you actually care about.
+ *   Now: a waypoint snapped more than maxSnapKm is treated exactly as if it had never
+ *   been sent, so EVERY cell touching it falls back to geometry — not just the ones whose
+ *   distance happens to look wrong.
+ *   THRESHOLD 10 km, and both anchors are real measurements (contrast the detour ceiling
+ *   below, whose upper anchor is not):
+ *     - largest snap where driving to the vicinity is still the honest answer: 4.44 km,
+ *       Mont Blanc summit. Ordinary town and city geocodes measure <= 0.5 km across 60+
+ *       routes; Ben Nevis 2.16, Preikestolen 2.48, remote fjord quays 1.35.
+ *     - smallest snap that produces an answer about somewhere else: 22.49 km, Ceuta.
+ *     - geometric midpoint 9.99, hence 10 km — x2.25 clear on each side.
+ *   A ~25 km threshold was proposed and would sit ABOVE Ceuta, missing the case that
+ *   motivated the whole rule. Absent fields yield NaN and condemn nothing: never condemn
+ *   on missing evidence, because a proxy or an older OSRM may not report the field.
+ *
+ *   THE SHORTFALL RATIO IS STILL LOAD-BEARING, for the complementary case. Snap distance
+ *   catches a waypoint dragged far away. It cannot catch two waypoints that each snapped
+ *   to a road a few metres away, where those roads sit on opposite banks of something
+ *   unbridged — the route then goes the long way round, or along one shore, and the
+ *   snap distances look perfect. Measured: Mannheller -> Fodnes across the Sognefjord
+ *   snapped only 2.04 km, but BOTH waypoints landed on the same road, "Erdalsvegen", on
+ *   the same shore, and the 1.33 km answer is x0.49 of the great circle. Snap says
+ *   nothing; the ratio condemns it. Neither guard subsumes the other:
+ *       snap check      -> large snap, any resulting distance   (Melilla, x0.97)
+ *       shortfall ratio -> any snap, impossible resulting distance (Mannheller, 2.0 km)
+ *
  *   THE GOVERNING RULE: each half of a cell is judged against what is actually KNOWN
  *   about it — the great-circle distance — and NEVER against the other half's estimate.
  *   An estimate is not a reference for validating a measurement. Charging the estimate's
@@ -75,12 +114,12 @@
  *   18x too small, with no warning. Hence three separate tests:
  *     - DISTANCE (needs only geometry): a road is never materially shorter than the
  *       great circle beneath it (cellKm + 0.5 >= straightKm * 0.90, slack for OSRM
- *       snapping to the nearest road) and never more than 10x + 50 km longer.
+ *       snapping to the nearest road) and never more than 30x + 50 km longer.
  *     - PAIR SPEED (only when BOTH halves are measured): at most 200 km/h, and at most
  *       geoMaxDurationMin(km, crow) in total.
  *     - DURATION ALONE (measured duration, estimated distance): rejected only when NO
  *       credible road length makes it drivable — too fast even along the great circle,
- *       or longer than the ceiling allows even along the 10x road.
+ *       or longer than the ceiling allows even along the 30x road.
  *   A measured distance with no duration needs no time test at all: the duration is
  *   derived from it at the calibrated speed, so it is in band by construction.
  *   Legs under 1 km are exempt (rounding noise dominates and nothing is at stake).
@@ -102,8 +141,25 @@
  *       6000 km in 360 min both clear a 30x ceiling and are both still rejected on speed.
  *       The ONLY thing the ceiling uniquely catches is a distance that is absurd AND
  *       internally consistent with its duration — the x60 case, 30 305 km in 202 h at
- *       150 km/h. That case pins the ONLY hard constraint: the ceiling must stay below
- *       x59.9, or it stops doing its one job. So the bound is placed at the geometric
+ *       150 km/h. That case pins the only remaining constraint: the ceiling must stay
+ *       below x59.9, or it stops doing its one job.
+ *       HONESTY ABOUT WHAT THAT DERIVATION IS. x59.9 is NOT a property of road networks.
+ *       It is a property of a synthetic x60 fixture invented for this test suite: had
+ *       that fabrication been written as x25, the same arithmetic would yield a different
+ *       constant. So this is a fit with one real anchor (x13.86 measured) and one
+ *       arbitrary one, dressed as a derivation. x30 is kept because the EVIDENCE supports
+ *       it — 89 live routes measured across every geography anyone has thought to try,
+ *       zero over the ceiling, worst x13.86 — not because the midpoint arithmetic proves
+ *       anything. Compare the snap threshold above, where both anchors are measured; that
+ *       is what a derived bound actually looks like.
+ *       COST OF THE WIDENING, which the round-8 note omitted: moving x10 -> x30 admits
+ *       self-consistent fabrications in the x10–x30 band that x10 refused — 15 200 km at
+ *       152 km/h for a Madrid–Barcelona pair clears the ceiling, the 200 km/h guard and
+ *       the duration cap alike. Nothing downstream catches that. What makes it acceptable
+ *       is the snap check above: the realistic way such a number arises is a waypoint
+ *       answered about somewhere else, and that is now detected at source rather than
+ *       inferred from how odd the distance looks. The two changes belong together.
+ *       For reference, the bound is placed at the geometric
  *       midpoint of the two things that actually constrain it — x13.86 (worst measured
  *       real) and x59.9 (junk) is x28.8, hence 30x. That is x2.16 clear of any real route
  *       and x2.00 clear of failing its purpose, and it is derived from the constraints
@@ -268,6 +324,8 @@
     const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
     const GEO_SHORTFALL_RATIO = 0.90;               // road vs great circle, with slack for
     const GEO_SHORTFALL_SLACK = 0.5;                // OSRM snapping to the nearest road
+    const GEO_MAX_SNAP_KM     = 10;                 // how far OSRM may move a waypoint onto
+                                                    // a road before it is a different place
     const GEO_QUEUE_SLACK_MS  = 500;                // grace before the queue tail self-releases
 
     /* ── Environment seams (all lazy, all guarded) ── */
@@ -313,6 +371,7 @@
             nominatimUrl:   o.nominatimUrl || GEO_NOMINATIM_URL,
             osrmBase:       o.osrmBase || GEO_OSRM_BASE,
             maxTablePlaces: typeof o.maxTablePlaces === 'number' ? o.maxTablePlaces : GEO_MAX_TABLE,
+            maxSnapKm:      typeof o.maxSnapKm === 'number' && o.maxSnapKm >= 0 ? o.maxSnapKm : GEO_MAX_SNAP_KM,
             roadFactor:     typeof o.roadFactor === 'number' && o.roadFactor > 0 ? o.roadFactor : GEO_ROAD_FACTOR,
             speedKmh:       typeof o.speedKmh === 'number' && o.speedKmh > 0 ? o.speedKmh : GEO_SPEED_KMH,
             userAgent:      o.userAgent || '',
@@ -819,6 +878,34 @@
         return cellMin <= geoMaxDurationMin(geoMaxRoadKm(straightKm), straightKm);
     }
 
+    /*
+     * How far OSRM had to move a waypoint to put it on a road, in metres. It reports this
+     * itself, per waypoint, in sources[k].distance and destinations[k].distance — this
+     * module simply never read it, and inferred "the answer is about a different place"
+     * from a distance-ratio proxy instead. The proxy fails whenever the wrong place
+     * happens to sit at a plausible-looking distance: Melilla is a Spanish exclave in
+     * North Africa, OSRM snapped it 155.8 km across the Mediterranean and answered about
+     * Almería, and the resulting 556 km against a 574 km great circle cleared the
+     * shortfall guard at x0.97.
+     * NaN when the field is absent — never condemn on missing evidence.
+     */
+    function geoSnapMetres(data, k) {
+        let worst = NaN;
+        const lists = [data.sources, data.destinations];
+        for (let l = 0; l < lists.length; l++) {
+            const arr = lists[l];
+            if (!Array.isArray(arr) || !arr[k] || typeof arr[k] !== 'object') continue;
+            const v = arr[k].distance;
+            const isNumber = typeof v === 'number';
+            const isNumericString = typeof v === 'string' && v.trim() !== '';
+            if (!isNumber && !isNumericString) continue;
+            const n = Number(v);
+            if (!isFinite(n) || n < 0) continue;
+            worst = isFinite(worst) ? Math.max(worst, n) : n;
+        }
+        return worst;
+    }
+
     function geoOsrmTableUrl(coords, cfg) {
         const parts = coords.map(function (c) { return c.lon + ',' + c.lat; }).join(';');
         return cfg.osrmBase + '/table/v1/driving/' + parts + '?annotations=duration,distance';
@@ -897,18 +984,32 @@
                 const usable = dStatus !== 'bad' && tStatus !== 'bad' &&
                                (dStatus === 'ok' || tStatus === 'ok');
                 if (usable) {
+                    /* A waypoint OSRM had to drag a long way to reach a road is not the
+                       place we asked about, and EVERY cell touching it is an answer about
+                       somewhere else — not just the ones whose distance looks wrong. */
+                    const misplaced = new Array(coords.length);
+                    for (let k = 0; k < coords.length; k++) {
+                        const snap = geoSnapMetres(data, k);
+                        misplaced[k] = isFinite(snap) && snap > cfg.maxSnapKm * 1000;
+                    }
                     table = {
                         distances: dStatus === 'ok' ? data.distances : null,
-                        durations: tStatus === 'ok' ? data.durations : null
+                        durations: tStatus === 'ok' ? data.durations : null,
+                        misplaced: misplaced
                     };
                 }
             }
         }
 
-        /* Position of each place inside the OSRM sub-matrix (-1 = not sent). */
+        /* Position of each place inside the OSRM sub-matrix (-1 = not sent, or sent and
+           answered about somewhere else — a misplaced waypoint is treated exactly as if
+           it had never been sent, so every one of its cells falls back to geometry). */
         const sub = new Array(n);
         for (let i = 0; i < n; i++) sub[i] = -1;
-        for (let k = 0; k < realIdx.length; k++) sub[realIdx[k]] = k;
+        for (let k = 0; k < realIdx.length; k++) {
+            if (table && table.misplaced && table.misplaced[k]) continue;
+            sub[realIdx[k]] = k;
+        }
 
         /* Pairs carrying at least one road-graph value / at least one estimated value.
            A half-real cell is in BOTH — see the MATRIX SOURCE note in the header. */
