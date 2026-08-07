@@ -131,6 +131,25 @@ Rules — these are the bug fixes and are all machine-checkable:
    destination names, unresolved places (`resolved: false` — fall back to matrix values
    which the provider guarantees to be finite).
 
+## Known limitation, accepted on severity (engine, closed after 5 review rounds)
+
+When one counter is malformed (`"x"`, `NaN`, negative, fractional, out of range), the
+engine discards the *other* counter's proof even when it is valid and decisive. So
+`{ source: 'osrm', osrmCells: 0, filledCells: "x" }` reports only "provenance cannot be
+confirmed", losing both the every-cell finding that `osrmCells: 0` proves outright and
+the label contradiction. 84 of 1,372 swept combinations are affected.
+
+This is accepted because it fails in the safe direction — the engine under-claims, never
+over-claims, and every affected case still warns the user that the provenance is
+untrustworthy. Nothing goes silent and no number is fabricated, which is what separates it
+from the defects this branch was opened to kill.
+
+Recorded because the reasoning first used to accept it was wrong: "a junk counter cannot be
+a decisive zero" is false (the junk counter is not the one carrying the zero), and "the
+sweep confirms the two never co-occur" is circular, since `noRoadProven` is itself gated on
+`!outOfRange` and so makes non-co-occurrence true by construction. A sweep cannot falsify a
+property its subject defines into existence. The acceptance stands on severity alone.
+
 ## Test command
 
 `npm test` is not available (no package.json in the app). Tests live in `tests/*.test.js`
