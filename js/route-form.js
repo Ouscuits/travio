@@ -330,6 +330,16 @@ function persistCountryScope() {
     });
 }
 
+/* A one-off message ("X is not a country") was written in the language the user was
+   reading at the time; after a switch it is a stale sentence in the wrong language
+   about a field they can see the state of. Cleared, not translated: it refers to text
+   that is no longer in the box. Named (not anonymous) so re-initialising the form
+   registers one listener, not one per visit. */
+function onScopeLanguageChange() {
+    showScopeMsg('', '');
+    renderCountryScope();
+}
+
 function initCountryScope() {
     const input = el('rfCountryInput');
     const addBtn = el('rfCountryAdd');
@@ -792,7 +802,7 @@ function initRouteForm() {
         /* The chips, the datalist and the "searching only in..." line are built in JS
            too, and country names are localised: without this a Spanish user switching
            to Chinese keeps a chip reading "Espana" beside a Chinese form. */
-        onLanguageChange(renderCountryScope);
+        onLanguageChange(onScopeLanguageChange);
     }
 }
 
