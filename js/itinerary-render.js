@@ -859,6 +859,13 @@
                 duration: plan && Array.isArray(plan.days) ? plan.days.length : 0,
                 dailyBudget: nonNeg(a.dailyBudget, 0),
                 departureTime: a.departureTime || '',
+                /* The cap this plan was actually judged against. Stored because a
+                   saved itinerary that says "over the daily limit" has to be able to
+                   state WHICH limit, and reading today's default at render time would
+                   assert a number the document does not contain — silently wrong the
+                   day the cap becomes configurable. Legacy documents lack it and are
+                   deliberately not backfilled. */
+                maxDriveMin: isFinite(num(a.maxDriveMin, NaN)) ? num(a.maxDriveMin, 0) : null,
                 matrixSource: a.matrixSource || '',
                 matrixFilledCells: isFinite(num(a.matrixFilledCells, NaN)) ? num(a.matrixFilledCells, 0) : null,
                 matrixOsrmCells: isFinite(num(a.matrixOsrmCells, NaN)) ? num(a.matrixOsrmCells, 0) : null,
