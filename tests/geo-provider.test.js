@@ -2462,7 +2462,23 @@ const LIVE = {
         [43.4618932, -3.8100255, 'Santander, Cantabria, Espana'],
         [7.0000085, -73.2500086, 'Santander, RAP Gran Santander, Colombia'],
         [9.4170689, 123.3351935, 'Santander, Cebu, Central Visayas, 6026, Philippines']],
-    'Gijon': [[43.5449422, -5.66275, 'Gijon / Xixon, Asturias / Asturies, Espana']]
+    'Gijon': [[43.5449422, -5.66275, 'Gijon / Xixon, Asturias / Asturies, Espana']],
+    'Barcelona': [
+        [41.3825802, 2.177073, 'Barcelona, Barcelones, Barcelona, Catalunya, Espana'],
+        [41.75787, 2.031182, 'Barcelona, Catalunya, Espana']],
+    'Santiago': [
+        [9.8694792, -83.7980749, 'Santiago, Paraiso, Cartago, 30202, Costa Rica'],
+        [-33.4376995, -70.6510671, 'Santiago, Provincia de Santiago, Region Metropolitana de Santiago, 8320000, Chile'],
+        [20.0214263, -75.8294928, 'Santiago de Cuba, Distrito Antonio Maceo, Santiago de Cuba, Cuba'],
+        [19.4508468, -70.6947386, 'Santiago, Republica Dominicana'],
+        [-29.189675, -54.866624, 'Santiago, Rio Grande do Sul, Regiao Sul, Brasil']],
+    'Guadalajara': [
+        [20.6720375, -103.338396, 'Guadalajara, Region Centro, Jalisco, 44450, Mexico'],
+        [40.7399963, -2.50593, 'Guadalajara, Castilla-La Mancha, Espana'],
+        [40.6326979, -3.1646067, 'Guadalajara, Castilla-La Mancha, Espana'],
+        [20.6782614, -103.3357646, 'Guadalajara, Region Centro, Jalisco, Mexico']],
+    'Castellar del Valles': [
+        [41.6183431, 2.0879423, 'Castellar del Valles, Valles Occidental, Barcelona, Catalunya, 08211, Espana']]
 };
 
 function liveBody(name) {
@@ -2729,16 +2745,17 @@ test('G3: another node of the SAME town is not a relocation and raises no flag',
     });
 });
 
-test('G3: with too few unambiguous anchors, nothing is relocated at all', async function () {
-    /* No cluster, no evidence, no decision. A single wrong anchor would otherwise drag
-       every ambiguous place to match it and manufacture a coherent-looking wrong trip —
-       which geocodeOutliers could then no longer see. */
+test('G3: with too small a plurality, nothing is relocated at all', async function () {
+    /* Three places, and the coherent group is Lugo + Bilbao — two, below the minimum.
+       No plurality, no evidence, no decision. The floor matters because a WRONG pair is
+       itself a coherent group (Mexico and Texas are only 1,200 km apart), so without it
+       a three-place trip could be anchored on the two errors in it. */
     resetGeoRateLimit();
     const fetchImpl = liveFetch();
     const out = await geocodePlaces(['Leon', 'Lugo', 'Bilbao'], geoOpts({ fetchImpl: fetchImpl }));
 
     const leon = byName(out, 'Leon');
-    assert.strictEqual(leon.chosenByCluster, false, 'one anchor is a point, not a cluster');
+    assert.strictEqual(leon.chosenByCluster, false, 'two places are not a plurality worth acting on');
     assert.strictEqual(leon.lat, 31.2715127, 'Texas is still on show — and displayName says so');
     assert.ok(leon.displayName.indexOf('Texas') !== -1);
     assert.strictEqual(leon.candidates, 5, 'ambiguity is still reported to the UI');
@@ -2827,9 +2844,9 @@ test('G3: a place with no candidates, and a malformed reply, do not disturb the 
     assert.strictEqual(byName(out, 'Leon').chosenByCluster, true, 'the cluster still formed from the rest');
 });
 
-test('G3: a duplicated name is one anchor, not two votes', async function () {
-    /* Bilbao three times plus Gijon looks like four unambiguous places but is only two
-       distinct ones, which is below the anchor minimum. Counting duplicates would let a
+test('G3: a duplicated name is one vote, not three', async function () {
+    /* Bilbao three times plus Gijon looks like a coherent group of four but is only two
+       distinct places, which is below the anchor minimum. Counting duplicates would let a
        user tilt the median simply by repeating a destination. */
     resetGeoRateLimit();
     const fetchImpl = liveFetch();
@@ -3121,4 +3138,320 @@ test('G4: end to end — the pipeline reports what it chose AND what looks wrong
         'the Breton Finisterre is not flagged by geometry — but its label names France, ' +
         'which is the whole reason displayName is not optional');
     assert.ok(byName(out, 'Fisterra').candidates > 1, 'ambiguity is reported where it exists');
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   G5: the anchor set — round 2
+
+   Round 1 anchored the cluster on the places that returned exactly ONE candidate,
+   reasoning that a single result meant the name was unambiguous. The user's own
+   case disproves that: "Santillana de Mar" returns exactly one candidate and it
+   is in Mexico. The anchors were seeded with precisely the errors the mechanism
+   exists to survive, and on the user's SECOND real trip that disarmed it
+   completely. Reproduced live, 2026-08:
+
+       Barcelona, Santillana de Mar, Leon, Fisterra, Lugo, Castellar del Valles
+       single-result names: Santillana (MEXICO) + Castellar -> 2 anchors, below
+       the minimum of 3 -> 'Leon' stayed in Leon County, TEXAS, unflagged
+       geocodeOutliers() -> (nothing), because 2 of 6 were wrong
+
+   The anchor is now the largest mutually-coherent group of first choices:
+   agreement is evidence, confidence is not.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* The user's second real trip, exactly as reported. */
+const USER_TRIP_2 = ['Barcelona', 'Santillana de Mar', 'Leon', 'Fisterra', 'Lugo',
+                     'Castellar del Valles'];
+
+test('G5: the second real trip — the mechanism is no longer disarmed by its own bug', async function () {
+    resetGeoRateLimit();
+    const out = await geocodePlaces(USER_TRIP_2, geoOpts({ fetchImpl: liveFetch() }));
+
+    /* Only two names return one candidate, and one of them is the Mexican village.
+       That is the fact the old anchor definition could not survive. */
+    const singles = out.filter(function (p) { return p.candidates === 1; });
+    assert.deepStrictEqual(singles.map(function (p) { return p.name; }).slice().sort(),
+        ['Castellar del Valles', 'Santillana de Mar'],
+        'the single-candidate places are Castellar and the MEXICAN Santillana');
+    assert.ok(singles.filter(function (p) { return p.name === 'Santillana de Mar'; })[0]
+        .displayName.indexOf('Mexico') !== -1, 'one result, and it is wrong');
+
+    /* Four Spanish places agree with each other and outvote the Mexico/Texas pair 4-2. */
+    const leon = byName(out, 'Leon');
+    assert.strictEqual(leon.chosenByCluster, true, "'Leon' is relocated, and it says so");
+    assert.ok(leon.displayName.indexOf('Lyon') !== -1, 'off Texas: ' + leon.displayName);
+
+    /* And with one error left instead of two, the outlier check now reaches it. */
+    const strays = geocodeOutliers(out);
+    assert.strictEqual(strays.length, 1, 'the Mexican village is named at last');
+    assert.strictEqual(strays[0].name, 'Santillana de Mar');
+    assert.ok(strays[0].km > 8000, Math.round(strays[0].km) + ' km from the rest of the trip');
+    assert.ok(strays[0].displayName.indexOf('Mexico') !== -1);
+});
+
+test('G5: a confidently-wrong single result does not get to be an anchor', async function () {
+    /* The direct statement of the fix. Santillana (Mexico) and Finisterre (France) each
+       return exactly one candidate; under the old rule they were anchors. They are now
+       simply two places that agree with nobody, and the Spanish majority carries. */
+    resetGeoRateLimit();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: liveFetch() }));
+
+    const mexico = byName(out, 'Santillana de Mar');
+    assert.strictEqual(mexico.candidates, 1, 'one candidate — the old definition called this an anchor');
+    assert.ok(mexico.displayName.indexOf('Mexico') !== -1, 'and it is 8,700 km from the trip');
+
+    /* The centre it would have pulled towards is not where the trip ended up. */
+    const leon = byName(out, 'Leon');
+    assert.strictEqual(leon.chosenByCluster, true);
+    assert.ok(haversineKm(leon.lat, leon.lon, mexico.lat, mexico.lon) > 8000,
+        'the relocation went towards Spain, not towards the confident error');
+});
+
+test('G5: a strict plurality is required — a tie relocates nothing', async function () {
+    /* Two Spanish places against two American ones is not evidence, it is a coin toss.
+       Acting on it would mean the answer depended on nothing at all. */
+    resetGeoRateLimit();
+    const out = await geocodePlaces(['Bilbao', 'Gijon', 'Santillana de Mar', 'Leon'],
+        geoOpts({ fetchImpl: liveFetch() }));
+
+    /* groups: {Bilbao, Gijon} = 2 and {Santillana MX, Leon TX} = 2 */
+    const leon = byName(out, 'Leon');
+    assert.strictEqual(leon.chosenByCluster, false, 'no majority opinion, so no decision');
+    assert.strictEqual(leon.lat, 31.2715127, 'the geocoder\'s own ranking stands');
+    assert.ok(leon.displayName.indexOf('Texas') !== -1, 'and displayName still says where it is');
+
+    /* One more coherent Spanish place breaks the tie, and the mechanism engages. */
+    resetGeoRateLimit();
+    const out2 = await geocodePlaces(['Bilbao', 'Gijon', 'Fisterra', 'Santillana de Mar', 'Leon'],
+        geoOpts({ fetchImpl: liveFetch() }));
+    assert.strictEqual(byName(out2, 'Leon').chosenByCluster, true, '3 against 2 is a plurality');
+    assert.ok(byName(out2, 'Leon').displayName.indexOf('Lyon') !== -1);
+});
+
+test('G5: the anchor group is a CHAIN, so a long thin trip stays one group', function () {
+    /* Single linkage, not a radius about a centre. Cape Town to Cairo is 7,250 km apart —
+       beyond the link distance — but joined through Johannesburg and Nairobi. A radius
+       rule would split every continental itinerary into pieces and then anchor on
+       whichever piece happened to be biggest. Verified through the public behaviour:
+       nothing in these trips is treated as an outlier, and the outlier check uses the
+       same median-centre geometry the anchor does. */
+    const transAfrica = [pl('Cape Town', -33.92, 18.42), pl('Johannesburg', -26.20, 28.05),
+                         pl('Nairobi', -1.29, 36.82), pl('Cairo', 30.04, 31.24)];
+    assert.ok(haversineKm(-33.92, 18.42, 30.04, 31.24) > 5000,
+        'the two ends really are further apart than the link distance');
+    assert.deepStrictEqual(geocodeOutliers(transAfrica), [], 'and the trip is still coherent');
+});
+
+test('G5: overriding the geocoder needs a real improvement, not a marginal one', async function () {
+    /* The criterion is how much NEARER the trip the alternative is, not merely that it is
+       nearer. Fisterra's three nodes span 14 km and Oviedo's two 2.8 km; one of each is
+       always marginally closer to the centre, and acting on that would move nothing real
+       while raising a flag the UI has to explain. */
+    resetGeoRateLimit();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: liveFetch() }));
+
+    ['Fisterra', 'Oviedo', 'Lugo', 'Santander'].forEach(function (name) {
+        assert.strictEqual(byName(out, name).chosenByCluster, false, name + ': no material improvement');
+        assert.strictEqual(byName(out, name).lat, LIVE[name][0][0], name + ': first answer kept');
+    });
+
+    /* Lower the bar to nothing and the marginal swaps appear — proving the criterion is
+       what suppresses them, and that they were there to be suppressed. */
+    resetGeoRateLimit();
+    const loose = await geocodePlaces(USER_TRIP,
+        geoOpts({ fetchImpl: liveFetch(), clusterMoveKm: 0 }));
+    const marginal = loose.filter(function (p) { return p.chosenByCluster; })
+        .map(function (p) { return p.name; });
+    assert.ok(marginal.indexOf('Fisterra') !== -1 || marginal.indexOf('Oviedo') !== -1,
+        'a marginal swap really was available and really was declined');
+    assert.strictEqual(byName(loose, 'Leon').chosenByCluster, true, 'the real relocation survives either way');
+});
+
+/* ── The measured boundary of geocodeOutliers ── */
+
+test('G5: geocodeOutliers holds exactly while the correct places are a strict majority', function () {
+    /* Swept over the northern-Spain itinerary with w of its n places moved to Mexico.
+       The boundary is the median's own defining property: all w errors are named iff
+       n >= 2w + 1. Documented in the header because the round-1 wording ("when roughly
+       HALF the places are wrong") was optimistic and would let someone trust this
+       further than it goes — it degrades at a third. */
+    const MEXICO = [[22.136, -100.952], [21.122, -101.683], [20.967, -89.617],
+                    [19.041, -98.206], [17.062, -96.725], [19.292, -99.654]];
+    const broken = function (n, w) {
+        return N_SPAIN.slice(0, n).map(function (p, i) {
+            return i < w ? pl(p.name + ' (MX)', MEXICO[i % MEXICO.length][0],
+                                MEXICO[i % MEXICO.length][1], p.name + ', Mexico') : p;
+        });
+    };
+
+    let inside = 0, outside = 0;
+    for (let n = 3; n <= 12; n++) {
+        for (let w = 1; w <= 6 && w < n; w++) {
+            const found = geocodeOutliers(broken(n, w));
+            const named = found.filter(function (f) { return f.name.indexOf('(MX)') !== -1; }).length;
+            const accused = found.length - named;
+            if (n >= 2 * w + 1) {
+                inside++;
+                assert.strictEqual(named, w,
+                    'n=' + n + ' w=' + w + ': a strict majority is correct, so all ' + w + ' must be named');
+                assert.strictEqual(accused, 0,
+                    'n=' + n + ' w=' + w + ': and no CORRECT place may ever be accused inside the boundary');
+            } else {
+                outside++;
+                assert.ok(named < w,
+                    'n=' + n + ' w=' + w + ': past the boundary it cannot name them all');
+            }
+        }
+    }
+    assert.ok(inside >= 20 && outside >= 10, 'the sweep covered both sides (' + inside + '/' + outside + ')');
+});
+
+test('G5: past the boundary it names the CORRECT places — recorded, not fixed', function () {
+    /* Five of seven towns geocoded to Mexico. The two real ones are now the geometric
+       minority and they are what gets named. This is not a defect in the function: it
+       names the minority, and when the errors are the majority the minority IS the
+       correct set. There is no signal inside the function that could tell the two apart —
+       "one stray among eleven" and "eleven strays among one" are the same geometry with
+       different labels — and a guard on "too many places named" was tried against the
+       sweep and suppresses nothing, because only one to three are named out of seven. */
+    const MEXICO = [[22.136, -100.952], [21.122, -101.683], [20.967, -89.617],
+                    [19.041, -98.206], [17.062, -96.725]];
+    const mostlyWrong = N_SPAIN.slice(0, 7).map(function (p, i) {
+        return i < 5 ? pl(p.name + ' (MX)', MEXICO[i][0], MEXICO[i][1], p.name + ', Mexico') : p;
+    });
+    const found = geocodeOutliers(mostlyWrong);
+    assert.ok(found.length > 0 && found.every(function (f) { return f.name.indexOf('(MX)') === -1; }),
+        'it names the two correct towns, because they are the minority');
+    /* displayName is what the user reads, and it is the one signal that does not depend
+       on the errors being outnumbered — hence its mandatory status. */
+    found.forEach(function (f) { assert.ok(f.displayName.length > 0); });
+});
+
+test('G5: the majority condition is necessary, not sufficient', function () {
+    /* Whether an error inside the boundary is actually named still depends on the trip's
+       own spread, which is the denominator. The SAME Mexican village scores x39.6 against
+       the user's tight regional itinerary and x18.8 against his Spain-wide one — both
+       named, but a wider trip would not be. */
+    const tight = geocodeOutliers(N_SPAIN_BROKEN);
+    assert.strictEqual(tight.length, 1);
+
+    const wide = [pl('Barcelona', 41.3825802, 2.177073), pl('Fisterra', 42.9286659, -9.2626624),
+                  pl('Lugo', 43.0395266, -7.4567985), pl('Castellar del Valles', 41.6183431, 2.0879423),
+                  pl('Leon', 45.7578137, 4.8320114, 'Lyon, France'),
+                  pl('Santillana de Mar', 22.1356454, -100.9519141, 'San Luis Potosi, Mexico')];
+    const found = geocodeOutliers(wide);
+    assert.strictEqual(found.length, 1, 'still named across a Spain-wide trip');
+    assert.strictEqual(found[0].name, 'Santillana de Mar');
+    assert.ok(found[0].km > tight[0].km - 500 && found[0].km > 8000);
+});
+
+test('G5: the round-1 false-positive evidence is untouched', function () {
+    /* The 60-itinerary corpus behind the 5,000 km floor and the x15 multiple must not
+       have been weakened to buy any of the above. Spot-checked here on the three cases
+       that constrain the two constants most tightly. */
+    const perth = cityStops('Perth', -31.953, 115.857).concat([pl('Sydney', -33.868, 151.209)]);
+    assert.deepStrictEqual(geocodeOutliers(perth), [], 'Perth-Sydney: the floor\'s lower anchor');
+
+    const russia = [pl('Moscow', 55.75, 37.62), pl('St Petersburg', 59.94, 30.31),
+                    pl('Kazan', 55.79, 49.12), pl('Vladivostok', 43.12, 131.89)];
+    assert.deepStrictEqual(geocodeOutliers(russia), [], "Vladivostok: the multiple's lower anchor");
+
+    const london = cityStops('London', 51.507, -0.128).concat([pl('Edinburgh', 55.953, -3.188)]);
+    assert.deepStrictEqual(geocodeOutliers(london), [], 'hub-and-spoke: why a ratio alone is worthless');
+});
+
+/* ── G6: what a plurality is worth, and what it is not ── */
+
+test('G6: a genuine 3-against-3 tie relocates nothing', async function () {
+    /* Three Spanish places against three American ones, both groups at the anchor
+       minimum. There is no majority opinion here, only a coin toss, and acting on it
+       would make the answer depend on nothing at all. (The earlier tie test could not
+       reach this check — its groups were of two, so the anchor floor stopped it first.)
+       'Santiago' is measured live and really does resolve to Costa Rica. */
+    resetGeoRateLimit();
+    const names = ['Bilbao', 'Gijon', 'Fisterra', 'Santillana de Mar', 'Leon', 'Santiago'];
+    const out = await geocodePlaces(names, geoOpts({ fetchImpl: liveFetch() }));
+
+    assert.strictEqual(byName(out, 'Santiago').lat, 9.8694792, 'Santiago really is in Costa Rica');
+    out.forEach(function (p) {
+        assert.strictEqual(p.chosenByCluster, false,
+            p.name + ': a tie is not a plurality, so nothing is decided');
+    });
+    assert.strictEqual(byName(out, 'Leon').lat, 31.2715127, "the geocoder's own ranking stands");
+
+    /* One more Spanish place breaks the tie 4-3, and the mechanism engages. */
+    resetGeoRateLimit();
+    const broken = await geocodePlaces(names.concat(['Lugo']), geoOpts({ fetchImpl: liveFetch() }));
+    assert.strictEqual(byName(broken, 'Leon').chosenByCluster, true, '4 against 3 is a plurality');
+    assert.ok(byName(broken, 'Leon').displayName.indexOf('Lyon') !== -1);
+});
+
+test('G6: the tie rule is what makes the answer independent of input order', async function () {
+    /* Without it, the largest group is whichever the sort happened to leave first, so a
+       reordered list would answer differently — the exact failure the whole two-phase
+       design exists to avoid. */
+    const names = ['Bilbao', 'Gijon', 'Fisterra', 'Santillana de Mar', 'Leon', 'Santiago'];
+    resetGeoRateLimit();
+    const a = await geocodePlaces(names, geoOpts({ fetchImpl: liveFetch() }));
+    resetGeoRateLimit();
+    const b = await geocodePlaces(names.slice().reverse(), geoOpts({ fetchImpl: liveFetch() }));
+
+    const key = function (l) {
+        return l.slice().sort(function (x, y) { return x.name < y.name ? -1 : 1; })
+            .map(function (p) { return p.name + '@' + p.lat + ',' + p.lon + ',' + p.chosenByCluster; });
+    };
+    assert.deepStrictEqual(key(a), key(b), 'the tie is resolved the same way from either end: not at all');
+});
+
+test('G6: cluster preference can recover the RIGHT place, not just a nearer wrong one', async function () {
+    /* 'Guadalajara' first-resolves to Jalisco, Mexico — and the Spanish one is sitting at
+       candidate [1]. This is the case the mechanism is actually good at, and it ends with
+       the user's real destination and a label that confirms it. */
+    resetGeoRateLimit();
+    const out = await geocodePlaces(['Bilbao', 'Gijon', 'Fisterra', 'Lugo', 'Guadalajara'],
+        geoOpts({ fetchImpl: liveFetch() }));
+
+    const g = byName(out, 'Guadalajara');
+    assert.strictEqual(g.candidates, 4);
+    assert.strictEqual(g.chosenByCluster, true, 'relocated, and declared');
+    assert.ok(g.displayName.indexOf('Castilla-La Mancha') !== -1,
+        'and it is the Spanish Guadalajara: ' + g.displayName);
+    assert.ok(g.lat > 40 && g.lat < 41 && g.lon > -4 && g.lon < -2, 'really in Spain');
+
+    /* Nothing is left for the outlier check to find. */
+    assert.deepStrictEqual(geocodeOutliers(out), [], 'the trip is coherent again');
+});
+
+test('G6: swapping one wrong continent for another is not an improvement', async function () {
+    /* 'Santiago' offers Costa Rica, Chile, Cuba, the Dominican Republic and Brazil, and
+       NOT Santiago de Compostela. Against a Spanish cluster the "nearest" is the Dominican
+       Republic at ~6,600 km. Taking it would destroy a label the user could recognise
+       ("Santiago, Cartago, Costa Rica"), replace it with an equally wrong one, and raise a
+       flag implying something had been fixed. So nothing on offer is taken. */
+    resetGeoRateLimit();
+    const out = await geocodePlaces(['Bilbao', 'Gijon', 'Fisterra', 'Lugo', 'Santiago'],
+        geoOpts({ fetchImpl: liveFetch() }));
+
+    const s = byName(out, 'Santiago');
+    assert.strictEqual(s.candidates, 5, 'five candidates, none of them in Spain');
+    assert.strictEqual(s.chosenByCluster, false, 'no flag, because nothing was fixed');
+    assert.strictEqual(s.lat, 9.8694792, 'the geocoder\'s own first answer stands');
+    assert.ok(s.displayName.indexOf('Costa Rica') !== -1,
+        'and the user keeps the label that tells him: ' + s.displayName);
+
+    /* The outlier check is what carries this case, exactly as intended. */
+    const strays = geocodeOutliers(out);
+    assert.strictEqual(strays.length, 1);
+    assert.strictEqual(strays[0].name, 'Santiago');
+    assert.ok(strays[0].displayName.indexOf('Costa Rica') !== -1,
+        'named, with the label that explains it');
+
+    /* Prove the alternative really was on offer and really was declined. */
+    resetGeoRateLimit();
+    const loose = await geocodePlaces(['Bilbao', 'Gijon', 'Fisterra', 'Lugo', 'Santiago'],
+        geoOpts({ fetchImpl: liveFetch(), clusterLinkKm: 40000 }));
+    const moved = byName(loose, 'Santiago');
+    assert.strictEqual(moved.chosenByCluster, true, 'without the rule it is relocated...');
+    assert.ok(moved.displayName.indexOf('Dominicana') !== -1,
+        '...to the Dominican Republic, which helps nobody: ' + moved.displayName);
 });

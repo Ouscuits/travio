@@ -23,7 +23,7 @@
  *   opts = { fetchImpl, sleepImpl, now, storage, minIntervalMs, cacheTtlMs,
  *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, maxSnapKm,
  *            roadFactor, speedKmh, userAgent, language, geocodeLimit,
- *            clusterMinAnchors, clusterMoveKm,
+ *            clusterMinAnchors, clusterMoveKm, clusterLinkKm,
  *            outlierMultiple, outlierMinKm, outlierMinPlaces }
  *
  * GEOCODING PROVENANCE — the second half of this file's job, and the newer half.
@@ -72,24 +72,60 @@
  *                (exactly one candidate), take their median centre, and for each
  *                ambiguous place prefer the candidate nearest it
  *   Cost: zero extra requests, zero extra latency, and the result is order-independent.
- *   THE ANCHOR IS A MEDIAN, NOT A MEAN. In the user's real case the unambiguous places
- *   are Santillana de Mar (MEXICO), Finisterre (FRANCE), Bilbao and Gijon — a mean sits
- *   in the Atlantic, the component-wise median sits at 43.40, -4.85, in northern Spain.
- *   A median needs to be outvoted to be wrong, hence GEO_CLUSTER_MIN_ANCHORS = 3: with
- *   fewer anchors one bad one carries the centre, and relocating everything to match a
- *   wrong anchor would manufacture a coherent-looking wrong trip that the outlier check
- *   below could no longer see. Under three anchors NOTHING is relocated — no evidence,
- *   no decision — and `candidates > 1` still carries the ambiguity to the UI.
- *   GEO_CLUSTER_MOVE_KM = 100 stops the flag becoming noise. Nominatim routinely returns
- *   several nodes for ONE town, and picking a different node of the same town is not a
- *   relocation worth telling anyone about. Both anchors measured on the live answers
- *   above: the widest spread between duplicate entries for the same town is 34 km (the
- *   two "Leon, Castilla y Leon" nodes; Fisterra's three span 14 km, Lugo's Spanish three
- *   13 km, Oviedo's two 2.8 km), and the closest pair of genuinely DIFFERENT places
- *   inside one candidate list is ~1000 km (Leon County TX vs Leon County FL). 100 km is
- *   x2.9 above the largest duplicate and x10 below the smallest distinct pair.
- *   On the user's case this moves 'Leon' from Texas to Lyon — still not what he meant,
- *   but 852 km from his trip instead of 7,704, and FLAGGED, which is the whole point.
+ *
+ *   WHAT THE ANCHOR IS, AND THE DEFINITION THE USER'S OWN CASE DESTROYED. The first
+ *   version anchored on the places that returned exactly ONE candidate, reasoning that a
+ *   single result means the name was unambiguous. The whole lesson of this bug is that a
+ *   single result does not mean CORRECT: "Santillana de Mar" returns one candidate and it
+ *   is in Mexico, "Finisterre" returns one and it is in Brittany. That definition seeded
+ *   the cluster with precisely the errors the mechanism exists to survive, and on the
+ *   user's SECOND real trip it disarmed it completely:
+ *       Barcelona, Santillana de Mar, Leon, Fisterra, Lugo, Castellar del Valles
+ *       single-result names: Santillana (MEXICO) and Castellar -> two anchors, below the
+ *       minimum of three -> 'Leon' never relocated -> Leon County, TEXAS -> and with two
+ *       wrong out of six, geocodeOutliers found nothing either. Silent, both mechanisms.
+ *   The anchor is now THE LARGEST MUTUALLY-COHERENT GROUP of first-choice results: every
+ *   resolved place votes with its first candidate, places within GEO_CLUSTER_LINK_KM of
+ *   each other (transitively) form a group, and the biggest group anchors the centre.
+ *   A confidently-wrong geocode is a minority of one; a correct set of Spanish towns is a
+ *   majority that agrees with ITSELF. Agreement is evidence, confidence is not. On the
+ *   trip above the four Spanish places outvote the Mexico/Texas pair 4 to 2, 'Leon' moves
+ *   to Lyon (flagged), and with only one error left geocodeOutliers then names it.
+ *   It needs a PLURALITY, not unanimity, and it degrades gracefully. A STRICT plurality:
+ *   on a tie there is no majority opinion, only a coin toss, so nothing is relocated.
+ *   GEO_CLUSTER_LINK_KM is SINGLE linkage, not a radius, because a real trip is a CHAIN —
+ *   Cape Town to Cairo is 7,250 km end to end but joined by Johannesburg and Nairobi.
+ *   GEO_CLUSTER_MIN_ANCHORS = 3 because a wrong pair is itself a coherent group of two
+ *   (Mexico and Texas are 1,200 km apart), so without a floor a three-place trip could be
+ *   anchored on the two errors in it.
+ *   A candidate is only taken if it could belong to the trip at all — within
+ *   GEO_CLUSTER_LINK_KM of the anchor centre. Measured live, 'Santiago' offers Costa
+ *   Rica, Chile, Cuba, the Dominican Republic and Brazil, and NOT Santiago de Compostela;
+ *   the "nearest" to a Spanish cluster is the Dominican Republic at 6,600 km. Swapping
+ *   one wrong continent for another destroys a label the user could have recognised and
+ *   raises a flag implying something was fixed. When nothing on offer could be part of
+ *   the journey, the geocoder's ranking stands and the outlier check names it instead.
+ *   GEO_CLUSTER_MOVE_KM = 100 is the improvement an alternative must show before the
+ *   geocoder's own ranking is overridden — how much NEARER the trip it is, not merely
+ *   that it is nearer. Nominatim routinely returns several nodes for ONE town and one is
+ *   always marginally closer; acting on a 3 km preference moves nothing real while
+ *   raising a flag the UI must explain. Both bounds measured on the live answers above:
+ *   the widest spread between duplicate entries for one town is 34 km (the two "Leon,
+ *   Castilla y Leon" nodes; Fisterra's three span 14 km, Lugo's Spanish three 13 km,
+ *   Oviedo's two 2.8 km), and the closest pair of genuinely DIFFERENT places inside one
+ *   candidate list is ~1,000 km (Leon County TX vs Leon County FL). 100 km is x2.9 above
+ *   the largest duplicate and x10 below the smallest distinct pair.
+ *   On both of the user's trips this moves 'Leon' from Texas to Lyon — still not what he
+ *   meant, the app cannot know that — but ~850 km from his trip instead of ~7,700, and
+ *   FLAGGED, which is the whole point.
+ *
+ *   THE LIMIT, AND IT IS SHARED WITH THE OUTLIER CHECK BELOW. This rests on the correct
+ *   places being the largest coherent group. Nothing here can tell WHICH group is which:
+ *   the geometry of "ten right and two wrong" is identical to "two right and ten wrong",
+ *   only the labels differ, and this module has no ground truth. When the errors are the
+ *   majority, the anchor moves onto them. That is why every relocation is flagged, and
+ *   why `displayName` is mandatory rather than a nicety — it is the ONE signal in this
+ *   file that does not depend on the errors being outnumbered.
  *
  * OUTLIERS — geocodeOutliers(places, opts) -> [{ name, displayName, km }]
  *   PURE and SYNCHRONOUS: no network, no clock, no storage, no globals. Places whose
@@ -137,11 +173,36 @@
  *   "Saint-Denis is 9,363 km from your other destinations" is true — while a road planner
  *   asked to drive there is producing exactly the plan this branch exists to make visible.
  *
- *   KNOWN LIMITATION: when roughly half the places are wrong, geometry has nothing to say.
- *   Six places in Spain and six in Mexico give a median centre in mid-Atlantic and a
- *   median spread of thousands of km, so the ratio collapses towards 1 and the list comes
- *   back empty. This is honest — there is no majority to be an outlier FROM — and it is
- *   the reason `displayName` is mandatory rather than a fallback.
+ *   THE REAL BOUNDARY, MEASURED — the earlier wording here said "when roughly HALF the
+ *   places are wrong", which was optimistic and would let someone trust this further than
+ *   it goes. Swept over the northern-Spain itinerary with w of its n places moved to
+ *   Mexico, for every n from 3 to 12 and every w from 1 to 6, the boundary is exact and
+ *   it is the median's own defining property:
+ *
+ *       all w errors are named   <=>   n >= 2w + 1   (the correct places are a STRICT
+ *                                                     majority)
+ *
+ *   1 wrong of 12: named. 1 wrong of 3: named. 2 wrong of 5: named. 3 wrong of 7: named.
+ *   5 wrong of 11: named. 2 wrong of 4: NOT named. 3 wrong of 6: NOT named.
+ *
+ *   PAST THAT BOUNDARY IT DOES NOT MERELY GO QUIET — IT NAMES THE WRONG PLACES. At n=7
+ *   with 5 errors the two CORRECT towns are the geometric minority, and they are what
+ *   gets named. This is not a defect to be fixed: the function names the minority, and
+ *   when the errors are the majority the minority IS the correct set. Measured across the
+ *   whole sweep, a correct place is never named while n >= 2w+1 holds, and there is no
+ *   signal inside the function that could detect the crossing — "one stray among eleven"
+ *   and "eleven strays among one" are the same geometry with different labels. A guard on
+ *   "too many places named" was tried against the sweep and suppresses nothing: in every
+ *   false-accusation case only one to three places are named out of seven to nine.
+ *
+ *   THE MAJORITY CONDITION IS NECESSARY, NOT SUFFICIENT. Whether an error inside the
+ *   boundary is actually named still depends on the trip's own spread, which is the
+ *   denominator: the same Mexican village scores x39.6 against a tight regional itinerary
+ *   (the user's first trip) and x18.8 against one spanning all of Spain (his second).
+ *   Both are named; a wider trip would not be.
+ *
+ *   This is the reason `displayName` is mandatory rather than a fallback. It is the only
+ *   signal here that survives the errors being in the majority.
  *
  * RATE LIMITING — ONE queue, ALL THREE network entry points.
  *   geocodePlaces (Nominatim), distanceMatrix (OSRM /table) and routeGeometry (OSRM
@@ -454,10 +515,16 @@
        down beside it there, not here. */
     const GEO_GEOCODE_LIMIT       = 5;      // candidates asked of Nominatim (was 1)
     const GEO_DISPLAY_NAME_MAX    = 300;    // defensive cap; live labels run 40-150 chars
-    const GEO_CLUSTER_MIN_ANCHORS = 3;      // fewer unambiguous places -> relocate nothing
-    const GEO_CLUSTER_MOVE_KM     = 100;    // below this it is the same town, not a move
+    const GEO_CLUSTER_MIN_ANCHORS = 3;      // smaller plurality -> relocate nothing
+    const GEO_CLUSTER_MOVE_KM     = 100;    // required improvement before overriding the
+                                            // geocoder's own ranking
     const GEO_OUTLIER_MULTIPLE    = 15;     // x median spread from the median centre
     const GEO_OUTLIER_MIN_KM      = 5000;   // and this far in absolute terms
+    const GEO_CLUSTER_LINK_KM     = 5000;   // two places belong to the same trip if they are
+                                            // within this of each other. Deliberately the
+                                            // same number as GEO_OUTLIER_MIN_KM: it is the
+                                            // same question ("could these be one journey?")
+                                            // and the same 3,289 km / 7,704 km evidence.
     const GEO_OUTLIER_MIN_PLACES  = 3;      // two places are always equidistant from
                                             // their own median: nothing to compare
 
@@ -514,7 +581,9 @@
             clusterMinAnchors: typeof o.clusterMinAnchors === 'number' && o.clusterMinAnchors >= 1
                                 ? Math.floor(o.clusterMinAnchors) : GEO_CLUSTER_MIN_ANCHORS,
             clusterMoveKm:  typeof o.clusterMoveKm === 'number' && o.clusterMoveKm >= 0
-                                ? o.clusterMoveKm : GEO_CLUSTER_MOVE_KM
+                                ? o.clusterMoveKm : GEO_CLUSTER_MOVE_KM,
+            clusterLinkKm:  typeof o.clusterLinkKm === 'number' && o.clusterLinkKm > 0
+                                ? o.clusterLinkKm : GEO_CLUSTER_LINK_KM
         };
     }
 
@@ -991,6 +1060,101 @@
     }
 
     /*
+     * Partition points into groups by single linkage: two points are in the same group
+     * when they are within `linkKm`, transitively. Union-find, O(n^2) over n <= a few
+     * dozen. The partition is a property of the point set alone, so it does not depend on
+     * the order the user typed the names in.
+     *
+     * SINGLE linkage, not a radius about a centre, because a real road trip is a CHAIN:
+     * Cape Town to Cairo is 7,250 km apart but joined by Johannesburg and Nairobi, and
+     * every consecutive leg of every itinerary measured is far below the link distance.
+     * A wrong-continent geocode has no such chain to its neighbours and falls out alone.
+     */
+    function geoLinkGroups(points, linkKm) {
+        const n = points.length;
+        const parent = new Array(n);
+        for (let i = 0; i < n; i++) parent[i] = i;
+        const find = function (i) {
+            while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+            return i;
+        };
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+                if (haversineKm(points[i].lat, points[i].lon, points[j].lat, points[j].lon) <= linkKm) {
+                    const a = find(i), b = find(j);
+                    if (a !== b) parent[a] = b;
+                }
+            }
+        }
+        const byRoot = new Map();
+        for (let i = 0; i < n; i++) {
+            const r = find(i);
+            if (!byRoot.has(r)) byRoot.set(r, []);
+            byRoot.get(r).push(points[i]);
+        }
+        const groups = Array.from(byRoot.values());
+        groups.sort(function (a, b) { return b.length - a.length; });
+        return groups;
+    }
+
+    /*
+     * The anchor set: THE LARGEST MUTUALLY-COHERENT GROUP of first-choice results.
+     *
+     * THIS REPLACES "the places that returned exactly one candidate", and the user's own
+     * case is what disproved that definition. A single result does not mean CORRECT:
+     * "Santillana de Mar" returns exactly one candidate and it is in Mexico, and
+     * "Finisterre" returns exactly one and it is in Brittany. Anchoring on single-result
+     * names therefore seeded the cluster with precisely the errors the mechanism exists
+     * to survive. Measured on the user's second real trip (Barcelona, Santillana de Mar,
+     * Leon, Fisterra, Lugo, Castellar del Valles) the only single-result names were
+     * Santillana (Mexico) and Castellar — two anchors, below the minimum of three — so
+     * 'Leon' was not relocated and stayed in Texas. The mechanism was disarmed by the
+     * error it was meant to catch.
+     *
+     * A confidently-wrong geocode is a minority of one; a correct set of Spanish towns is
+     * a majority that agrees with ITSELF. Agreement is evidence; confidence is not. So
+     * every resolved place votes with its first choice, and the biggest group of places
+     * that could plausibly be one journey becomes the anchor. This needs a PLURALITY, not
+     * unanimity, and it degrades gracefully: on the trip above the four Spanish places
+     * outvote the Mexico/Texas pair 4 to 2 and 'Leon' moves to Lyon, flagged.
+     *
+     * A STRICT plurality is required. On a tie there is no majority opinion to anchor on —
+     * two Spanish places against two American ones is not evidence, it is a coin toss —
+     * and the honest response is to relocate nothing. Same for a plurality below
+     * clusterMinAnchors: the Mexico/Texas pair is itself a coherent group of two, and
+     * without a floor a trip of three could be anchored on the two errors in it.
+     *
+     * A name repeated by the user is one place, not two votes.
+     *
+     * THE LIMIT, stated plainly: this rests on the correct places being the largest
+     * coherent group. Nothing here can tell which group is which — the geometry of "ten
+     * right and two wrong" is identical to "two right and ten wrong", only the labels
+     * differ, and this module has no ground truth. When the errors are the majority the
+     * anchor moves onto them. That is why every relocation is flagged and why
+     * `displayName` is mandatory: it is the ONE signal in this file that does not depend
+     * on the errors being outnumbered.
+     */
+    function geoAnchorCentre(out, candidateLists, cfg) {
+        const points = [];
+        const seen = Object.create(null);
+        for (let i = 0; i < out.length; i++) {
+            const list = candidateLists[i];
+            if (!out[i] || !out[i].resolved || !list || !list.length) continue;
+            const key = normalisePlaceName(out[i].name);
+            if (seen[key]) continue;
+            seen[key] = true;
+            points.push({ lat: list[0].lat, lon: list[0].lon });
+        }
+        if (points.length < cfg.clusterMinAnchors) return null;
+
+        const groups = geoLinkGroups(points, cfg.clusterLinkKm);
+        const largest = groups[0];
+        if (!largest || largest.length < cfg.clusterMinAnchors) return null;
+        if (groups.length > 1 && groups[1].length === largest.length) return null;  // no plurality
+        return geoMedianCentre(largest);
+    }
+
+    /*
      * PHASE 2 of geocoding — pure, no network, runs once every candidate list is in hand.
      * See CLUSTER PREFERENCE in the header for why the choice is made here rather than
      * incrementally during the (rate-limited, sequential) network phase.
@@ -1000,40 +1164,43 @@
      * moved, so the flag is what makes the choice reviewable rather than imposed.
      */
     function geoPreferCluster(out, candidateLists, cfg) {
-        /* Anchors: resolved places whose name was UNAMBIGUOUS. A name repeated by the
-           user is one place, not two votes — normalised-name dedup keeps the median
-           honest about how many distinct anchors there really are. */
-        const anchors = [];
-        const seen = Object.create(null);
-        for (let i = 0; i < out.length; i++) {
-            const list = candidateLists[i];
-            if (!out[i] || !out[i].resolved || !list || list.length !== 1) continue;
-            const key = normalisePlaceName(out[i].name);
-            if (seen[key]) continue;
-            seen[key] = true;
-            anchors.push({ lat: list[0].lat, lon: list[0].lon });
-        }
-        if (anchors.length < cfg.clusterMinAnchors) return;
-
-        const centre = geoMedianCentre(anchors);
+        const centre = geoAnchorCentre(out, candidateLists, cfg);
+        if (!centre) return;
 
         for (let i = 0; i < out.length; i++) {
             const list = candidateLists[i];
             if (!out[i] || !out[i].resolved || !list || list.length < 2) continue;
 
+            const firstKm = haversineKm(centre.lat, centre.lon, list[0].lat, list[0].lon);
             let best = 0;
-            let bestKm = haversineKm(centre.lat, centre.lon, list[0].lat, list[0].lon);
+            let bestKm = firstKm;
             for (let k = 1; k < list.length; k++) {
                 const d = haversineKm(centre.lat, centre.lon, list[k].lat, list[k].lon);
                 if (d < bestKm) { bestKm = d; best = k; }   // strict: ties keep the earlier
             }
             if (best === 0) continue;
 
-            /* Nominatim routinely returns several nodes for ONE town. Swapping between
-               them is not a relocation and must not raise a flag the UI would have to
-               explain — see GEO_CLUSTER_MOVE_KM in the header. */
-            const moved = haversineKm(list[0].lat, list[0].lon, list[best].lat, list[best].lon);
-            if (moved <= cfg.clusterMoveKm) continue;
+            /* THE CANDIDATE TAKEN MUST BE ABLE TO BELONG TO THIS TRIP AT ALL. Measured
+               live: 'Santiago' offers Costa Rica, Chile, Cuba, the Dominican Republic and
+               Brazil — and NOT Santiago de Compostela. Against a Spanish cluster the
+               "nearest" of those is the Dominican Republic, 6,600 km away. Swapping one
+               wrong continent for another is not an improvement, it is a fabricated one:
+               it destroys the label the user could have recognised ("Santiago, Cartago,
+               Costa Rica") and replaces it with an equally wrong one, while raising a flag
+               that implies something was fixed. When nothing on offer could be part of the
+               journey, the geocoder's own ranking stands and the outlier check names it. */
+            if (bestKm > cfg.clusterLinkKm) continue;
+
+            /* OVERRIDING THE GEOCODER'S OWN RANKING NEEDS A REASON WORTH THE OVERRIDE, and
+               the reason is how much nearer the trip the alternative actually is — not
+               merely that it is nearer at all. Nominatim routinely returns several nodes
+               for ONE town (three Fisterra nodes spanning 14 km, two Oviedo nodes 2.8 km
+               apart), one of which is always marginally closer; acting on a 3 km
+               preference would move nothing real while raising a flag the UI must explain.
+               Requiring the improvement to exceed clusterMoveKm also implies the two
+               candidates are more than clusterMoveKm apart (triangle inequality), so this
+               one test does the work of two. */
+            if (firstKm - bestKm <= cfg.clusterMoveKm) continue;
 
             out[i].lat = list[best].lat;
             out[i].lon = list[best].lon;
