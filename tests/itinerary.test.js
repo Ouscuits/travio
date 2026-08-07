@@ -90,7 +90,19 @@ const DICT = {
     'notice.tollsNotAvoided': 'The route below was NOT re-planned to avoid tolls, so tolls are not applicable rather than zero and the cost shown is a minimum.',
     'notice.tollsClamped': 'The AI estimated EUR {value} of tolls on day {day} for {km}; capped at EUR {capped}.',
     'notice.roundTrip': 'Round trip back to {place}.',
-    'notice.overBudget': 'Over budget on day(s) {days}.'
+    'notice.overBudget': 'Over budget on day(s) {days}.',
+    'itin.geoTitle': 'Where each place was located',
+    'itin.geoNote': 'These labels come from the geocoder, not from Travio.',
+    'itin.geoNotLocated': 'could not be located',
+    'itin.geoNoLabel': 'the geocoder returned no label',
+    'itin.geoBadgeOutlier': '{km} from the rest of the trip',
+    'itin.geoBadgeOutlierFar': 'far from the rest of the trip',
+    'itin.geoBadgeMatches': '{count} places matched this name',
+    'itin.geoBadgeMoved': 'not the first match: chosen for being nearer the rest of the trip',
+    'notice.geoOutlier': '"{name}" was located at {label}, {km} from the rest of the trip.',
+    'notice.geoOutlierNoDistance': '"{name}" was located at {label}, far from the rest of the trip.',
+    'notice.geoRelocated': '"{name}" matched more than one place. {label} was used, chosen for being nearer the rest of the trip.',
+    'notice.geoAmbiguous': '{count} of the names you typed matched more than one place ({names}).'
 };
 const CTX = { t: function (k) { return Object.prototype.hasOwnProperty.call(DICT, k) ? DICT[k] : k; } };
 
@@ -1950,13 +1962,17 @@ function loadRouteForm(opts) {
         TravioMap: o.noMap ? null : MAPMOD,
         TravioExport: o.noExport ? null : EXPMOD,
         planRoute: engine.planRoute,
-        geocodePlaces: function (names) {
+        geocodePlaces: o.geocodePlaces || function (names) {
             return Promise.resolve(names.map(function (n) {
                 const known = { Madrid: MADRID, Barcelona: BARCELONA, Zaragoza: ZARAGOZA }[n];
                 return known || P(n, 41, 1);
             }));
         }
     };
+    /* js/geo-provider.js is another builder's file and its outlier check may or may
+       not be present. The wiring must consume it when it is there and stay silent
+       when it is not, so the harness can supply either. */
+    if (o.geo) windowObj.TravioGeo = o.geo;
     if (o.geometry !== 'absent') {
         windowObj.routeGeometry = function (places) {
             geometryCalls++;
@@ -2426,5 +2442,432 @@ test('W10: place names with markup in them cannot escape into the map', function
         assert.strictEqual(svg.indexOf('<b>'), -1, 'raw markup reached the SVG');
         assert.match(svg, /&lt;b&gt;/, 'the name is present, escaped');
         assert.ok(app.els.routeMapLegend.childNodes.length > 0, 'the legend describes what is drawn');
+    });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   G — WHERE THE PLACES ACTUALLY ARE
+   ═══════════════════════════════════════════════════════════════════════════════
+   A real user planned Barcelona -> Castellar del Valles via Santillana, Leon,
+   Fisterra and Lugo and was told 24,179 km and 268 hours of driving. Nothing was
+   broken. "Santillana de Mar" had geocoded to San Luis Potosi in MEXICO and "Leon"
+   to Lyon in FRANCE; the itinerary was internally consistent, the warnings fired,
+   the map drew it — and at no point did the screen say WHERE those places were.
+   He tested twice and hit it twice.
+
+   Every test below fails against the code that shipped before them.
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* The two places that ruined his trip, as the geocoder actually returned them. */
+const SANTILLANA_MX = P('Santillana de Mar', 22.1565, -100.9855,
+    { displayName: 'San Luis Potosi, Mexico', candidates: 4 });
+const LEON_FR = P('Leon', 45.7640, 4.8357,
+    { displayName: 'Lyon, Auvergne-Rhone-Alpes, France', candidates: 6 });
+const BCN_ES = P('Barcelona', 41.3851, 2.1734,
+    { displayName: 'Barcelona, Catalunya, Espana', candidates: 1 });
+const CASTELLAR = P('Castellar del Valles', 41.6178, 2.0894,
+    { displayName: 'Castellar del Valles, Barcelona, Catalunya, Espana', candidates: 1 });
+const FISTERRA = P('Fisterra', 42.9070, -9.2637,
+    { displayName: 'Fisterra, A Coruna, Galicia, Espana', candidates: 2 });
+const LUGO = P('Lugo', 43.0121, -7.5559,
+    { displayName: 'Lugo, Galicia, Espana', candidates: 3 });
+
+/* What geocodeOutliers() reports for that trip: the Mexican village is thousands of
+   kilometres from the median centre of everything else. */
+const MX_OUTLIER = [{ name: 'Santillana de Mar', displayName: 'San Luis Potosi, Mexico', km: 8135 }];
+
+function geoView(places, outliers) {
+    return I.buildGeoView(places, [], outliers);
+}
+
+/* ── G1 — the single change that would have saved both of his tests ── */
+
+test('G1: the itinerary states the full label of every place the geocoder chose', function () {
+    const plan = planFor(BCN_ES, CASTELLAR, [SANTILLANA_MX, LEON_FR, FISTERRA, LUGO], 5);
+    const view = I.buildItineraryView({
+        plan: plan, requestedStops: ['Santillana de Mar', 'Leon', 'Fisterra', 'Lugo'],
+        startName: 'Barcelona', endName: 'Castellar del Valles',
+        places: [BCN_ES, SANTILLANA_MX, LEON_FR, FISTERRA, LUGO, CASTELLAR],
+        geoOutliers: MX_OUTLIER,
+        matrixSource: 'osrm', maxDriveMin: 360, dailyBudget: 150,
+        departureTime: '09:00', t: CTX.t
+    });
+    const html = I.renderItineraryHtml(view, CTX);
+
+    assert.ok(html.indexOf('San Luis Potosi, Mexico') >= 0,
+        'the screen never said the village was in Mexico — that is the whole bug');
+    assert.ok(html.indexOf('Lyon, Auvergne-Rhone-Alpes, France') >= 0,
+        '"Leon" resolved to Lyon and the screen must say so');
+    for (let i = 0; i < view.geo.places.length; i++) {
+        assert.ok(html.indexOf(view.geo.places[i].displayName) >= 0,
+            'every place carries its label, not just the suspicious ones');
+    }
+
+    /* And it is readable BEFORE the numbers it explains. */
+    assert.ok(html.indexOf('geo-panel') < html.indexOf('summary-card'),
+        'the labels have to be above the kilometres, not below them');
+
+    /* The plain-text mirror is what an export and a copy/paste carry away. */
+    const plain = I.buildPlainSummary(view, CTX);
+    assert.ok(plain.indexOf('San Luis Potosi, Mexico') >= 0, 'the label travels with the export too');
+});
+
+test('G1: the geocoder label is never invented — an unlabelled place says so', function () {
+    const nameOnly = P('Nowhere in particular', 41, 1);            /* resolved, no label */
+    const ghost = P('Atlantis', null, null, { resolved: false });
+    const geo = geoView([BCN_ES, nameOnly, ghost], []);
+    assert.strictEqual(geo.places[1].displayName, '');
+    assert.strictEqual(geo.places[2].displayName, '');
+
+    const html = I.renderItineraryHtml({
+        plan: { days: [], order: [] }, costs: I.computeCosts({ days: [] }, {}),
+        notices: [], geo: geo, meta: {}
+    }, CTX);
+    assert.ok(html.indexOf('the geocoder returned no label') >= 0,
+        'a resolved place with no label says the geocoder gave none');
+    assert.ok(html.indexOf('could not be located') >= 0,
+        'an unresolved place says it was not located');
+    /* The typed name must never be echoed back into the label slot as if it were a
+       match — that is exactly the false confidence this whole piece removes. */
+    assert.strictEqual(html.indexOf('<span class="geo-label">Nowhere in particular'), -1);
+});
+
+test('G1: a trip the app knows nothing about renders no block at all', function () {
+    /* Every place from a build that predates displayName: no labels, no candidate
+       counts, no outliers. A list of blanks would be a claim in itself. */
+    assert.strictEqual(geoView([MADRID, ZARAGOZA, BARCELONA], []), null);
+    const view = I.buildItineraryView({
+        plan: planFor(MADRID, BARCELONA, [ZARAGOZA], 2),
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm',
+        dailyBudget: 200, t: CTX.t
+    });
+    assert.strictEqual(view.geo, null);
+    assert.strictEqual(I.renderItineraryHtml(view, CTX).indexOf('geo-panel'), -1);
+});
+
+/* ── G2 — the odd one out is the loudest thing on the page ── */
+
+test('G2: an outlier is an ALERT and is read before every other notice', function () {
+    /* A day over the drive cap, a blown budget, and no road data — all three of the
+       loud things this app already knew how to say, plus a place in Mexico. */
+    const plan = planFor(BCN_ES, CASTELLAR, [SANTILLANA_MX, LEON_FR], 1);
+    const costs = I.computeCosts(plan, { dailyBudget: 10 });
+    const notices = I.buildNotices(plan, {
+        geo: geoView([BCN_ES, SANTILLANA_MX, LEON_FR, CASTELLAR], MX_OUTLIER),
+        maxDriveMin: 360, matrixSource: 'haversine', costs: costs,
+        startName: 'Barcelona', endName: 'Castellar del Valles'
+    });
+    const codes = notices.map(function (n) { return n.code; });
+
+    assert.strictEqual(codes[0], 'geoOutlier',
+        'the most likely explanation for every absurd number must not be buried: ' + codes.join(','));
+    assert.strictEqual(notices[0].level, 'alert');
+    assert.ok(codes.indexOf('overCap') > 0 && codes.indexOf('overBudget') > 0,
+        'fixture: the drive-cap and budget warnings are present and outranked');
+    assert.ok(codes.indexOf('haversine') > codes.indexOf('geoOutlier'),
+        'even the other alert comes after the one that explains it');
+
+    const text = I.noticeText(notices[0], CTX);
+    assert.ok(text.indexOf('Santillana de Mar') >= 0 && text.indexOf('San Luis Potosi, Mexico') >= 0,
+        'the alert names the place AND where it landed: ' + text);
+    assert.ok(text.indexOf('8135') >= 0, 'and how far away it is: ' + text);
+    assert.strictEqual(text.indexOf('{'), -1, 'no unfilled placeholder');
+});
+
+test('G2: an outlier with no usable distance still alerts, without printing a NaN', function () {
+    const junk = [{ name: 'Santillana de Mar', displayName: 'San Luis Potosi, Mexico', km: 'far away' }];
+    const notices = I.buildNotices({ days: [], order: [] },
+        { geo: geoView([BCN_ES, SANTILLANA_MX], junk) });
+    assert.strictEqual(notices[0].code, 'geoOutlierNoDistance');
+    assert.strictEqual(notices[0].level, 'alert');
+    const text = I.noticeText(notices[0], CTX);
+    assert.strictEqual(text.indexOf('NaN'), -1, 'a distance the app does not have is not printed as one');
+    assert.strictEqual(text.indexOf('null'), -1);
+    assert.ok(text.indexOf('San Luis Potosi, Mexico') >= 0);
+});
+
+test('G2: the outlier changes NOTHING it is not entitled to change', function () {
+    const base = {
+        plan: planFor(BCN_ES, CASTELLAR, [SANTILLANA_MX, LEON_FR], 3),
+        requestedStops: ['Santillana de Mar', 'Leon'],
+        startName: 'Barcelona', endName: 'Castellar del Valles',
+        places: [BCN_ES, SANTILLANA_MX, LEON_FR, CASTELLAR],
+        matrixSource: 'osrm', maxDriveMin: 360, dailyBudget: 150,
+        departureTime: '09:00', t: CTX.t
+    };
+    const quiet = I.buildItineraryView(base);
+    const loud = I.buildItineraryView(Object.assign({}, base, { geoOutliers: MX_OUTLIER }));
+
+    assert.deepStrictEqual(loud.plan.days.map(function (d) { return [d.km, d.driveMin]; }),
+        quiet.plan.days.map(function (d) { return [d.km, d.driveMin]; }),
+        'flagging a place must not move a single kilometre');
+    assert.deepStrictEqual(loud.costs.days.map(function (d) { return d.total; }),
+        quiet.costs.days.map(function (d) { return d.total; }));
+    assert.strictEqual(loud.costs.over, quiet.costs.over);
+
+    /* The card stops looking calm; the verdict itself is still given, because the
+       arithmetic is sound — it is the PREMISE that is in doubt. */
+    const html = I.renderItineraryHtml(loud, CTX);
+    assert.match(html, /summary-card summary-geo-outlier/);
+    assert.strictEqual(html.indexOf('The budget cannot be assessed'), -1,
+        'an outlier is not an excuse to withhold a verdict the numbers do support');
+});
+
+/* ── G3 — a choice made on the user's behalf, said out loud ── */
+
+test('G3: a candidate preferred for being nearer the cluster is never silent', function () {
+    const moved = P('Leon', 42.5987, -5.5671, {
+        displayName: 'Leon, Castilla y Leon, Espana', candidates: 6, chosenByCluster: true });
+    const geo = geoView([BCN_ES, moved, CASTELLAR], []);
+    const notices = I.buildNotices({ days: [], order: [] }, { geo: geo });
+    const hit = notices.filter(function (n) { return n.code === 'geoRelocated'; });
+    assert.strictEqual(hit.length, 1);
+    assert.strictEqual(hit[0].level, 'warn');
+    const text = I.noticeText(hit[0], CTX);
+    assert.ok(text.indexOf('Leon, Castilla y Leon, Espana') >= 0,
+        'the user must be able to see WHICH one was taken: ' + text);
+    assert.strictEqual(text.indexOf('{'), -1);
+
+    const html = I.renderItineraryHtml({
+        plan: { days: [], order: [] }, costs: I.computeCosts({ days: [] }, {}),
+        notices: notices, geo: geo, meta: {}
+    }, CTX);
+    assert.ok(html.indexOf('geo-badge-moved') >= 0, 'and the list marks the place it happened to');
+});
+
+test('G3: plain ambiguity is reported once, listing the names, not once per place', function () {
+    const geo = geoView([BCN_ES, SANTILLANA_MX, LEON_FR, FISTERRA, LUGO], []);
+    assert.strictEqual(geo.ambiguous, 4, 'fixture: four names matched more than one place');
+    const notices = I.buildNotices({ days: [], order: [] }, { geo: geo });
+    const amb = notices.filter(function (n) { return n.code === 'geoAmbiguous'; });
+    assert.strictEqual(amb.length, 1, 'four facts, one paragraph');
+    assert.strictEqual(amb[0].level, 'info');
+    const text = I.noticeText(amb[0], CTX);
+    assert.ok(text.indexOf('Santillana de Mar') >= 0 && text.indexOf('Lugo') >= 0, text);
+    assert.strictEqual(text.indexOf('{'), -1);
+
+    /* Barcelona matched exactly one place and is not accused of ambiguity. */
+    assert.strictEqual(text.indexOf('Barcelona'), -1);
+});
+
+test('G3: the loud notice wins — an outlier is not also reported as mere ambiguity', function () {
+    const geo = geoView([BCN_ES, SANTILLANA_MX], MX_OUTLIER);
+    const notices = I.buildNotices({ days: [], order: [] }, { geo: geo });
+    const amb = notices.filter(function (n) { return n.code === 'geoAmbiguous'; });
+    assert.strictEqual(amb.length, 0,
+        '"it matched 4 places" under "it is in Mexico" is noise, not information');
+    assert.strictEqual(notices.filter(function (n) { return n.code === 'geoOutlier'; }).length, 1);
+});
+
+/* ── G4 — the labels are untrusted input from an external service ── */
+
+test('G4: geocoder labels and place names are escaped everywhere they are shown', function () {
+    const evil = P('Sant "Joan" & Co <b>', 41.9, 2.1, {
+        displayName: '<img src=x onerror=alert(1)>, "Mexico" & co',
+        candidates: 3, chosenByCluster: true });
+    const view = I.buildItineraryView({
+        plan: planFor(BCN_ES, CASTELLAR, [evil], 2),
+        requestedStops: [evil.name], startName: 'Barcelona', endName: 'Castellar del Valles',
+        places: [BCN_ES, evil, CASTELLAR],
+        geoOutliers: [{ name: evil.name, displayName: evil.displayName, km: 9000 }],
+        matrixSource: 'osrm', maxDriveMin: 360, dailyBudget: 150, t: CTX.t
+    });
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('<img src=x'), -1, 'a geocoder label reached innerHTML raw');
+    assert.strictEqual(html.indexOf('<b>'), -1);
+    assert.ok(html.indexOf('&lt;img src=x') >= 0, 'the label is still shown, escaped');
+    assert.ok(html.indexOf('&quot;Mexico&quot;') >= 0);
+    assert.ok(html.indexOf('&amp;') >= 0);
+});
+
+/* ── G5 — it survives the save, and an old document gains no claim ── */
+
+test('G5: the labels round-trip through Firestore-safe JSON, byte for byte', function () {
+    const view = I.buildItineraryView({
+        plan: planFor(BCN_ES, CASTELLAR, [SANTILLANA_MX, LEON_FR], 4),
+        requestedStops: ['Santillana de Mar', 'Leon'],
+        startName: 'Barcelona', endName: 'Castellar del Valles',
+        places: [BCN_ES, SANTILLANA_MX, LEON_FR, CASTELLAR],
+        geoOutliers: MX_OUTLIER, matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 150, departureTime: '09:00', t: CTX.t
+    });
+    const doc = JSON.parse(JSON.stringify({
+        startPoint: 'Barcelona', endPoint: 'Castellar del Valles',
+        result: I.buildPlainSummary(view, CTX), structured: I.serialiseView(view)
+    }));
+    assert.strictEqual(I.isStructuredRoute(doc), true);
+
+    const restored = I.viewFromSaved(doc);
+    assert.strictEqual(I.renderItineraryHtml(restored, CTX), I.renderItineraryHtml(view, CTX),
+        'a saved route must show exactly the same labels it was saved with');
+    assert.strictEqual(restored.geo.outliers[0].displayName, 'San Luis Potosi, Mexico');
+    /* The provenance rides on the places themselves too, for anything reading the plan. */
+    const order = doc.structured.plan.order;
+    let found = false;
+    for (let i = 0; i < order.length; i++) {
+        if (order[i].name === 'Santillana de Mar') {
+            assert.strictEqual(order[i].displayName, 'San Luis Potosi, Mexico');
+            assert.strictEqual(order[i].candidates, 4);
+            assert.strictEqual(order[i].chosenByCluster, false);
+            found = true;
+        }
+    }
+    assert.ok(found, 'fixture: the place is in the saved order');
+});
+
+test('G5: a document written before any of this existed makes no claim about location', function () {
+    const doc = round1Doc([
+        round1CostDay(1, 300, 31.50, 12.50, 0, 35, 200),
+        round1CostDay(2, 300, 31.50, 0, 0, 35, 200)
+    ], 200);
+    assert.strictEqual(doc.structured.geo, undefined, 'fixture: no geo section at all');
+    const view = I.viewFromSaved(doc);
+    assert.strictEqual(view.geo, null);
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('geo-panel'), -1, 'no block, and no blanks pretending to be one');
+    for (let i = 0; i < view.notices.length; i++) {
+        assert.strictEqual(String(view.notices[i].code).indexOf('geo'), -1,
+            'a migration must not manufacture geocoding findings the document never had');
+    }
+});
+
+/* ── G6 — five locales, and no sentence carrying another one's words ── */
+
+test('G6: every geocoding string exists and fills in all five locales', function () {
+    const i18n = loadI18n();
+    const geo = geoView([BCN_ES, SANTILLANA_MX,
+        P('Leon', 42.6, -5.57, { displayName: 'Leon, Castilla y Leon, Espana', candidates: 6, chosenByCluster: true }),
+        FISTERRA, P('Anon', 41, 1)], MX_OUTLIER);
+    const notices = I.buildNotices({ days: [], order: [] }, { geo: geo });
+    const codes = notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('geoOutlier') >= 0 && codes.indexOf('geoRelocated') >= 0 &&
+        codes.indexOf('geoAmbiguous') >= 0, 'fixture covers all three: ' + codes.join(','));
+
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const ctx = { t: i18n.t };
+        for (let n = 0; n < notices.length; n++) {
+            const text = I.noticeText(notices[n], ctx);
+            assert.ok(text && text.length > 0, LOCALES[i] + ' / ' + notices[n].code);
+            assert.strictEqual(text.indexOf('{'), -1,
+                LOCALES[i] + ' / ' + notices[n].code + ' left a placeholder: ' + text);
+            assert.strictEqual(text.indexOf('notice.'), -1,
+                LOCALES[i] + ' / ' + notices[n].code + ' is untranslated');
+        }
+        const html = I.renderItineraryHtml({
+            plan: { days: [], order: [] }, costs: I.computeCosts({ days: [] }, {}),
+            notices: notices, geo: geo, meta: {}
+        }, ctx);
+        assert.strictEqual(html.indexOf('itin.geo'), -1, LOCALES[i] + ' leaked a raw key');
+        assert.ok(html.indexOf('San Luis Potosi, Mexico') >= 0,
+            LOCALES[i] + ' must still name the place it chose');
+    }
+});
+
+test('G6: a label the app never had is filled in the language it is READ in', function () {
+    const i18n = loadI18n();
+    /* Built once and then re-read in another language — exactly what a language
+       switch and a saved route do. The stand-in must follow the reader. */
+    const notice = { code: 'geoOutlier', level: 'alert',
+        params: { name: 'Santillana de Mar', label: '', km: 8135 } };
+    i18n.setLanguage('fr');
+    const fr = I.noticeText(notice, { t: i18n.t });
+    i18n.setLanguage('zh');
+    const zh = I.noticeText(notice, { t: i18n.t });
+    i18n.setLanguage('fr');
+    assert.strictEqual(fr, I.noticeText(notice, { t: i18n.t }), 'reading it must not mutate it');
+    assert.notStrictEqual(fr, zh, 'the stand-in was baked in at build time');
+    assert.strictEqual(fr.indexOf('{'), -1);
+    assert.strictEqual(zh.indexOf('{'), -1);
+    i18n.setLanguage('en');
+    assert.ok(I.noticeText(notice, { t: i18n.t }).indexOf('the geocoder returned no label') >= 0);
+});
+
+/* ── G7 — the wiring, end to end, on the trip that started all of this ── */
+
+function northSpainApp(opts) {
+    const o = opts || {};
+    const known = {
+        'Barcelona': BCN_ES, 'Castellar del Valles': CASTELLAR,
+        'Santillana de Mar': SANTILLANA_MX, 'Leon': LEON_FR,
+        'Fisterra': FISTERRA, 'Lugo': LUGO
+    };
+    return loadRouteForm({
+        geometry: 'straight',
+        geocodePlaces: function (names) {
+            return Promise.resolve(names.map(function (n) { return known[n] || P(n, 41, 1); }));
+        },
+        geo: o.noOutlierCheck ? {} : {
+            geocodeOutliers: function () { return MX_OUTLIER; }
+        }
+    });
+}
+
+function fillNorthSpain(els) {
+    els.rfStartPoint.value = 'Barcelona';
+    els.rfEndPoint.value = 'Castellar del Valles';
+    els.rfDestinations.value = 'Santillana de Mar, Leon, Fisterra, Lugo';
+    els.rfTripType.value = 'moto';
+    els.rfDuration.value = '5';
+    els.rfDailyBudget.value = '120';
+    els.rfTolls.value = 'with-tolls';
+    els.rfDepartureTime.value = '09:00';
+}
+
+test('G7: the exact trip that broke now names Mexico on screen, at the top', function () {
+    const app = northSpainApp();
+    fillNorthSpain(app.els);
+    return app.generateRoute().then(function () {
+        const html = app.els.resultItinerary.innerHTML;
+        assert.ok(html.indexOf('San Luis Potosi, Mexico') >= 0,
+            'the screen that told him 24,179 km never said this word');
+        assert.ok(html.indexOf('Lyon, Auvergne-Rhone-Alpes, France') >= 0);
+
+        /* The first notice on the page, above every warning and above the numbers. */
+        const first = /<div class="notice ([^"]*)"><span class="notice-icon">[^<]*<\/span><span class="notice-text">([^<]*)/.exec(html);
+        assert.ok(first, 'fixture: notices rendered');
+        assert.strictEqual(first[1], 'notice-alert');
+        assert.ok(first[2].indexOf('Santillana de Mar') >= 0 &&
+            first[2].indexOf('San Luis Potosi, Mexico') >= 0,
+            'the first thing he reads is the reason: ' + first[2]);
+        assert.ok(html.indexOf(first[2]) < html.indexOf('summary-card'),
+            'and he reads it before the kilometres it explains');
+
+        /* And the route he can act on is still there, unchanged and complete. */
+        const route = app.route();
+        assert.strictEqual(route.view.plan.days.length, 5);
+        assert.strictEqual(route.view.geo.outliers.length, 1);
+        assert.ok(route.structured.geo, 'saving it keeps the finding');
+        assert.ok(route.result.indexOf('San Luis Potosi, Mexico') >= 0,
+            'and so does the plain-text mirror');
+    });
+});
+
+test('G7: the wiring survives a geo provider with no outlier check at all', function () {
+    const app = northSpainApp({ noOutlierCheck: true });
+    fillNorthSpain(app.els);
+    return app.generateRoute().then(function () {
+        const html = app.els.resultItinerary.innerHTML;
+        assert.ok(html.indexOf('San Luis Potosi, Mexico') >= 0,
+            'the labels are not conditional on the outlier check existing');
+        const route = app.route();
+        assert.strictEqual(route.view.geo.outliers.length, 0);
+        assert.strictEqual(html.indexOf('geo-badge-outlier'), -1,
+            'and nothing is accused on evidence the app does not have');
+    });
+});
+
+test('G7: a language switch re-renders the labels without re-geocoding anything', function () {
+    const app = northSpainApp();
+    fillNorthSpain(app.els);
+    return app.generateRoute().then(function () {
+        const before = app.route().view.geo.places.map(function (p) { return p.displayName; });
+        app.i18n.setLanguage('fr');
+        const html = app.els.resultItinerary.innerHTML;
+        assert.ok(html.indexOf('Ou chaque lieu a ete localise') >= 0, 'the block follows the language');
+        assert.ok(html.indexOf('San Luis Potosi, Mexico') >= 0, 'the labels themselves do not');
+        assert.deepStrictEqual(app.route().view.geo.places.map(function (p) { return p.displayName; }),
+            before, 'nothing was looked up again');
+        app.i18n.setLanguage('es');
     });
 });

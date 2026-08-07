@@ -757,7 +757,32 @@ async function generateRoute() {
             setProgress((i / (names.length + 2)) * 100, t('progress.geocoding'),
                 tf('progress.geocodingItem', { done: i + 1, total: names.length, name: names[i] }));
             const one = await geocodePlaces([names[i]], geoOpts);
-            places.push(one && one[0] ? one[0] : { name: names[i], lat: null, lon: null, resolved: false, source: 'osm' });
+            const got = (one && one[0]) ? one[0]
+                : { name: names[i], lat: null, lon: null, resolved: false, source: 'osm' };
+            places.push(got);
+            /* Say where it landed the moment it lands, not only in the itinerary:
+               the user watching the progress bar is already looking at this line. */
+            if (got.displayName) {
+                setProgress(((i + 1) / (names.length + 2)) * 100, t('progress.geocoding'),
+                    tf('progress.geocodedAs', { name: names[i], label: got.displayName }));
+            }
+        }
+
+        /* Which of those, if any, sits far from the rest of the trip. Pure and
+           synchronous — no network, no second geocode — and it is the only thing on
+           the page that can explain 24,179 km round northern Spain. The provider
+           owns the geometry; a build without it simply reports nothing rather than
+           the wiring inventing a threshold of its own. */
+        let geoOutliers = [];
+        try {
+            const G = (typeof window !== 'undefined' && window.TravioGeo) ? window.TravioGeo : null;
+            if (G && typeof G.geocodeOutliers === 'function') {
+                const found = G.geocodeOutliers(places);
+                if (Array.isArray(found)) geoOutliers = found;
+            }
+        } catch (e) {
+            console.warn('Outlier check unavailable:', e);
+            geoOutliers = [];
         }
 
         /* 3 — road distance matrix */
@@ -812,6 +837,7 @@ async function generateRoute() {
             startName: fd.startPoint,
             endName: fd.endPoint,
             places: places,
+            geoOutliers: geoOutliers,
             matrixSource: matrix.source,
             matrixFilledCells: matrix.filledCells,
             matrixOsrmCells: matrix.osrmCells,

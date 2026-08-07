@@ -175,11 +175,33 @@ input,select,textarea{font-size:16px!important}
 .notice-icon{flex:0 0 auto}
 .notice-text{flex:1 1 auto}
 
+/* ── Where each place actually landed ──
+   The element that would have caught "Santillana de Mar" resolving to Mexico. It
+   sits ABOVE the summary card on purpose: the labels have to be readable before the
+   kilometres are believed. Badges carry words, never colour alone. */
+.geo-panel{background:var(--surface);border:1px solid var(--border-light);border-radius:8px;padding:12px 14px;margin-bottom:16px}
+.geo-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:8px}
+.geo-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+.geo-item{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;font-size:13px;line-height:1.5}
+.geo-item-outlier{background:var(--red-light);border:1px solid rgba(239,68,68,.45);border-radius:var(--radius);padding:5px 8px}
+.geo-name{font-weight:700;color:var(--dark)}
+.geo-arrow{color:var(--mid)}
+.geo-label{color:var(--label);word-break:break-word}
+.geo-missing{color:#8a5a00;font-style:italic}
+.geo-badge{font-size:10px;font-weight:600;padding:1px 8px;border-radius:10px;line-height:1.7}
+.geo-badge-outlier{background:var(--red);color:#fff}
+.geo-badge-moved{background:var(--yellow-light);color:#8a5a00}
+.geo-badge-matches{background:var(--primary-light);color:var(--primary-darker)}
+.geo-note{font-size:11px;color:var(--mid);margin-top:8px;line-height:1.5}
+
 .summary-card{background:var(--green-light);border:1px solid rgba(16,185,129,.35);border-radius:8px;padding:14px 16px;margin-bottom:16px}
 .summary-card.summary-over{background:var(--red-light);border-color:rgba(239,68,68,.35)}
 /* Not green: a card whose numbers are unusable, or whose total is only a floor. */
 .summary-card.summary-unreliable{background:var(--red-light);border-color:rgba(239,68,68,.45)}
 .summary-card.summary-unknown{background:var(--yellow-light);border-color:rgba(217,164,6,.35)}
+/* The arithmetic is sound; the PREMISE is in doubt. Not green, not red — and the
+   words that say why are in the alert above it, never in this colour alone. */
+.summary-card.summary-geo-outlier{background:var(--yellow-light);border-color:rgba(217,164,6,.45)}
 .summary-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:10px}
 .summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 @media(max-width:640px){.summary-grid{grid-template-columns:repeat(2,1fr)}}

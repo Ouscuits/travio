@@ -531,10 +531,157 @@
         return false;
     }
 
+    /* ── Geocoding provenance ───────────────────────────────────────────────────
+       A real user planned Barcelona -> Castellar del Valles via Santillana, Leon,
+       Fisterra and Lugo, and was told 24,179 km and 268 hours. Nothing was broken:
+       "Santillana de Mar" had resolved to San Luis Potosi (MEXICO) and "Leon" to
+       Lyon (FRANCE). The itinerary was internally consistent, the warnings fired,
+       the map drew it — and at no point did the screen say WHERE those places were.
+       He tested twice and hit it twice.
+
+       The app cannot know he meant Spain: Lyon -> Brittany is a legitimate trip. It
+       knows three things, and states all three:
+
+         · WHAT IT CHOSE   — `Place.displayName`, the geocoder's own full label.
+                             No heuristic, no threshold: this alone would have
+                             caught both of his tests.
+         · THE ODD ONE OUT — `geocodeOutliers()`, computed by the provider from
+                             geometry alone. When it says something, that is the
+                             most likely explanation for every absurd number on the
+                             page, so it outranks the drive-cap and the cost
+                             warnings and is read first.
+         · THAT IT CHOSE   — `candidates > 1` means the name was ambiguous;
+                             `chosenByCluster` means a candidate nearer the rest of
+                             the trip was preferred over the geocoder's first hit.
+                             Choosing it is allowed. Doing it silently is not.
+
+       Nothing here invents. A place whose label the geocoder never supplied says so
+       instead of borrowing the name the user typed, and a document written by an
+       earlier build — which carries no labels at all — produces no block rather
+       than a list of confident blanks. */
+
+    function geoEntry(p) {
+        if (!p) return null;
+        const name = (p.name === null || p.name === undefined) ? '' : String(p.name);
+        if (!name) return null;
+        const cand = num(p.candidates, NaN);
+        return {
+            name: name,
+            displayName: (p.displayName === null || p.displayName === undefined)
+                ? '' : String(p.displayName),
+            resolved: p.resolved === true,
+            candidates: (isFinite(cand) && cand > 0) ? Math.floor(cand) : 0,
+            chosenByCluster: p.chosenByCluster === true,
+            /* Filled in from the outlier list below; `null` means "not an outlier",
+               which is a different statement from "an outlier at an unknown
+               distance" and must not collapse into it. */
+            outlierKm: null,
+            outlier: false
+        };
+    }
+
+    function buildGeoView(places, order, outliers) {
+        const src = (Array.isArray(places) && places.length) ? places
+            : (Array.isArray(order) ? order : []);
+        const list = [];
+        const index = {};
+        for (let i = 0; i < src.length; i++) {
+            const e = geoEntry(src[i]);
+            if (!e) continue;
+            const k = normName(e.name);
+            /* A round trip lists its origin twice. It is one place, geocoded once. */
+            if (k && Object.prototype.hasOwnProperty.call(index, k)) continue;
+            if (k) index[k] = e;
+            list.push(e);
+        }
+
+        const found = [];
+        const raw = Array.isArray(outliers) ? outliers : [];
+        for (let i = 0; i < raw.length; i++) {
+            const o = raw[i] || {};
+            const name = (o.name === null || o.name === undefined) ? '' : String(o.name);
+            if (!name) continue;
+            const entry = Object.prototype.hasOwnProperty.call(index, normName(name))
+                ? index[normName(name)] : null;
+            const km = num(o.km, NaN);
+            const label = (o.displayName === null || o.displayName === undefined)
+                ? '' : String(o.displayName);
+            const item = {
+                name: name,
+                displayName: label || (entry ? entry.displayName : ''),
+                /* A distance that is not a finite number is not printed as one. The
+                   place is still named — the alert does not depend on the figure. */
+                km: (isFinite(km) && km >= 0) ? round2(km) : null
+            };
+            if (entry) { entry.outlier = true; entry.outlierKm = item.km; }
+            found.push(item);
+        }
+
+        let labelled = 0, ambiguous = 0, relocated = 0;
+        for (let i = 0; i < list.length; i++) {
+            if (list[i].displayName) labelled++;
+            if (list[i].candidates > 1) ambiguous++;
+            if (list[i].chosenByCluster) relocated++;
+        }
+        /* Nothing the app actually knows: say nothing. */
+        if (labelled === 0 && ambiguous === 0 && relocated === 0 && found.length === 0) return null;
+        return {
+            places: list, outliers: found,
+            labelled: labelled, ambiguous: ambiguous, relocated: relocated
+        };
+    }
+
+    /* The loudest thing on the page, and deliberately the FIRST thing pushed: the
+       stable sort keeps insertion order inside a severity band, so an outlier alert
+       is read before every other alert, and far above the drive-cap and cost
+       warnings. When a place is on another continent, that is not a footnote to the
+       numbers — it is the explanation for them. */
+    function pushGeoNotices(out, geo) {
+        if (!geo) return;
+        const outliers = Array.isArray(geo.outliers) ? geo.outliers : [];
+        for (let i = 0; i < outliers.length; i++) {
+            const o = outliers[i];
+            const hasKm = o.km !== null && o.km !== undefined && isFinite(num(o.km, NaN));
+            out.push({
+                code: hasKm ? 'geoOutlier' : 'geoOutlierNoDistance',
+                level: 'alert',
+                params: hasKm
+                    ? { name: o.name, label: o.displayName || '', km: o.km }
+                    : { name: o.name, label: o.displayName || '' }
+            });
+        }
+        /* A destination relocated on the user's behalf is a decision, and it is
+           stated per place: which name, and which of the candidates was taken. */
+        const places = Array.isArray(geo.places) ? geo.places : [];
+        const ambiguousNames = [];
+        for (let i = 0; i < places.length; i++) {
+            const p = places[i];
+            if (p.chosenByCluster) {
+                out.push({
+                    code: 'geoRelocated', level: 'warn',
+                    params: { name: p.name, label: p.displayName || '' }
+                });
+                continue;
+            }
+            /* Plain ambiguity is quieter and is aggregated: eight destinations with
+               two matches each is eight facts, not eight paragraphs. The block above
+               the summary already shows which one was taken for every one of them. */
+            if (p.candidates > 1 && !p.outlier) ambiguousNames.push(p.name);
+        }
+        if (ambiguousNames.length) {
+            out.push({
+                code: 'geoAmbiguous', level: 'info',
+                params: { count: ambiguousNames.length, names: ambiguousNames.join(', ') }
+            });
+        }
+    }
+
     function buildNotices(plan, ctx) {
         const out = [];
-        if (!plan || !Array.isArray(plan.days)) return out;
-        const c = ctx || {};
+        const c0 = ctx || {};
+        pushGeoNotices(out, c0.geo);
+        if (!plan || !Array.isArray(plan.days)) return sortNoticesBySeverity(out);
+        const c = c0;
         const days = plan.days;
         const order = Array.isArray(plan.order) ? plan.order : [];
 
@@ -697,13 +844,26 @@
        into the sentence ("7 h 21 min" surviving inside a Chinese string). */
     const NOTICE_NUMERIC_PARAMS = {
         overCap:      { drive: 'duration', cap: 'duration' },
-        tollsClamped: { km: 'km', value: 'amount', capped: 'amount' }
+        tollsClamped: { km: 'km', value: 'amount', capped: 'amount' },
+        geoOutlier:   { km: 'km' }
+    };
+
+    /* And which params are TEXT the app may simply not have. Same reason as the
+       units above: the stand-in has to be chosen in the language the notice is READ
+       in. A geocoder label is not always supplied, and "" would leave the sentence
+       claiming the place was located at nowhere in particular. */
+    const NOTICE_TEXT_FALLBACKS = {
+        geoOutlier:           { label: 'itin.geoNoLabel' },
+        geoOutlierNoDistance: { label: 'itin.geoNoLabel' },
+        geoRelocated:         { label: 'itin.geoNoLabel' }
     };
 
     function noticeFillParams(notice, ctx) {
         const raw = (notice && notice.params) || {};
-        const spec = NOTICE_NUMERIC_PARAMS[notice && notice.code];
-        if (!spec) return raw;
+        const code = notice && notice.code;
+        const spec = NOTICE_NUMERIC_PARAMS[code];
+        const text = NOTICE_TEXT_FALLBACKS[code];
+        if (!spec && !text) return raw;
         const out = {};
         for (const k in raw) if (Object.prototype.hasOwnProperty.call(raw, k)) out[k] = raw[k];
         for (const k in spec) {
@@ -713,6 +873,11 @@
             if (!isFinite(v)) continue;
             out[k] = spec[k] === 'duration' ? formatDuration(v, ctx)
                 : (spec[k] === 'km' ? formatKm(v, ctx) : formatAmount(v));
+        }
+        for (const k in text) {
+            if (!Object.prototype.hasOwnProperty.call(text, k)) continue;
+            const v = raw[k];
+            if (v === null || v === undefined || String(v).trim() === '') out[k] = tr(ctx, text[k]);
         }
         return out;
     }
@@ -835,7 +1000,10 @@
             tollsEnabled: a.tollsEnabled,
             tolls: enrichment ? tollEstimates(enrichment) : []
         });
+        /* Built before the notices, because the notices are derived from it. */
+        const geo = buildGeoView(a.places, plan && plan.order, a.geoOutliers);
         const notices = buildNotices(plan, {
+            geo: geo,
             requestedStops: a.requestedStops,
             startName: a.startName,
             endName: a.endName,
@@ -852,6 +1020,7 @@
             costs: costs,
             enrichment: enrichment,
             notices: notices,
+            geo: geo,
             meta: {
                 startName: a.startName || '',
                 endName: a.endName || '',
@@ -893,6 +1062,48 @@
                 '<span class="notice-text">' + esc(noticeText(n, ctx)) + '</span></div>';
         }
         return html + '</div>';
+    }
+
+    /* ── Where each place actually landed ──
+       Rendered ABOVE the summary, on purpose: the labels have to be readable before
+       the kilometres are believed. Every value here is escaped — place names in this
+       project really do contain &, <, > and quotes, and a geocoder label is untrusted
+       input from an external service on top of that. */
+    function renderGeoBlock(view, ctx) {
+        const geo = view && view.geo;
+        if (!geo || !Array.isArray(geo.places) || geo.places.length === 0) return '';
+        let html = '<div class="geo-panel"><div class="geo-title">' +
+            esc(tr(ctx, 'itin.geoTitle')) + '</div><ul class="geo-list">';
+        for (let i = 0; i < geo.places.length; i++) {
+            const p = geo.places[i];
+            html += '<li class="geo-item' + (p.outlier ? ' geo-item-outlier' : '') + '">';
+            html += '<span class="geo-name">' + esc(p.name) + '</span>';
+            html += '<span class="geo-arrow">&rarr;</span>';
+            if (p.displayName) {
+                html += '<span class="geo-label">' + esc(p.displayName) + '</span>';
+            } else {
+                /* Never the typed name echoed back as though it were a match. */
+                html += '<span class="geo-label geo-missing">' +
+                    esc(tr(ctx, p.resolved ? 'itin.geoNoLabel' : 'itin.geoNotLocated')) + '</span>';
+            }
+            if (p.outlier) {
+                html += '<span class="geo-badge geo-badge-outlier">' +
+                    esc(p.outlierKm === null || p.outlierKm === undefined
+                        ? tr(ctx, 'itin.geoBadgeOutlierFar')
+                        : trf(ctx, 'itin.geoBadgeOutlier', { km: formatKm(p.outlierKm, ctx) })) +
+                    '</span>';
+            }
+            if (p.chosenByCluster) {
+                html += '<span class="geo-badge geo-badge-moved">' +
+                    esc(tr(ctx, 'itin.geoBadgeMoved')) + '</span>';
+            }
+            if (p.candidates > 1) {
+                html += '<span class="geo-badge geo-badge-matches">' +
+                    esc(trf(ctx, 'itin.geoBadgeMatches', { count: p.candidates })) + '</span>';
+            }
+            html += '</li>';
+        }
+        return html + '</ul><div class="geo-note">' + esc(tr(ctx, 'itin.geoNote')) + '</div></div>';
     }
 
     /* ── The budget verdict, and the one rule that governs it ──
@@ -955,10 +1166,15 @@
     function viewFlags(view) {
         const costs = (view && view.costs) || {};
         const meta = (view && view.meta) || {};
+        const geo = (view && view.geo) || null;
         return {
             unreliable: meta.numbersUnreliable === true ||
                 hasUnreliableNumbers(view && view.notices),
-            incomplete: costs.incomplete === true || costs.tollsUnknown === true
+            incomplete: costs.incomplete === true || costs.tollsUnknown === true,
+            /* Not the same claim as `unreliable`. The arithmetic is sound; it is the
+               PREMISE that is in doubt, so the budget verdict is still given — but
+               the card does not get to look calm about it. */
+            geoOutlier: !!(geo && Array.isArray(geo.outliers) && geo.outliers.length > 0)
         };
     }
 
@@ -970,6 +1186,7 @@
 
         let cardCls = '';
         if (flags.unreliable) cardCls = ' summary-unreliable';
+        else if (flags.geoOutlier) cardCls = ' summary-geo-outlier';
         else if (costs.over) cardCls = ' summary-over';
         else if (flags.incomplete) cardCls = ' summary-unknown';
 
@@ -1157,6 +1374,9 @@
                 '<span class="notice-text">' + esc(trf(ctx, 'itin.enrichPartial',
                     { days: view.enrichment.missingDays.join(', ') })) + '</span></div>';
         }
+        /* Between the notices and the numbers: the user reads WHERE every place is
+           before reading how far apart they are. */
+        html += renderGeoBlock(view, ctx);
         html += renderSummary(view, ctx);
         html += '<div class="day-list">';
         const days = view.plan.days || [];
@@ -1186,6 +1406,27 @@
         lines.push(tr(ctx, 'itin.totalCost') + ': ' + amountText(costs.totalCost, flags.incomplete, ctx) +
             ' / ' + tr(ctx, 'itin.totalBudget') + ': ' + formatMoney(costs.totalBudget));
         lines.push('');
+        /* The plain-text mirror is what a copy/paste, an export and every reader
+           older than this build actually sees. The labels travel with it. */
+        const geo = view.geo;
+        if (geo && Array.isArray(geo.places) && geo.places.length) {
+            lines.push(tr(ctx, 'itin.geoTitle').toUpperCase());
+            for (let i = 0; i < geo.places.length; i++) {
+                const p = geo.places[i];
+                const marks = [];
+                if (p.outlier) {
+                    marks.push(p.outlierKm === null || p.outlierKm === undefined
+                        ? tr(ctx, 'itin.geoBadgeOutlierFar')
+                        : trf(ctx, 'itin.geoBadgeOutlier', { km: formatKm(p.outlierKm, ctx) }));
+                }
+                if (p.chosenByCluster) marks.push(tr(ctx, 'itin.geoBadgeMoved'));
+                if (p.candidates > 1) marks.push(trf(ctx, 'itin.geoBadgeMatches', { count: p.candidates }));
+                lines.push('  ' + p.name + ' -> ' +
+                    (p.displayName || tr(ctx, p.resolved ? 'itin.geoNoLabel' : 'itin.geoNotLocated')) +
+                    (marks.length ? '  [' + marks.join(' | ') + ']' : ''));
+            }
+            lines.push('');
+        }
         for (let i = 0; i < plan.days.length; i++) {
             const d = plan.days[i];
             const c = costs.days[i] || {};
@@ -1216,12 +1457,21 @@
     /* ── Serialisable plan for Firestore (no matrices, no nested arrays) ── */
     function serialisePlace(p) {
         if (!p) return null;
+        const cand = num(p.candidates, NaN);
         return {
             name: p.name || '',
             lat: typeof p.lat === 'number' ? p.lat : null,
             lon: typeof p.lon === 'number' ? p.lon : null,
             resolved: p.resolved === true,
-            source: p.source || ''
+            source: p.source || '',
+            /* Geocoding provenance travels with the place, or the saved route comes
+               back unable to say where any of it is. Absent in every document
+               written before this build, and read back as "nothing known" — never
+               back-filled from the name the user typed. */
+            displayName: (p.displayName === null || p.displayName === undefined)
+                ? '' : String(p.displayName),
+            candidates: (isFinite(cand) && cand > 0) ? Math.floor(cand) : 0,
+            chosenByCluster: p.chosenByCluster === true
         };
     }
 
@@ -1266,6 +1516,7 @@
                 days: view.enrichment.days
             } : null,
             notices: view.notices,
+            geo: view.geo || null,
             meta: view.meta
         };
     }
@@ -1451,11 +1702,16 @@
         const savedMeta = s.meta || {};
         for (const k in savedMeta) if (Object.prototype.hasOwnProperty.call(savedMeta, k)) meta[k] = savedMeta[k];
         meta.numbersUnreliable = hasUnreliableNumbers(sorted);
+        /* A document written before geocoding provenance existed has no `geo` at
+           all. That is read as "the app cannot say where these places are" — which
+           is the truth — and renders no block, rather than a list of blanks that
+           would look like an answer. */
         return {
             plan: s.plan,
             costs: costs,
             enrichment: s.enrichment || null,
             notices: sorted,
+            geo: s.geo || null,
             meta: meta
         };
     }
@@ -1472,6 +1728,7 @@
         tollCapForDay: tollCapForDay,
         hasUnreliableNumbers: hasUnreliableNumbers,
         displayTotals: displayTotals,
+        buildGeoView: buildGeoView,
         buildNotices: buildNotices,
         noticeText: noticeText,
         buildItineraryView: buildItineraryView,
