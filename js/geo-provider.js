@@ -76,13 +76,11 @@
  *     - DISTANCE (needs only geometry): a road is never materially shorter than the
  *       great circle beneath it (cellKm + 0.5 >= straightKm * 0.90, slack for OSRM
  *       snapping to the nearest road) and never more than 10x + 50 km longer.
- *     - PAIR SPEED (only when BOTH halves are measured): the implied average speed must
- *       be inside [minSpeed(km), 200] km/h.
+ *     - PAIR SPEED (only when BOTH halves are measured): at most 200 km/h, and at most
+ *       geoMaxDurationMin(km) in total.
  *     - DURATION ALONE (measured duration, estimated distance): rejected only when NO
  *       credible road length makes it drivable — too fast even along the great circle,
- *       or too slow even along the 10x ceiling. Deliberately permissive towards
- *       over-long durations, because that error over-splits days, which is the safe
- *       direction.
+ *       or longer than the ceiling allows even along the 10x road.
  *   A measured distance with no duration needs no time test at all: the duration is
  *   derived from it at the calibrated speed, so it is in band by construction.
  *   Legs under 1 km are exempt (rounding noise dominates and nothing is at stake).
@@ -98,13 +96,48 @@
  *       order of magnitude below the x60 case that motivated the ceiling. The +50 km is
  *       headroom for short legs, where a large ratio is cheap and common (an estuary
  *       crossing to the nearest bridge).
- *     - speed floor 5 km/h for short legs, rising linearly to 30 km/h at 300 km. 5 km/h
- *       is ordinary stop-and-go over 1–3 km. 30 km/h is one third of every measured
- *       long-haul average (87.6–92.8 km/h, mean 90.6) — below that, a 500 km leg would
- *       be a 17-hour day, which is not what OSRM's car profile models. The 300 km scale
- *       is the lower end of the routes those averages were measured on.
  *     - speed ceiling 200 km/h, flat: OSRM's car profile tops out near 140 km/h on
  *       motorways, so 200 leaves 43% headroom and no real route averages above it.
+ *
+ *   THE SLOW SIDE — why there is no minimum-speed test.
+ *   There used to be one (5 km/h short, rising to 30 km/h over 300 km) and it was wrong:
+ *   Athens -> Iraklio is 644 km of real OSRM ferry route at 34.8 km/h, only 16% above
+ *   that floor, so a slower sailing was rejected and 1290 real minutes became 266.8 —
+ *   a 4.8x understatement, silent. Widening the floor does not fix it. 22 routes were
+ *   measured live against router.project-osrm.org over the worst geography available
+ *   (Balearics, Aegean, Tyrrhenian, Baltic, Norwegian coast, Iceland, Outer Hebrides):
+ *       Athens–Mykonos     176 km in 28.9 h =  6.1 km/h   REAL
+ *       Athens–Santorini   290 km in 37.8 h =  7.7 km/h   REAL
+ *       Athens–Iraklio     644 km in 18.5 h = 34.8 km/h   REAL
+ *       Madrid–Barcelona   620 km in 84 h   =  7.4 km/h   JUNK
+ *   The real and the junk distributions OVERLAP — the junk is faster than the slowest
+ *   real route — so no speed threshold can separate them, at any asymptote. Average
+ *   speed is the wrong instrument because it conflates a fixed wait (a scheduled
+ *   sailing, which does not scale with distance) with progress (which does).
+ *   Splitting those two apart separates them cleanly:
+ *       maxDuration = 48 h + km / 30 km/h
+ *   48 h is up to two days waiting for a service that does not sail daily; 30 km/h is a
+ *   slow ferry's sustained speed once moving (real ferries make 30–40 km/h). Against the
+ *   22 measured routes the tightest headroom is x1.53 (Athens–Santorini) and every one
+ *   passes; all four junk cases above are still rejected. OSRM's /table response carries
+ *   no ferry flag — only distances and durations — so detecting the ferry directly, the
+ *   other option considered, is not possible from what this module receives.
+ *
+ *   WHICH DIRECTION IS "SAFE" — this file makes two calls that look opposed:
+ *   FALLBACK CALIBRATION says a pessimistic speed is bad because it over-splits days,
+ *   and the slow-side rule above is deliberately generous towards over-long durations.
+ *   They are not in tension because they govern different objects:
+ *     - an INVENTED value must be ACCURATE. Nothing measured it, so a conservative guess
+ *       is not caution, it is a fabricated warning: 75 km/h manufactured over-cap flags
+ *       out of thin air. Hence 90 km/h, the measured mean.
+ *     - DISCARDING A MEASUREMENT must require proof, not suspicion. The replacement is
+ *       not a conservative value either — it is that same estimate, and for a ferry leg
+ *       it is 4.8x too small. So when a measurement merely looks odd, it is kept.
+ *   Ranked by harm: silently understating drive time (the plan looks feasible and the
+ *   user drives 18 hours) is worse than overstating it (the flag is 'mixed', the engine's
+ *   overDriveCap fires, the user sees it and can argue), which is worse than an estimate
+ *   being a few percent off. Optimise the estimate for accuracy; optimise the decision to
+ *   throw a measurement away for caution.
  *
  * FALLBACK CALIBRATION — haversine × 1.25 at 90 km/h.
  *   Measured against live OSRM on long Spanish routes: the 1.25 road factor is well
@@ -155,10 +188,9 @@
 
     /* Plausibility floor for values claimed to come from the road graph.
        Every threshold below is derived from measurement — see PLAUSIBILITY FLOOR. */
-    const GEO_MIN_SPEED_KMH      = 5;               // floor for a short leg (city traffic)
-    const GEO_MIN_SPEED_LONG_KMH = 30;              // floor once the leg is long-haul
-    const GEO_SPEED_SCALE_KM     = 300;             // where the floor reaches its long-haul value
     const GEO_MAX_SPEED_KMH      = 200;             // faster than this is not driving, at any length
+    const GEO_STOPPAGE_ALLOWANCE_MIN = 48 * 60;     // waiting for a scheduled sailing/service
+    const GEO_MIN_SUSTAINED_KMH  = 30;              // slowest sustained progress once moving
     const GEO_MAX_DETOUR         = 10;              // road / great circle ceiling
     const GEO_DETOUR_SLACK_KM    = 50;              // absolute headroom for short legs
     const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
@@ -632,14 +664,15 @@
     }
 
     /*
-     * The minimum credible average speed depends on how far you are going. 6 km/h is
-     * ordinary over 2 km of city traffic and absurd sustained over 505 km, so one flat
-     * band cannot judge both. Rises linearly from GEO_MIN_SPEED_KMH to
-     * GEO_MIN_SPEED_LONG_KMH across GEO_SPEED_SCALE_KM, then flat.
+     * The longest credible duration for a road of this length. There is deliberately NO
+     * minimum-speed test on the slow side: measurement shows the distributions overlap,
+     * so no speed threshold can separate a real ferry from junk (see SLOW SIDE in the
+     * header). A duration ceiling can, because it separates the two things average speed
+     * conflates — a fixed wait that does not scale with distance, and progress that does.
      */
-    function geoMinSpeedFor(km) {
-        const t = Math.min(1, Math.max(0, (isFinite(km) ? km : 0) / GEO_SPEED_SCALE_KM));
-        return GEO_MIN_SPEED_KMH + (GEO_MIN_SPEED_LONG_KMH - GEO_MIN_SPEED_KMH) * t;
+    function geoMaxDurationMin(km) {
+        const road = isFinite(km) && km > 0 ? km : 0;
+        return GEO_STOPPAGE_ALLOWANCE_MIN + (road / GEO_MIN_SUSTAINED_KMH) * 60;
     }
 
     /* The longest road length that could credibly join two points this far apart. */
@@ -647,12 +680,27 @@
         return (isFinite(straightKm) ? straightKm : 0) * GEO_MAX_DETOUR + GEO_DETOUR_SLACK_KM;
     }
 
+    /*
+     * A road SHORTER than the great circle beneath it is not a bad road distance — it is
+     * an answer about a different pair of points, and the duration beside it measures
+     * that other journey just as wrongly. Measured: asking OSRM for Algeciras -> Ceuta
+     * (30 km across the strait) snapped the Ceuta endpoint 22.5 km away onto the Spanish
+     * coast and answered 12 km / 18 min. Keeping that 18 minutes as road data would
+     * present a measurement of somewhere else as fact. So this verdict kills the WHOLE
+     * cell, not just the distance.
+     */
+    function geoDistanceContradictsGeometry(cellKm, straightKm) {
+        if (!isFinite(cellKm) || cellKm < 0) return false;      // absent, not contradictory
+        if (geoTrivialLeg(cellKm, straightKm)) return false;
+        return cellKm + GEO_SHORTFALL_SLACK < straightKm * GEO_SHORTFALL_RATIO;
+    }
+
     /* A road cannot be materially shorter than the great circle beneath it, and it
        cannot wander an order of magnitude further than it either. */
     function geoDistancePlausible(cellKm, straightKm) {
         if (!isFinite(cellKm) || cellKm < 0) return false;
         if (geoTrivialLeg(cellKm, straightKm)) return true;
-        if (cellKm + GEO_SHORTFALL_SLACK < straightKm * GEO_SHORTFALL_RATIO) return false;
+        if (geoDistanceContradictsGeometry(cellKm, straightKm)) return false;
         return cellKm <= geoMaxRoadKm(straightKm);
     }
 
@@ -665,7 +713,8 @@
         if (geoTrivialLeg(cellKm, straightKm)) return true;
         if (!(cellMin > 0)) return false;                       // distance in zero time
         const kmh = cellKm / (cellMin / 60);
-        return isFinite(kmh) && kmh >= geoMinSpeedFor(cellKm) && kmh <= GEO_MAX_SPEED_KMH;
+        if (!isFinite(kmh) || kmh > GEO_MAX_SPEED_KMH) return false;
+        return cellMin <= geoMaxDurationMin(cellKm);
     }
 
     /*
@@ -687,9 +736,8 @@
         const hours = cellMin / 60;
         /* Too fast even along the shortest road that could possibly exist. */
         if (straightKm / hours > GEO_MAX_SPEED_KMH) return false;
-        /* Too slow even along the longest road that could possibly exist. */
-        const maxRoad = geoMaxRoadKm(straightKm);
-        return (maxRoad / hours) >= geoMinSpeedFor(maxRoad);
+        /* Too long even for the longest road that could possibly exist. */
+        return cellMin <= geoMaxDurationMin(geoMaxRoadKm(straightKm));
     }
 
     function geoOsrmTableUrl(coords, cfg) {
@@ -808,10 +856,11 @@
                 const straightKm = haversineKm(eff[i].lat, eff[i].lon, eff[j].lat, eff[j].lon);
                 const hav = geoHaversineCell(straightKm, cfg);
 
-                /* A distance shorter than the great circle beneath it — or ten times
-                   longer than it — is not a road. */
-                let realKm = geoDistancePlausible(rawKm, straightKm);
-                let realMin = isFinite(rawMin);
+                /* A distance shorter than the great circle beneath it means OSRM answered
+                   about somewhere else, so the duration is discredited with it. */
+                const misSnapped = geoDistanceContradictsGeometry(rawKm, straightKm);
+                let realKm = !misSnapped && geoDistancePlausible(rawKm, straightKm);
+                let realMin = !misSnapped && isFinite(rawMin);
 
                 /* Each half is judged against what is actually KNOWN about it, never
                    against the other half's estimate. */
