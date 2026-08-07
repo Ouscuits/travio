@@ -324,6 +324,7 @@
     const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
     const GEO_SHORTFALL_RATIO = 0.90;               // road vs great circle, with slack for
     const GEO_SHORTFALL_SLACK = 0.5;                // OSRM snapping to the nearest road
+    const GEO_GEOMETRY_SLACK_KM = 1;                // polyline rounding, on top of the snap
     const GEO_MAX_SNAP_KM     = 10;                 // how far OSRM may move a waypoint onto
                                                     // a road before it is a different place
     const GEO_QUEUE_SLACK_MS  = 500;                // grace before the queue tail self-releases
@@ -1131,6 +1132,57 @@
     }
 
     /* ── Route geometry ── */
+    /*
+     * /route reports the SAME snap signal /table does, in waypoints[k].distance, and this
+     * path never read it either — so the very waypoint distanceMatrix condemns could still
+     * produce a polyline tagged as measured road geometry. Melilla: matrix says
+     * 'haversine', geometry said 'osrm' and drew a line starting near Almería.
+     * Absent or unusable field -> not evidence; never condemn on missing evidence.
+     */
+    function geoRouteWaypointsOk(data, cfg) {
+        const wps = data.waypoints;
+        if (!Array.isArray(wps)) return true;
+        for (let k = 0; k < wps.length; k++) {
+            const w = wps[k];
+            if (!w || typeof w !== 'object') continue;
+            const v = w.distance;
+            const isNumber = typeof v === 'number';
+            const isNumericString = typeof v === 'string' && v.trim() !== '';
+            if (!isNumber && !isNumericString) continue;
+            const metres = Number(v);
+            if (!isFinite(metres) || metres < 0) continue;
+            if (metres > cfg.maxSnapKm * 1000) return false;
+        }
+        return true;
+    }
+
+    /*
+     * Geometry must describe the journey that was asked for. `points.length >= 2` did not
+     * establish that: '????????????????' decodes to eight copies of [0,0] and shipped as
+     * measured road geometry — a map line through Null Island. So every point must be a
+     * usable coordinate, and the line must begin and end at the places requested.
+     * Measured on live /route, the first and last polyline points sit almost exactly the
+     * waypoint snap distance from the request (0.09/0.09, 4.44/4.43, 2.48/2.47, and
+     * 155.76/156.08 for the mis-snapped one), so maxSnapKm plus a kilometre for polyline
+     * rounding is the honest tolerance — anything legitimate has already cleared the
+     * snap test above.
+     */
+    function geoGeometryDescribes(points, coords, cfg) {
+        if (!Array.isArray(points) || points.length < 2 || !coords.length) return false;
+        for (let i = 0; i < points.length; i++) {
+            const p = points[i];
+            if (!Array.isArray(p) || !geoValidLatLon(p[0], p[1])) return false;
+        }
+        const tol = cfg.maxSnapKm + GEO_GEOMETRY_SLACK_KM;
+        const first = points[0];
+        const last = points[points.length - 1];
+        const from = coords[0];
+        const to = coords[coords.length - 1];
+        if (haversineKm(first[0], first[1], from.lat, from.lon) > tol) return false;
+        if (haversineKm(last[0], last[1], to.lat, to.lon) > tol) return false;
+        return true;
+    }
+
     function geoOsrmRouteUrl(coords, cfg) {
         const parts = coords.map(function (c) { return c.lon + ',' + c.lat; }).join(';');
         return cfg.osrmBase + '/route/v1/driving/' + parts + '?overview=full&geometries=polyline';
@@ -1140,9 +1192,26 @@
      * routeGeometry(places, opts) -> Promise<[lat,lon][]>
      * OSRM overview polyline decoded to points. On any failure returns the resolved
      * place coordinates in order, i.e. straight segments between places.
-     * The returned array carries a NON-ENUMERABLE `source` marker
-     * ('osrm' | 'straight' | 'none') for the UI — it stays a plain Array for every
-     * consumer (deep-equality, JSON.stringify, map libraries).
+     * The returned array carries a NON-ENUMERABLE `source` marker for the UI — it stays
+     * a plain Array for every consumer (deep-equality, JSON.stringify, map libraries).
+     *
+     * WHAT `source` MEANS — the map may rely on exactly this, and nothing more:
+     *   'osrm'     Every point came off the road graph AND the line was verified to
+     *              describe the journey requested: no waypoint snapped further than
+     *              maxSnapKm, every point a usable coordinate, and the line begins and
+     *              ends at the places asked for. Safe to draw as a real driving route.
+     *   'straight' NOT road geometry. The points are the resolved place coordinates in
+     *              order, so the array is still drawable and still index-aligned to the
+     *              resolved places — but it is an ESTIMATE and must be presented as one.
+     *              Covers every degraded case together: the request failed, OSRM declined
+     *              or returned no route, there were too many places for one call, a
+     *              waypoint was answered about somewhere else, or the geometry decoded to
+     *              garbage. The distinction between those does not change what the user
+     *              must be told, so it is deliberately not exposed.
+     *   'none'     No resolved coordinates at all; the array is empty.
+     * The guarantee that matters: 'osrm' is never returned for a line this module could
+     * not verify. It is the same law the matrix path enforces — an estimate is never
+     * presented as measured — and the two paths now agree about the same waypoint.
      */
     function geoTagSource(arr, source) {
         try {
@@ -1174,25 +1243,24 @@
 
         /* Same queue and same spacing as geocoding — see RATE LIMITING in the header. */
         const data = await geoRequest(geoOsrmRouteUrl(coords, cfg), cfg);
-        if (data && (data.code === undefined || data.code === 'Ok') && Array.isArray(data.routes) && data.routes[0]) {
+        if (data && (data.code === undefined || data.code === 'Ok') &&
+            Array.isArray(data.routes) && data.routes[0] && geoRouteWaypointsOk(data, cfg)) {
             const geom = data.routes[0].geometry;
+            let points = null;
             if (typeof geom === 'string') {
-                const points = decodePolyline(geom, 5);
-                if (points.length >= 2) {
-                    return geoTagSource(points, 'osrm');
-                }
+                points = decodePolyline(geom, 5);
             } else if (geom && Array.isArray(geom.coordinates)) {
                 /* geometries=geojson — [lon,lat] pairs */
-                const points = [];
+                points = [];
                 for (let i = 0; i < geom.coordinates.length; i++) {
                     const c = geom.coordinates[i];
                     if (Array.isArray(c) && isFinite(Number(c[0])) && isFinite(Number(c[1]))) {
                         points.push([Number(c[1]), Number(c[0])]);
                     }
                 }
-                if (points.length >= 2) {
-                    return geoTagSource(points, 'osrm');
-                }
+            }
+            if (geoGeometryDescribes(points, coords, cfg)) {
+                return geoTagSource(points, 'osrm');
             }
         }
 

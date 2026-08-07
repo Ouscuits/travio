@@ -1075,17 +1075,72 @@ test('polyline: handles empty and garbage input without throwing', function () {
     assert.ok(Array.isArray(decodePolyline('~~~~~~~~')));
 });
 
+/* Encoder for building geographically coherent fixtures. The canonical Google polyline
+   describes a line in California; feeding it to a Madrid->Barcelona request was exactly
+   the "geometry about somewhere else" case D17 now rejects, so integration fixtures have
+   to encode the route actually being asked for. decodePolyline keeps the canonical
+   fixture in its own unit test above, where no geography is involved. */
+function encodePolyline(points, precision) {
+    const factor = Math.pow(10, typeof precision === 'number' ? precision : 5);
+    const chunk = function (v) {
+        v = v < 0 ? ~(v << 1) : (v << 1);
+        let s = '';
+        while (v >= 0x20) { s += String.fromCharCode((0x20 | (v & 0x1f)) + 63); v >>= 5; }
+        return s + String.fromCharCode(v + 63);
+    };
+    let out = '', prevLat = 0, prevLon = 0;
+    for (const p of points) {
+        const lat = Math.round(p[0] * factor), lon = Math.round(p[1] * factor);
+        out += chunk(lat - prevLat) + chunk(lon - prevLon);
+        prevLat = lat; prevLon = lon;
+    }
+    return out;
+}
+
+/* A plausible Madrid -> Barcelona line, used by the geometry tests below. */
+const MAD_BCN_LINE = [[40.4168, -3.7038], [41.0, -1.5], [41.6488, -0.8891], [41.3874, 2.1686]];
+
+test('geometry: the test encoder round-trips through decodePolyline', function () {
+    const decoded = decodePolyline(encodePolyline(MAD_BCN_LINE, 5), 5);
+    assert.strictEqual(decoded.length, MAD_BCN_LINE.length);
+    decoded.forEach(function (p, i) {
+        assert.ok(Math.abs(p[0] - MAD_BCN_LINE[i][0]) < 1e-5, 'lat ' + i);
+        assert.ok(Math.abs(p[1] - MAD_BCN_LINE[i][1]) < 1e-5, 'lon ' + i);
+    });
+});
+
 test('geometry: OSRM route polyline is decoded', async function () {
     const fetchImpl = makeFetch(function (url) {
         assert.ok(url.indexOf('/route/v1/driving/') !== -1);
         assert.ok(url.indexOf('overview=full') !== -1);
         assert.ok(url.indexOf('geometries=polyline') !== -1);
-        return { code: 'Ok', routes: [{ geometry: '_p~iF~ps|U_ulLnnqC_mqNvxq`@' }] };
+        return { code: 'Ok', routes: [{ geometry: encodePolyline(MAD_BCN_LINE, 5) }] };
     });
     const pts = await routeGeometry([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
-    assert.strictEqual(pts.length, 3);
-    assert.deepStrictEqual(pts[0], [38.5, -120.2]);
+    assert.strictEqual(pts.length, 4);
+    assert.ok(Math.abs(pts[0][0] - 40.4168) < 1e-5 && Math.abs(pts[0][1] - (-3.7038)) < 1e-5);
+    assert.ok(Math.abs(pts[3][0] - 41.3874) < 1e-5 && Math.abs(pts[3][1] - 2.1686) < 1e-5);
     assert.strictEqual(pts.source, 'osrm');
+});
+
+test('geometry: a geojson route is decoded and validated the same way', async function () {
+    const fetchImpl = makeFetch(function () {
+        return {
+            code: 'Ok',
+            routes: [{ geometry: { coordinates: MAD_BCN_LINE.map(function (p) { return [p[1], p[0]]; }) } }]
+        };
+    });
+    const pts = await routeGeometry([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(pts.source, 'osrm');
+    assert.strictEqual(pts.length, 4);
+    assert.deepStrictEqual(pts[0], [40.4168, -3.7038]);
+
+    /* ...and a geojson line about somewhere else is refused, like the polyline one. */
+    const elsewhere = makeFetch(function () {
+        return { code: 'Ok', routes: [{ geometry: { coordinates: [[-120.2, 38.5], [-120.95, 40.7]] } }] };
+    });
+    const bad = await routeGeometry([MADRID, BARCELONA], { fetchImpl: elsewhere, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(bad.source, 'straight', 'a California line is not a Madrid-Barcelona route');
 });
 
 test('geometry: falls back to straight segments between places', async function () {
@@ -1103,6 +1158,130 @@ test('geometry: falls back to straight segments between places', async function 
             [40.4168, -3.7038], [41.3874, 2.1686], [39.4699, -0.3763]
         ]);
         assert.strictEqual(pts.source, 'straight');
+    }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   D17: the geometry path gets the guards the matrix path spent nine rounds getting
+   ══════════════════════════════════════════════════════════════════════════ */
+
+test('geometry D17: a mis-snapped waypoint cannot produce measured geometry', async function () {
+    /* Reported repro: the SAME Melilla waypoint, two paths in one module.
+       distanceMatrix condemned the cell on sources[].distance = 155 760 m, while
+       routeGeometry never read waypoints[].distance and returned source 'osrm' — a
+       polyline starting near Almeria, tagged as real road geometry. The map builder's
+       provenance flag would have been wired to that. */
+    const MELILLA = place('Melilla', 35.2923, -2.9381);
+    const line = encodePolyline([[36.84, -2.45], [38.5, -3.0], [40.4168, -3.7038]], 5);
+
+    const misSnapped = makeFetch(function () {
+        return {
+            code: 'Ok',
+            waypoints: [{ distance: 155760 }, { distance: 90 }],
+            routes: [{ geometry: line }]
+        };
+    });
+    const g = await routeGeometry([MELILLA, MADRID], { fetchImpl: misSnapped, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(g.source, 'straight', 'a 155.76 km snap is a route through somewhere else');
+    assert.deepStrictEqual(g, [[35.2923, -2.9381], [40.4168, -3.7038]],
+        'it falls back to the requested places, not the polyline');
+
+    /* The two paths in this module must now agree about the same waypoint. */
+    const m = await distanceMatrix([MELILLA, MADRID], {
+        fetchImpl: makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, 556000], [556000, 0]],
+                durations: [[0, 23100], [23100, 0]],
+                sources: [{ distance: 155760 }, { distance: 90 }],
+                destinations: [{ distance: 155760 }, { distance: 90 }]
+            };
+        }), storage: null, minIntervalMs: 0
+    });
+    assert.strictEqual(m.source, 'haversine');
+    assert.ok(m.source !== 'osrm' && g.source !== 'osrm',
+        'neither path may claim road provenance for a waypoint answered about elsewhere');
+
+    /* The threshold is shared: a legitimately remote place still yields real geometry. */
+    const remote = makeFetch(function () {
+        return {
+            code: 'Ok',
+            waypoints: [{ distance: 4440 }, { distance: 80 }],      // Mont Blanc summit
+            routes: [{ geometry: encodePolyline(MAD_BCN_LINE, 5) }]
+        };
+    });
+    const ok = await routeGeometry([MADRID, BARCELONA], { fetchImpl: remote, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(ok.source, 'osrm', 'a 4.44 km snap is still the honest answer');
+});
+
+test('geometry D17: a garbage or degenerate decode is not measured geometry', async function () {
+    /* Reported repro: '????????????????' decodes to eight copies of [0,0] and shipped as
+       source 'osrm' — a map line through Null Island, labelled measured. `length >= 2`
+       was the only test it had to pass. */
+    const cases = [
+        ['null island', '????????????????'],
+        ['long garbage', '~~~~~~~~~~~~~~~~'],
+        ['a line in California', '_p~iF~ps|U_ulLnnqC_mqNvxq`@']
+    ];
+    for (const [label, geometry] of cases) {
+        const fetchImpl = makeFetch(function () { return { code: 'Ok', routes: [{ geometry: geometry }] }; });
+        const g = await routeGeometry([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assert.strictEqual(g.source, 'straight', label + ' must not claim to be measured');
+        assert.deepStrictEqual(g, [[40.4168, -3.7038], [41.3874, 2.1686]], label + ': honest fallback');
+    }
+
+    /* Out-of-range points are refused even when the endpoints would match. */
+    const outOfRange = makeFetch(function () {
+        return {
+            code: 'Ok',
+            routes: [{ geometry: { coordinates: [[-3.7038, 40.4168], [999, 500], [2.1686, 41.3874]] } }]
+        };
+    });
+    const g = await routeGeometry([MADRID, BARCELONA], { fetchImpl: outOfRange, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(g.source, 'straight', 'a point off the planet invalidates the line');
+});
+
+test('geometry D17: missing waypoint data condemns nothing', async function () {
+    /* Same rule as the matrix path: never condemn on absent evidence, because a proxy or
+       an older OSRM may not report the field. */
+    const noWaypoints = makeFetch(function () {
+        return { code: 'Ok', routes: [{ geometry: encodePolyline(MAD_BCN_LINE, 5) }] };
+    });
+    const a = await routeGeometry([MADRID, BARCELONA], { fetchImpl: noWaypoints, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(a.source, 'osrm', 'absent waypoints[] is not evidence of anything');
+
+    for (const junk of [null, undefined, 'x', {}, [], true, NaN, -5, Infinity]) {
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                waypoints: [{ distance: junk }, { distance: junk }],
+                routes: [{ geometry: encodePolyline(MAD_BCN_LINE, 5) }]
+            };
+        });
+        const g = await routeGeometry([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assert.strictEqual(g.source, 'osrm', String(junk) + ' in waypoints[].distance proves nothing');
+    }
+});
+
+test('geometry D17: real measured geometry is not newly rejected', async function () {
+    /* Live-measured offsets between the first/last polyline point and the requested
+       coordinate: 0.09, 0.00, 0.01, 0.18, 0.06, 4.43 (Mont Blanc), 2.47 (Preikestolen).
+       All must survive the maxSnapKm + 1 km tolerance. */
+    const offsets = [0.0, 0.01, 0.09, 0.18, 1.35, 2.47, 4.43];
+    for (const offsetKm of offsets) {
+        const dLat = offsetKm / 111.195;
+        const line = [[40.4168 + dLat, -3.7038], [41.0, -1.5], [41.3874, 2.1686]];
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                waypoints: [{ distance: offsetKm * 1000 }, { distance: 20 }],
+                routes: [{ geometry: encodePolyline(line, 5) }]
+            };
+        });
+        const g = await routeGeometry([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assert.strictEqual(g.source, 'osrm',
+            'a geometry starting ' + offsetKm + ' km from the request is real and must survive');
+        assert.strictEqual(g.length, 3);
     }
 });
 
