@@ -52,13 +52,18 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
   - `0 <= osrmCells <= dim*(dim-1)` and `0 <= filledCells <= dim*(dim-1)`
   - their sum may exceed `dim*(dim-1)`; it must never be used as a consistency test
 
-  The two laws that DO hold, and that the engine may rely on:
+  The two laws that DO hold **for `dim >= 2`**, and that the engine may rely on:
 
   - `filledCells === 0`  ⟺  `source === 'osrm'`
   - `osrmCells === 0`    ⟺  `source === 'haversine'`
 
   A matrix that violates either law is self-contradictory and the engine must warn
   rather than trust the label — the counters are the evidence, the label is the claim.
+
+  **`dim < 2` is carved out and must not warn.** With fewer than two places there is
+  no off-diagonal cell at all, so both counters are 0 and the provider reports
+  `'haversine'` — which falsifies the first law while being the only honest answer
+  available. The engine must skip the whole source check when `dim <= 1`.
 
   Because of the overlap, a warning that reads "N of M cells are straight-line estimates"
   overstates the case when those cells still hold real distances. The engine's message
