@@ -93,6 +93,24 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
 - `routeGeometry(places: Place[]) -> Promise<[lat,lon][]>` — OSRM `route` overview
   polyline decoded to points, for the map. Falls back to straight lines between places.
 
+  Carries a `source` flag with the same law as the matrix:
+  - `'osrm'` — every point came off the road graph **and** the line was verified to
+    describe the journey requested: no waypoint snapped beyond `maxSnapKm`, every point
+    a usable coordinate, line begins and ends at the places asked for
+  - `'straight'` — **not** road geometry: the resolved place coordinates in order. An
+    estimate. Deliberately collapses request failure, OSRM declining, too many places, a
+    waypoint answered about somewhere else, and a garbage decode — four of which the
+    matrix path already surfaces separately on the same trip, and the fifth carries no
+    user action
+  - `'none'` — no resolved coordinates; empty array
+
+  **Known limitation, accepted:** the line is verified at its endpoints, not along its
+  path. A polyline that starts and ends correctly but wanders absurdly in between still
+  reports `'osrm'`. It requires a server returning a well-formed reply with a corrupt
+  middle, which the public OSRM does not do. The guard, if it ever matters, is already
+  affordable: compare the decoded polyline's summed length against `routes[0].distance`,
+  which is in the response and already parsed. Not done on spec.
+
 ## `js/route-engine.js` (Builder A)
 
 `planRoute(input) -> Plan`, **pure and synchronous** — it receives an already-built
