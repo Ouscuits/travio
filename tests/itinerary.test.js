@@ -56,9 +56,10 @@ const DICT = {
     'itin.fuel': 'Fuel', 'itin.tolls': 'Tolls', 'itin.lodging': 'Lodging', 'itin.meals': 'Meals',
     'itin.total': 'Day total', 'itin.budget': 'Day budget',
     'itin.withinBudget': 'Within budget', 'itin.estimate': '(estimate)',
-    'itin.unknownValue': '-', 'itin.tollsNotEstimated': '(not estimated)',
+    'itin.unknownValue': '—', 'itin.tollsNotEstimated': '(not estimated)',
+    'itin.tollsNotApplicable': '(not applicable)',
     'itin.atLeast': 'at least {amount}',
-    'itin.withinBudgetIncomplete': 'Within budget for what is counted; tolls are missing',
+    'itin.withinBudgetIncomplete': 'Within budget for what is counted; the total is not complete',
     'itin.budgetNotAssessable': 'The budget cannot be assessed',
     'itin.overBudgetByEstimated': 'Over budget by {amount}, but only because of the AI-estimated toll ({tolls})',
     'itin.sourcePartial': 'Partial road data',
@@ -80,6 +81,7 @@ const DICT = {
     'notice.zeroDistance': 'The whole itinerary computes to 0 km, so the figures below are not real.',
     'notice.unknownDistance': 'At least one leg has no usable distance data.',
     'notice.tollsUnknown': 'Tolls could not be estimated and are not included in any total.',
+    'notice.tollsNotAvoided': 'The route below was NOT re-planned to avoid tolls, so tolls are not applicable rather than zero and the cost shown is a minimum.',
     'notice.tollsClamped': 'The AI estimated EUR {value} of tolls on day {day} for {km}; capped at EUR {capped}.',
     'notice.roundTrip': 'Round trip back to {place}.',
     'notice.overBudget': 'Over budget on day(s) {days}.'
@@ -344,7 +346,11 @@ test('INV: the itinerary is byte-identical with the model stubbed out and enrich
     /* Only the toll estimate may differ, and it must be flagged as an estimate. */
     assert.strictEqual(plain.costs.tollsEstimated, false);
     assert.strictEqual(enriched.costs.tollsEstimated, true);
-    assert.strictEqual(enriched.costs.totalTolls, 36);
+    /* 3 driving days x EUR 9. The 4th is a rest day: no driving, so its EUR 9 claim is
+       discarded rather than added — that zero is computed, not asserted. */
+    assert.strictEqual(enriched.costs.totalTolls, 27);
+    assert.strictEqual(enriched.costs.days[3].km, 0);
+    assert.strictEqual(enriched.costs.days[3].tolls, 0);
     for (let i = 0; i < plain.costs.days.length; i++) {
         assert.strictEqual(enriched.costs.days[i].fuel, plain.costs.days[i].fuel);
         assert.strictEqual(enriched.costs.days[i].budget, plain.costs.days[i].budget);
@@ -663,17 +669,28 @@ test('D1: a toll with no estimate is UNKNOWN, not a computed zero', function () 
     assert.strictEqual(offline.days[0].tollsKnown, false);
     assert.strictEqual(offline.incomplete, true, 'the trip total is a floor, not a total');
 
-    /* The traveller who avoids tolls has a genuine, computed zero — not the same thing. */
+    /* "Avoid tolls" is a REQUEST, not an outcome — see the D1b tests below. */
     const avoided = I.computeCosts(plan, { dailyBudget: 400, tollsEnabled: false, tolls: [null, null] });
-    assert.strictEqual(avoided.tollsUnknown, false, 'avoiding tolls makes zero a fact, not a gap');
-    assert.strictEqual(avoided.days[0].tollsKnown, true);
-    assert.strictEqual(avoided.incomplete, false);
+    assert.strictEqual(avoided.days[0].tollsBasis, 'not-avoided');
+    assert.strictEqual(avoided.days[0].tollsKnown, false);
+    assert.strictEqual(avoided.tollsUnknown, false, 'a different gap from "nobody estimated it"');
+    assert.strictEqual(avoided.tollsNotAvoided, true);
 
-    /* A model-supplied 0 is also a real answer. */
+    /* A model-supplied 0 is a real answer. */
     const answered = I.computeCosts(plan, { dailyBudget: 400, tollsEnabled: true, tolls: [0, 14] });
     assert.strictEqual(answered.tollsUnknown, false);
     assert.strictEqual(answered.days[0].tollsKnown, true);
+    assert.strictEqual(answered.days[0].tollsBasis, 'estimated');
     assert.strictEqual(answered.days[0].tollsEstimated, true, 'it still came from the model');
+    assert.strictEqual(answered.incomplete, false);
+
+    /* The one zero this app can genuinely compute: a day with no driving. */
+    const rest = I.computeCosts({ days: [{ day: 1, km: 0, driveMin: 0, legs: [] }] },
+        { dailyBudget: 400, tollsEnabled: true, tolls: [9] });
+    assert.strictEqual(rest.days[0].tollsBasis, 'none');
+    assert.strictEqual(rest.days[0].tolls, 0, 'no road travelled, no toll incurred');
+    assert.strictEqual(rest.days[0].incomplete, false);
+    assert.strictEqual(rest.clampedTolls.length, 0, 'and no noisy clamp notice for it');
 });
 
 test('D1: an unknown toll is shown as unknown and blocks a "within budget" verdict', function () {
@@ -689,34 +706,198 @@ test('D1: an unknown toll is shown as unknown and blocks a "within budget" verdi
     /* Budget is generous, so the old code said "Within budget" with EUR 0.00 of tolls. */
     assert.strictEqual(view.costs.over, false, 'fixture: the known costs are inside the budget');
     assert.strictEqual(view.costs.tollsUnknown, true);
+    assert.deepStrictEqual(view.costs.unknownTollDays, [1, 2],
+        'fixture: days 1-2 drive, day 3 is a rest day with a genuinely computed zero');
 
     const html = I.renderItineraryHtml(view, CTX);
-    assert.strictEqual(html.indexOf('>Within budget<'), -1,
-        'a verdict that ignores a missing cost component must not be given');
-    assert.match(html, /Within budget for what is counted; tolls are missing/);
+    /* Verdicts, in day order: the two driving days are withheld, the rest day — whose
+       zero really is computed — keeps its clean verdict. */
+    const verdicts = (html.match(/class="cost-flag [^"]*">[^<]*/g) || [])
+        .map(function (s) { return s.replace(/class="cost-flag ([^"]*)">/, '$1|'); });
+    assert.deepStrictEqual(verdicts, [
+        'flag-unknown|Within budget for what is counted; the total is not complete',
+        'flag-unknown|Within budget for what is counted; the total is not complete',
+        'flag-ok|Within budget'
+    ], 'a verdict that ignores a missing cost component must not be given');
+    assert.match(html, /summary-flag flag-unknown">Within budget for what is counted/,
+        'and the trip verdict is withheld too');
     assert.match(html, /\(not estimated\)/, 'the toll row is marked as not estimated');
     assert.match(html, /at least EUR/, 'a total that omits a component is labelled a minimum');
-    assert.ok(html.indexOf('Tolls</td><td class="mono">EUR 0.00') === -1,
+    assert.strictEqual(
+        (html.match(/<tr class="cost-unknown"><td>Tolls <span class="est-flag">\(not estimated\)<\/span><\/td><td class="mono">—<\/td><\/tr>/g) || []).length, 2,
         'an unknown toll must never render as a computed EUR 0.00');
     const codes = view.notices.map(function (n) { return n.code; });
     assert.ok(codes.indexOf('tollsUnknown') >= 0, 'the gap is stated, not just implied');
 });
 
+/* ── DEFECT 1b (round 3) — "avoid tolls" is a request the pipeline never acts on ──
+   Nothing adds exclude=toll to the road-graph calls, so choosing "without tolls"
+   changes the route not at all. Printing EUR 0.00 there invents the one fact the app
+   never established: either the toll line is wrong (the user drives the route shown)
+   or the distances are (they really avoid tolls). ── */
+
+function tollPrefViews(t) {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 3);
+    const base = {
+        plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 500, departureTime: '09:00', t: t,
+        enrichment: I.parseEnrichment(null, 3)
+    };
+    return {
+        without: I.buildItineraryView(Object.assign({}, base,
+            { tollsEnabled: false, tollPreference: 'without-tolls' })),
+        with_: I.buildItineraryView(Object.assign({}, base,
+            { tollsEnabled: true, tollPreference: 'with-tolls' }))
+    };
+}
+
+test('D1b: "without tolls" does not re-plan the route, so it must not print a computed zero', function () {
+    const v = tollPrefViews(CTX.t);
+
+    /* The premise: the preference reaches the cost switch and the model prompt, and
+       nothing else. Same stops, same order, same kilometres. */
+    assert.deepStrictEqual(
+        v.without.plan.order.map(function (p) { return p.name; }),
+        v.with_.plan.order.map(function (p) { return p.name; }),
+        'fixture: the route is identical, so the toll preference changed nothing');
+    assert.strictEqual(v.without.plan.totalKm, v.with_.plan.totalKm);
+
+    const days = v.without.costs.days;
+    assert.strictEqual(days[0].tollsBasis, 'not-avoided');
+    assert.strictEqual(days[0].tollsKnown, false, 'zero here was never established');
+    assert.strictEqual(days[0].incomplete, true, 'so the day total is a floor');
+    assert.strictEqual(v.without.costs.tollsNotAvoided, true);
+    assert.deepStrictEqual(v.without.costs.notAvoidedTollDays, [1, 2],
+        'the rest day is excluded: no driving really does mean no tolls');
+
+    const html = I.renderItineraryHtml(v.without, CTX);
+    assert.strictEqual(
+        (html.match(/<tr class="cost-unknown"><td>Tolls <span class="est-flag">\(not applicable\)<\/span><\/td><td class="mono">—<\/td><\/tr>/g) || []).length, 2,
+        'the toll line must read "not applicable", never a computed EUR 0.00');
+    assert.strictEqual(html.indexOf('<td>Tolls</td><td class="mono">EUR 0.00'), -1);
+    assert.match(html, /at least EUR/, 'the total is labelled a minimum');
+    assert.match(html, /summary-flag flag-unknown/, 'and the trip verdict is withheld');
+
+    const codes = v.without.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('tollsNotAvoided') >= 0,
+        'the screen must say the route was not re-planned — silence here is the lie');
+    const notice = v.without.notices.filter(function (n) { return n.code === 'tollsNotAvoided'; })[0];
+    assert.strictEqual(notice.level, 'warn');
+});
+
+test('D1b: the "without tolls" gap is a DIFFERENT gap from "nobody estimated it"', function () {
+    const v = tollPrefViews(CTX.t);
+    const w = v.without.costs, t = v.with_.costs;
+    assert.strictEqual(w.tollsNotAvoided, true);
+    assert.strictEqual(w.tollsUnknown, false);
+    assert.strictEqual(t.tollsNotAvoided, false);
+    assert.strictEqual(t.tollsUnknown, true, 'with tolls on and no model answer, it is unknown');
+    /* Different explanation, different marker — the user can tell which one happened. */
+    assert.notStrictEqual(
+        I.noticeText(v.without.notices.filter(function (n) { return n.code === 'tollsNotAvoided'; })[0], CTX),
+        I.noticeText(v.with_.notices.filter(function (n) { return n.code === 'tollsUnknown'; })[0], CTX));
+});
+
+test('D1b: the not-avoided explanation exists in all five locales', function () {
+    const i18n = loadI18n();
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const s = i18n.t('notice.tollsNotAvoided');
+        assert.notStrictEqual(s, 'notice.tollsNotAvoided', LOCALES[i] + ' is missing it');
+        assert.notStrictEqual(i18n.t('itin.tollsNotApplicable'), 'itin.tollsNotApplicable', LOCALES[i]);
+        assert.notStrictEqual(i18n.t('itin.tollsNotApplicable'), i18n.t('itin.tollsNotEstimated'),
+            LOCALES[i] + ' reuses one marker for two different gaps');
+        const v = tollPrefViews(i18n.t).without;
+        assert.match(I.renderItineraryHtml(v, { t: i18n.t }), /flag-unknown/,
+            LOCALES[i] + ' still shows a pass/fail verdict');
+    }
+});
+
+/* ── DEFECT 2b (round 3) — the bound must not reject fixed-price crossings ──
+   Real 2026 car prices, one way. A per-km-only cap calls the model a liar for being
+   right about a flat charge that owes nothing to distance. ── */
+
+const REAL_CROSSINGS = [
+    ['Oresund bridge',    60, 60.00],
+    ['Mont Blanc tunnel', 40, 49.60],
+    ['Frejus tunnel',     45, 49.60],
+    ['Great St Bernard',  30, 30.60],
+    ['Storebaelt',        90, 33.00],
+    /* the priciest realistic PAIR in one day: Copenhagen -> Malmo */
+    ['Storebaelt + Oresund', 200, 93.00],
+    /* and the Alpine pair */
+    ['Mont Blanc + Frejus',  250, 99.20]
+];
+
+test('D2b: a real fixed-price crossing is not clamped and not called implausible', function () {
+    for (let i = 0; i < REAL_CROSSINGS.length; i++) {
+        const name = REAL_CROSSINGS[i][0], km = REAL_CROSSINGS[i][1], real = REAL_CROSSINGS[i][2];
+        const c = I.computeCosts({ days: [{ day: 1, km: km, driveMin: km, legs: [{}] }] },
+            { dailyBudget: 400, tollsEnabled: true, tolls: [real] });
+        assert.strictEqual(c.days[0].tolls, real,
+            name + ' (' + km + ' km, EUR ' + real + ') was clamped to EUR ' + c.days[0].tolls +
+            ' — the model was right and the app called it implausible');
+        assert.strictEqual(c.days[0].tollsBasis, 'estimated');
+        assert.strictEqual(c.clampedTolls.length, 0, name + ' produced a false clamp notice');
+        assert.strictEqual(c.days[0].incomplete, false, name + ' is a settled figure');
+    }
+});
+
+test('D2b: the bound still rejects a hallucination by a wide margin', function () {
+    const c = I.computeCosts({ days: [{ day: 1, km: 300, driveMin: 180, legs: [{}] }] },
+        { dailyBudget: 400, tollsEnabled: true, tolls: [4998] });
+    assert.ok(c.days[0].tolls <= 200, 'still bounded: ' + c.days[0].tolls);
+    assert.strictEqual(c.clampedTolls.length, 1);
+    /* The cap sits comfortably above every real price and far below the hallucination. */
+    assert.ok(I.tollCapForDay(300) >= 99.20 * 1.5, 'headroom over the priciest real day');
+    assert.ok(I.tollCapForDay(300) < 4998 / 20, 'and still an order of magnitude below the junk');
+    assert.strictEqual(I.tollCapForDay(0), 0, 'no driving, no toll allowance');
+});
+
+test('D2b: a CLAMPED day is a floor, with its budget verdict withheld', function () {
+    /* The shape of the old bug: clamping cuts the figure down, so the total lands
+       inside the budget and a clean verdict is given on money that was reduced. */
+    const plan = { days: [{ day: 1, km: 60, driveMin: 60, legs: [{}] }] };
+    const c = I.computeCosts(plan, { dailyBudget: 200, tollsEnabled: true, tolls: [250] });
+    assert.strictEqual(c.days[0].tollsBasis, 'clamped');
+    assert.ok(c.days[0].tolls < 250, 'fixture: the figure really was cut down');
+    assert.strictEqual(c.days[0].over, false, 'fixture: after the cut it looks affordable');
+    assert.strictEqual(c.days[0].incomplete, true,
+        'a reduced number must not be presented with the confidence of a computed one');
+    assert.strictEqual(c.incomplete, true);
+
+    const html = I.renderItineraryHtml({ plan: plan, costs: c, notices: [], meta: {} }, CTX);
+    assert.strictEqual(html.indexOf('>Within budget<'), -1, 'no clean verdict on a reduced total');
+    assert.match(html, /at least EUR/);
+    assert.match(html, /cost-flag flag-unknown/);
+    /* and the shown figure still carries the estimate marker */
+    assert.match(html, /<td>Tolls <span class="est-flag">\(estimate\)<\/span>/);
+
+    /* A floor verdict, by contrast, survives the cut: if the REDUCED total is already
+       over budget, the real one is too. That one is still asserted. */
+    const over = I.computeCosts(plan, { dailyBudget: 130, tollsEnabled: true, tolls: [250] });
+    assert.strictEqual(over.days[0].over, true);
+    assert.match(I.renderItineraryHtml({ plan: plan, costs: over, notices: [], meta: {} }, CTX),
+        /cost-flag flag-over/);
+});
+
 /* ── DEFECT 2 — "the numbers below are not real" must be loud and translated ── */
 
-function zeroDistanceView(t) {
+function zeroDistanceView(t, days, dailyBudget) {
     const ghost = function (n) { return P(n, null, null, { resolved: false }); };
     const places = [ghost('A'), ghost('B'), ghost('C')];
     const zeros = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     const matrix = { km: zeros, min: zeros, source: 'haversine', osrmCells: 0, filledCells: 6 };
     const plan = engine.planRoute({
         start: places[0], end: places[2], stops: [places[1]],
-        matrix: matrix, days: 3, departureTime: '09:00', maxDriveMinPerDay: 360
+        matrix: matrix, days: days || 3, departureTime: '09:00', maxDriveMinPerDay: 360
     });
     return I.buildItineraryView({
         plan: plan, requestedStops: ['B'], startName: 'A', endName: 'C', places: places,
         matrixSource: 'haversine', matrixFilledCells: 6, matrixOsrmCells: 0,
-        maxDriveMin: 360, dailyBudget: 120, tollsEnabled: true, t: t
+        maxDriveMin: 360, dailyBudget: dailyBudget === undefined ? 120 : dailyBudget,
+        tollsEnabled: true, t: t
     });
 }
 
@@ -780,6 +961,79 @@ test('D2: unknown-distance is surfaced too — it was covered but never rendered
         'the warning was in COVERED_WARNINGS with nothing covering it — silently swallowed');
     assert.strictEqual(notices.filter(function (n) { return n.code === 'unknownDistance'; })[0].level, 'alert');
     assert.strictEqual(I.hasUnreliableNumbers(notices), true);
+});
+
+test('D3b: an over-budget NOTICE is not asserted from numbers declared unusable', function () {
+    const view = zeroDistanceView(CTX.t, 6, 20);
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+    assert.ok(view.costs.overBudgetDays.length > 0,
+        'fixture: the raw arithmetic does say every day is over budget');
+
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.strictEqual(codes.indexOf('overBudget'), -1,
+        'withholding the verdict in the summary while asserting it in a notice is the ' +
+        'same claim in a smaller font');
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('Over budget on day'), -1);
+    assert.strictEqual(html.indexOf('Over budget by'), -1);
+    assert.match(html, /The budget cannot be assessed/);
+
+    /* Control: with usable distances the notice is still given. */
+    const ok = I.buildItineraryView({
+        plan: planFor(MADRID, BARCELONA, [ZARAGOZA], 2),
+        requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 10, tollsEnabled: true, t: CTX.t
+    });
+    assert.ok(ok.notices.map(function (n) { return n.code; }).indexOf('overBudget') >= 0,
+        'suppression must be conditional, not blanket');
+});
+
+/* ── DEFECT 4b (round 3) — units belong to the language the notice is READ in ── */
+
+test('D4b: a notice built in one language carries no units from it into another', function () {
+    const i18n = loadI18n();
+    i18n.setLanguage('en');
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 1);   // one day -> over the drive cap
+    const view = I.buildItineraryView({
+        plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 150, tollsEnabled: true, t: i18n.t,
+        enrichment: I.parseEnrichment(JSON.stringify({ days: [{ day: 1, tip: 'x', tollsEur: 4998 }] }), 1)
+    });
+    const pick = function (code) {
+        return view.notices.filter(function (n) { return n.code === code; })[0];
+    };
+    assert.ok(pick('overCap') && pick('tollsClamped'), 'fixture: both notices are present');
+
+    /* Params are stored raw — a formatted string here is a unit frozen at build time. */
+    assert.strictEqual(typeof pick('overCap').params.drive, 'number');
+    assert.strictEqual(typeof pick('overCap').params.cap, 'number');
+    assert.strictEqual(typeof pick('tollsClamped').params.km, 'number');
+
+    const en = I.noticeText(pick('overCap'), { t: i18n.t });
+    assert.match(en, /h/, 'fixture: English renders hours as "h"');
+
+    i18n.setLanguage('zh');
+    const zhCtx = { t: i18n.t };
+    const zhCap = I.noticeText(pick('overCap'), zhCtx);
+    const zhToll = I.noticeText(pick('tollsClamped'), zhCtx);
+    assert.match(zhCap, /小时/, 'the hour unit must follow the language: ' + zhCap);
+    assert.strictEqual(/\d\s*h\b/.test(zhCap), false, 'English "h" survived into zh: ' + zhCap);
+    assert.match(zhToll, /公里/, 'the km unit must follow the language: ' + zhToll);
+    assert.strictEqual(zhToll.indexOf(' km'), -1, 'English " km" survived into zh: ' + zhToll);
+    assert.strictEqual(zhCap.indexOf('{'), -1);
+    assert.strictEqual(zhToll.indexOf('{'), -1);
+
+    /* Every locale, both notices, no placeholder and no foreign unit left behind. */
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const ctx = { t: i18n.t };
+        const km = i18n.t('unit.km'), hour = i18n.t('unit.hour');
+        assert.ok(I.noticeText(pick('tollsClamped'), ctx).indexOf(km) >= 0, LOCALES[i] + ' km unit');
+        assert.ok(I.noticeText(pick('overCap'), ctx).indexOf(hour) >= 0, LOCALES[i] + ' hour unit');
+    }
 });
 
 /* ── DEFECT 3 — 'mixed' is not 'haversine' ── */
@@ -867,11 +1121,19 @@ test('D4: an absurd model toll is capped, and the cap is reported', function () 
         assert.ok(d.tolls <= I.tollCapForDay(d.km) + 0.005,
             'day ' + d.day + ' kept an unbounded ' + d.tolls);
         assert.ok(d.tolls < 4998, 'the model number went straight through');
-        assert.ok(d.tollsClamped, 'the clamp must be recorded, not applied silently');
+        if (d.km > 0) {
+            assert.ok(d.tollsClamped, 'the clamp must be recorded, not applied silently');
+            assert.strictEqual(d.tollsBasis, 'clamped');
+            assert.strictEqual(d.incomplete, true,
+                'a REDUCED figure is a floor — it must not wear the confidence of a computed one');
+        } else {
+            assert.strictEqual(d.tolls, 0, 'a day with no driving incurs no toll');
+            assert.strictEqual(d.tollsBasis, 'none');
+        }
     }
     assert.ok(view.costs.totalCost < 1500,
         'a hallucinated toll must not be able to multiply the trip cost: ' + view.costs.totalCost);
-    assert.strictEqual(view.costs.clampedTolls.length, 3);
+    assert.strictEqual(view.costs.clampedTolls.length, 2, 'the two driving days');
 
     const codes = view.notices.map(function (n) { return n.code; });
     assert.ok(codes.indexOf('tollsClamped') >= 0, 'the user is told a number was rejected');

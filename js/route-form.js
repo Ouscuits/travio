@@ -175,9 +175,15 @@ function buildEnrichmentPrompt(fd, plan) {
     const I = itin();
     const langName = { es: 'Spanish', en: 'English', ca: 'Catalan', fr: 'French', zh: 'Simplified Chinese' }[fd.language] || 'English';
     const tripLabel = { familiar: 'family', pareja: 'couple', aventura: 'adventure', moto: 'motorcycle' }[fd.tripType] || fd.tripType;
+    /* Nothing in the pipeline re-plans the route to avoid tolls (no exclude=toll on the
+       road-graph calls), so asking the model to report zero would only manufacture the
+       fact the app never established. The UI marks that branch "not applicable" and
+       ignores tollsEur entirely — say so rather than soliciting a number to discard. */
     const tollText = fd.tollPreference === 'with-tolls'
         ? 'The traveller accepts toll motorways.'
-        : 'The traveller avoids tolls, so tollsEur must be 0 for every day.';
+        : 'The traveller would prefer to avoid tolls, but the itinerary above was NOT re-planned ' +
+          'to avoid them — do not change any route, distance or time for it. Set tollsEur to 0; ' +
+          'it is ignored in this case.';
 
     const lines = [];
     for (let i = 0; i < plan.days.length; i++) {

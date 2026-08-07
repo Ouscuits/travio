@@ -27,19 +27,34 @@
 
     /* ── Bounds on the ONE number the model is allowed to contribute ──
        A toll estimate is prose with a euro sign in front of it: unbounded, it can
-       double the trip cost and flip the budget verdict on its own. The priciest
-       French and Italian autostrade run about 0.09-0.12 EUR/km, so 0.25 EUR/km leaves
-       more than double the headroom of the priciest real network — anything above that
-       is not an estimate, it is a typo or a hallucination. Values over the cap are
-       clamped, and the clamp is reported to the user rather than applied quietly. */
-    const MAX_TOLL_EUR_PER_KM  = 0.25;
-    const MIN_TOLL_CAP_EUR     = 20;    // a 5 km day can still cross one paying tunnel
-    const MAX_TOLL_EUR_PER_DAY = 150;
+       double the trip cost and flip the budget verdict on its own.
+
+       European tolls have TWO shapes and the bound has to model both, or it rejects
+       true values:
+         · per-kilometre networks — the priciest real ones run 0.07-0.12 EUR/km
+           (Paris-Lyon 465 km / EUR 40 = 0.086; Madrid-Barcelona 620 km / EUR 45 =
+           0.073), so 0.25 EUR/km leaves more than double the headroom;
+         · fixed-price crossings — a flat charge that owes nothing to distance:
+           Oresund EUR 60.00, Mont Blanc EUR 49.60, Frejus EUR 49.60, Storebaelt
+           EUR 33.00, Great St Bernard EUR 30.60. A per-km-only bound caps a 40 km
+           Mont Blanc day at pocket change and calls the model a liar for being right.
+       The allowance is sized to the priciest realistic PAIR of crossings in one day —
+       Storebaelt + Oresund = EUR 93.00 (the Copenhagen-Malmo run), Mont Blanc + Frejus
+       = EUR 99.20 — so EUR 100, ADDED to the per-km term rather than maxed against it,
+       because a day can legitimately have both. A day with no driving has no tolls.
+
+       Anything above the bound is a typo or a hallucination. It is clamped, the clamp
+       is reported, and — because a clamped figure is a reduced one — the day's total
+       becomes a floor with its budget verdict withheld, exactly like an unknown. */
+    const MAX_TOLL_EUR_PER_KM         = 0.25;
+    const FIXED_CROSSING_ALLOWANCE_EUR = 100;
+    const MAX_TOLL_EUR_PER_DAY        = 200;
 
     function tollCapForDay(km) {
         const k = nonNeg(km, 0);
+        if (k <= 0) return 0;           // no driving, no tolls
         return Math.min(MAX_TOLL_EUR_PER_DAY,
-            Math.max(MIN_TOLL_CAP_EUR, round2(k * MAX_TOLL_EUR_PER_KM)));
+            round2(FIXED_CROSSING_ALLOWANCE_EUR + k * MAX_TOLL_EUR_PER_KM));
     }
 
     /* ── Tiny pure helpers ── */
@@ -130,6 +145,8 @@
         let totalCost = 0, totalBudget = 0;
         let tollsEstimated = false;
         const unknownTollDays = [];
+        const notAvoidedTollDays = [];
+        const incompleteDays = [];
         const clampedTolls = [];
 
         for (let i = 0; i < planDays.length; i++) {
@@ -137,15 +154,32 @@
             const km = nonNeg(d.km, 0);
             const fuel = round2((km / 100) * consumption * fuelPrice);
 
-            /* Three genuinely different toll states, and the UI must be able to tell
-               them apart:
-                 known 0   — the traveller avoids tolls, so zero is a computed fact;
-                 estimated — the model supplied a number (bounded, flagged);
-                 UNKNOWN   — nobody supplied anything. A computed 0 here would be a
-                             lie: it silently drops a whole cost component and then
-                             lets a "within budget" verdict rest on the gap. */
+            /* Four genuinely different toll states, and the UI must be able to tell
+               them apart. None of them is a computed zero, because nothing in this
+               app computes tolls:
+                 'estimated'   — the model supplied a plausible number (flagged);
+                 'clamped'     — the model's number was outside the plausible bound, so
+                                 what is shown is a REDUCED figure: a floor, not a total;
+                 'unknown'     — nobody supplied anything. A 0 here silently drops a
+                                 whole cost component and then lets a "within budget"
+                                 verdict rest on the gap;
+                 'not-avoided' — the traveller asked to avoid tolls, but NOTHING in the
+                                 pipeline re-plans the route to do it (no exclude=toll on
+                                 the road-graph calls). So either the distances shown are
+                                 for a route that uses toll roads, or they are not the
+                                 route the traveller will drive. Printing EUR 0.00 here
+                                 would be inventing the one fact the app never
+                                 established. It is not applicable, not zero. */
             let tolls = 0, tollsKnown = true, fromModel = false, clamped = null;
-            if (tollsEnabled) {
+            let basis = 'estimated';
+            if (km <= 0) {
+                /* A day with no driving is the ONE case where a zero really is computed:
+                   no road travelled, no toll incurred, whatever the model claims. */
+                basis = 'none';
+            } else if (!tollsEnabled) {
+                basis = 'not-avoided';
+                tollsKnown = false;
+            } else {
                 const rawIn = tollsIn[i];
                 const raw = (rawIn === null || rawIn === undefined || rawIn === '')
                     ? NaN : num(rawIn, NaN);
@@ -155,14 +189,22 @@
                     if (raw > cap) {
                         clamped = { requested: round2(raw), capped: cap, km: round2(km) };
                         tolls = cap;
+                        basis = 'clamped';
                     } else {
                         tolls = round2(raw);
+                        basis = 'estimated';
                     }
                 } else {
+                    basis = 'unknown';
                     tollsKnown = false;
                 }
             }
             if (fromModel) tollsEstimated = true;
+            /* A settled figure is a plausible model estimate, or a no-driving day. A
+               clamped one has been cut down, an unknown was never given, and a "without
+               tolls" route was never actually re-planned — all three make the day total
+               a FLOOR, so they all get the floor treatment the unknown branch already had. */
+            const incomplete = !(basis === 'estimated' || basis === 'none');
 
             /* Lodging pays for the NIGHTS of the trip: no hotel after the final day. */
             const lodging = (i < planDays.length - 1) ? round2(lodgingRate) : 0;
@@ -183,19 +225,22 @@
                 fuel: fuel,
                 tolls: tolls,
                 tollsKnown: tollsKnown,
+                tollsBasis: basis,
                 tollsEstimated: fromModel,
                 tollsClamped: clamped,
                 lodging: lodging,
                 meals: meals,
                 total: total,
-                /* `total` counts only what is known: with unknown tolls it is a FLOOR. */
-                incomplete: !tollsKnown,
+                /* `total` counts only what is settled: anything else makes it a FLOOR. */
+                incomplete: incomplete,
                 budget: round2(budget),
                 over: over,
                 overBy: over ? round2(total - budget) : 0,
                 overDependsOnEstimate: overFromEstimate
             });
-            if (!tollsKnown) unknownTollDays.push(dayNo);
+            if (basis === 'unknown') unknownTollDays.push(dayNo);
+            if (basis === 'not-avoided') notAvoidedTollDays.push(dayNo);
+            if (incomplete) incompleteDays.push(dayNo);
             if (clamped) clampedTolls.push({ day: dayNo, requested: clamped.requested, capped: clamped.capped, km: clamped.km });
 
             totalFuel += fuel; totalTolls += tolls; totalLodging += lodging;
@@ -223,9 +268,12 @@
             tollsEstimated: tollsEstimated,
             tollsUnknown: unknownTollDays.length > 0,
             unknownTollDays: unknownTollDays,
+            tollsNotAvoided: notAvoidedTollDays.length > 0,
+            notAvoidedTollDays: notAvoidedTollDays,
             clampedTolls: clampedTolls,
             /* The trip total is a floor whenever any day's is. */
-            incomplete: unknownTollDays.length > 0,
+            incomplete: incompleteDays.length > 0,
+            incompleteDays: incompleteDays,
             overDependsOnEstimate: over && tollsEstimated && tollsTotal > 0 &&
                 round2(cost - tollsTotal) <= budgetTotal + 0.005,
             rates: {
@@ -447,6 +495,17 @@
         const days = plan.days;
         const order = Array.isArray(plan.order) ? plan.order : [];
 
+        /* Decided up front, because it gates what may be asserted below: once the
+           distances are declared unusable, every judgement computed FROM them —
+           including the over-budget one — is unusable too. */
+        const planWarnings = Array.isArray(plan.warnings) ? plan.warnings : [];
+        let unusableNumbers = false;
+        for (let i = 0; i < planWarnings.length; i++) {
+            const w = String(planWarnings[i] || '');
+            const code = w.indexOf(':') > 0 ? w.slice(0, w.indexOf(':')) : w;
+            if (UNRELIABLE_WARNINGS[code]) { unusableNumbers = true; break; }
+        }
+
         /* Dropped destinations (duplicates / same as start or end). */
         const requested = Array.isArray(c.requestedStops) ? c.requestedStops : [];
         const inOrder = {};
@@ -481,12 +540,14 @@
                 });
             }
             if (d.overDriveCap) {
+                /* Raw minutes, NOT a formatted string: the units belong to the locale
+                   the notice is READ in, not the one it was built in. */
                 out.push({
                     code: 'overCap', level: 'warn',
                     params: {
                         day: num(d.day, i + 1),
-                        drive: formatDuration(num(d.driveMin, 0), ctx),
-                        cap: formatDuration(num(c.maxDriveMin, 360), ctx)
+                        drive: num(d.driveMin, 0),
+                        cap: num(c.maxDriveMin, 360)
                     }
                 });
             }
@@ -522,12 +583,18 @@
             }
         }
 
-        /* Tolls: an unknown is not a zero, and a clamped model number is not a fact. */
+        /* Tolls. Nothing in this app computes them, so every branch that is not a
+           plausible model estimate has to say what it actually is. */
         if (c.costs && c.costs.tollsUnknown) {
             out.push({
                 code: 'tollsUnknown', level: 'warn',
                 params: { days: (c.costs.unknownTollDays || []).join(', ') }
             });
+        }
+        /* "Without tolls" is a preference the pipeline never acts on: the road-graph
+           calls carry no exclude=toll, so the route below is the same route. */
+        if (c.costs && c.costs.tollsNotAvoided) {
+            out.push({ code: 'tollsNotAvoided', level: 'warn', params: {} });
         }
         const clamped = (c.costs && Array.isArray(c.costs.clampedTolls)) ? c.costs.clampedTolls : [];
         for (let i = 0; i < clamped.length; i++) {
@@ -535,9 +602,9 @@
                 code: 'tollsClamped', level: 'warn',
                 params: {
                     day: clamped[i].day,
-                    value: formatAmount(clamped[i].requested),
-                    capped: formatAmount(clamped[i].capped),
-                    km: formatKm(clamped[i].km, ctx)
+                    value: clamped[i].requested,
+                    capped: clamped[i].capped,
+                    km: clamped[i].km
                 }
             });
         }
@@ -549,8 +616,10 @@
             });
         }
 
-        /* Over-budget days. */
-        if (c.costs && Array.isArray(c.costs.overBudgetDays) && c.costs.overBudgetDays.length) {
+        /* Over-budget days — but not when the distances they were computed from have
+           already been declared unusable. Withholding the verdict in the summary while
+           still asserting it in a notice is the same lie in a smaller font. */
+        if (!unusableNumbers && c.costs && Array.isArray(c.costs.overBudgetDays) && c.costs.overBudgetDays.length) {
             out.push({
                 code: 'overBudget', level: 'warn',
                 params: { days: c.costs.overBudgetDays.join(', '), count: c.costs.overBudgetDays.length }
@@ -560,7 +629,7 @@
         /* Engine warnings. The "numbers are not real" class gets a translated string
            and the top severity; anything else not represented above is still surfaced
            verbatim (code 'other') so nothing is ever swallowed. */
-        const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
+        const warnings = planWarnings;
         const seenUnreliable = {};
         for (let i = 0; i < warnings.length; i++) {
             const w = String(warnings[i] || '');
@@ -587,10 +656,36 @@
             .map(function (x) { return x.n; });
     }
 
+    /* Which notice params are NUMBERS carrying a unit, and which unit. Notices store
+       the raw value; the unit is attached here, at read time, so a notice built in one
+       language and re-rendered in another does not keep the old locale's units baked
+       into the sentence ("7 h 21 min" surviving inside a Chinese string). */
+    const NOTICE_NUMERIC_PARAMS = {
+        overCap:      { drive: 'duration', cap: 'duration' },
+        tollsClamped: { km: 'km', value: 'amount', capped: 'amount' }
+    };
+
+    function noticeFillParams(notice, ctx) {
+        const raw = (notice && notice.params) || {};
+        const spec = NOTICE_NUMERIC_PARAMS[notice && notice.code];
+        if (!spec) return raw;
+        const out = {};
+        for (const k in raw) if (Object.prototype.hasOwnProperty.call(raw, k)) out[k] = raw[k];
+        for (const k in spec) {
+            if (!Object.prototype.hasOwnProperty.call(spec, k)) continue;
+            const v = num(raw[k], NaN);
+            /* A value already formatted by an older saved route is left as it is. */
+            if (!isFinite(v)) continue;
+            out[k] = spec[k] === 'duration' ? formatDuration(v, ctx)
+                : (spec[k] === 'km' ? formatKm(v, ctx) : formatAmount(v));
+        }
+        return out;
+    }
+
     function noticeText(notice, ctx) {
         if (!notice) return '';
         if (notice.code === 'other') return String(notice.params && notice.params.text || '');
-        return trf(ctx, 'notice.' + notice.code, notice.params || {});
+        return trf(ctx, 'notice.' + notice.code, noticeFillParams(notice, ctx));
     }
 
     /* ── Formatting ── */
@@ -856,12 +951,18 @@
                 '</td><td class="mono">' + esc(valueText) + '</td></tr>';
         };
         row('itin.fuel', formatMoney(dayCost.fuel));
-        /* An unknown toll is shown as an unknown, never as a computed EUR 0.00. */
-        if (dayCost.tollsKnown === false) {
+        /* Nothing computes tolls, so nothing but a plausible model estimate is printed
+           as a euro amount. Both non-answers render as an unknown, with the marker that
+           says WHICH non-answer it is. */
+        const basis = dayCost.tollsBasis ||
+            (dayCost.tollsKnown === false ? 'unknown' : (dayCost.tollsEstimated ? 'estimated' : 'unknown'));
+        if (basis === 'not-avoided') {
+            row('itin.tolls', tr(ctx, 'itin.unknownValue'), tr(ctx, 'itin.tollsNotApplicable'), 'cost-unknown');
+        } else if (basis === 'unknown') {
             row('itin.tolls', tr(ctx, 'itin.unknownValue'), tr(ctx, 'itin.tollsNotEstimated'), 'cost-unknown');
         } else {
-            row('itin.tolls', formatMoney(dayCost.tolls),
-                dayCost.tollsEstimated ? tr(ctx, 'itin.estimate') : '');
+            row('itin.tolls', formatMoney(dayCost.tolls), tr(ctx, 'itin.estimate'),
+                basis === 'clamped' ? 'cost-unknown' : '');
         }
         row('itin.lodging', formatMoney(dayCost.lodging));
         row('itin.meals', formatMoney(dayCost.meals));
