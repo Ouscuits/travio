@@ -19,6 +19,15 @@ const MAX_DRIVE_MIN_PER_DAY = 360;      // quality bar B6 — 6 h/day cap
 let currentRoute = null;
 let isGenerating = false;
 
+/* Every write to the result pane is stamped with the generation that produced it.
+   Step 6 (enrichment) lands seconds after step 5, and in between the user can clear
+   the form or load a saved route — without this token that late write resurrects a
+   dead itinerary against an empty form, or clobbers the route just loaded. */
+let generationId = 0;
+function beginGeneration() { return ++generationId; }
+function invalidateGeneration() { generationId++; }
+function isCurrentGeneration(id) { return id === generationId; }
+
 /* ── Small helpers ── */
 function itin() {
     return (typeof window !== 'undefined' && window.TravioItinerary) ? window.TravioItinerary : null;
@@ -32,6 +41,16 @@ function numVal(id, def) {
     if (!node) return def;
     const n = Number(node.value);
     return isFinite(n) && n > 0 ? n : def;
+}
+/* Firestore rejects undefined and NaN — everything unusable becomes an explicit null. */
+function numOrNull(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return isFinite(n) && n >= 0 ? n : null;
+}
+function setVal(id, value) {
+    const node = el(id);
+    if (node && value !== null && value !== undefined && value !== '') node.value = value;
 }
 
 /* ── Initialization ── */
@@ -53,6 +72,24 @@ function initRouteForm() {
 
     const customChk = el('rfCustomBudget');
     if (customChk) customChk.addEventListener('change', renderBudgetPerDay);
+
+    /* The itinerary is built in JS, so applyTranslations() cannot reach it: without
+       this hook a language switch leaves every label, notice and budget verdict in
+       the result pane frozen in the previous language. */
+    if (typeof onLanguageChange === 'function') onLanguageChange(rerenderCurrentRoute);
+}
+
+/* Re-render the result pane in the current language. Cheap and idempotent: the view
+   is already computed, only the strings change. */
+function rerenderCurrentRoute() {
+    if (!currentRoute) return;
+    const I = itin();
+    if (I && currentRoute.view) {
+        currentRoute.result = I.buildPlainSummary(currentRoute.view, trCtx());
+        currentRoute.language = currentLang;
+    }
+    displayRoute(currentRoute);
+    renderBudgetPerDay();
 }
 
 /* ── Advanced Options ── */
@@ -238,9 +275,12 @@ async function generateRoute() {
     }
 
     isGenerating = true;
+    const myGen = beginGeneration();
     const genBtn = el('generateBtn');
+    const clrBtn = el('clearBtn');
     genBtn.disabled = true;
     genBtn.textContent = t('form.generating');
+    if (clrBtn) clrBtn.disabled = true;
     showLoadingState();
 
     const fd = collectFormData();
@@ -285,6 +325,8 @@ async function generateRoute() {
             endName: fd.endPoint,
             places: places,
             matrixSource: matrix.source,
+            matrixFilledCells: matrix.filledCells,
+            matrixOsrmCells: matrix.osrmCells,
             maxDriveMin: MAX_DRIVE_MIN_PER_DAY,
             tripType: fd.tripType,
             departureTime: fd.departureTime,
@@ -298,6 +340,7 @@ async function generateRoute() {
             tollPreference: fd.tollPreference,
             t: t, tf: tf
         };
+        if (!isCurrentGeneration(myGen)) return;   // cleared / another route loaded
         const baseView = I.buildItineraryView(viewArgs);
         currentRoute = makeRoute(fd, baseView);
         setProgress(100, t('progress.done'), '');
@@ -314,19 +357,24 @@ async function generateRoute() {
             enrichment = I.parseEnrichment(null, plan.days.length);
             enrichment.error = 'unavailable';
         }
+        setEnrichBusy(false);
+        /* The user may have cleared the form or loaded a saved route while this was in
+           flight. Writing now would resurrect a dead itinerary or clobber theirs. */
+        if (!isCurrentGeneration(myGen)) return;
         viewArgs.enrichment = enrichment;
         const finalView = I.buildItineraryView(viewArgs);
         currentRoute = makeRoute(fd, finalView);
-        setEnrichBusy(false);
         displayRoute(currentRoute);
 
     } catch (e) {
         console.error('Route generation error:', e);
-        showRouteError(t('result.error') + ': ' + e.message);
+        if (isCurrentGeneration(myGen)) showRouteError(t('result.error') + ': ' + e.message);
     } finally {
         isGenerating = false;
         genBtn.disabled = false;
         genBtn.textContent = t('form.generate');
+        if (clrBtn) clrBtn.disabled = false;
+        setEnrichBusy(false);
         hideLoadingState();
     }
 }
@@ -459,6 +507,15 @@ async function saveCurrentRoute() {
             dailyBudget:    fd.dailyBudget || 0,
             tollPreference: fd.tollPreference || 'with-tolls',
             departureTime:  fd.departureTime || '09:00',
+            /* Cost assumptions and per-day budgets are part of the answer: without them
+               a reloaded route silently regenerates against the defaults. */
+            consumption:     numOrNull(fd.consumption),
+            fuelPrice:       numOrNull(fd.fuelPrice),
+            lodgingPerNight: numOrNull(fd.lodgingPerNight),
+            mealsPerDay:     numOrNull(fd.mealsPerDay),
+            customBudget:    !!fd.customBudget,
+            budgets:         Array.isArray(fd.budgets)
+                ? fd.budgets.map(function (v) { return numOrNull(v); }) : [],
             result:         currentRoute.result || '',
             structured:     currentRoute.structured || null,
             language:       currentRoute.language || currentLang
@@ -474,6 +531,7 @@ async function saveCurrentRoute() {
 
 /* ── Clear form ── */
 function clearForm() {
+    invalidateGeneration();     // any in-flight enrichment must not write back
     el('rfStartPoint').value = '';
     el('rfEndPoint').value = '';
     el('rfDestinations').value = '';
@@ -536,6 +594,7 @@ async function viewSavedRoute(routeId) {
         if (!doc.exists) return;
         const r = doc.data();
         const I = itin();
+        invalidateGeneration();     // a pending enrichment must not clobber this route
         /* New saves carry a structured plan; older ones only have the plain text. */
         const view = (I && I.isStructuredRoute(r)) ? I.viewFromSaved(r) : null;
         currentRoute = { formData: r, view: view, structured: r.structured || null, result: r.result || '', language: r.language };
@@ -548,6 +607,21 @@ async function viewSavedRoute(routeId) {
         el('rfDailyBudget').value  = r.dailyBudget || 100;
         if (el('rfTolls') && r.tollPreference) el('rfTolls').value = r.tollPreference;
         if (el('rfDepartureTime') && r.departureTime) el('rfDepartureTime').value = r.departureTime;
+
+        /* Restore the assumptions the route was costed with, so regenerating it does
+           not silently swap in the defaults. */
+        setVal('rfConsumption', r.consumption);
+        setVal('rfFuelPrice', r.fuelPrice);
+        setVal('rfLodging', r.lodgingPerNight);
+        setVal('rfMeals', r.mealsPerDay);
+        const chk = el('rfCustomBudget');
+        if (chk) {
+            chk.checked = !!r.customBudget;
+            renderBudgetPerDay();
+            if (chk.checked && Array.isArray(r.budgets)) {
+                for (let i = 0; i < r.budgets.length; i++) setVal('rfBudgetDay' + (i + 1), r.budgets[i]);
+            }
+        }
 
         showView('userHomeView');
         applyTranslations();

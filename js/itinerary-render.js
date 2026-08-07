@@ -25,6 +25,23 @@
     const MAX_ACTIVITIES = 6;
     const MAX_TEXT       = 400;
 
+    /* ── Bounds on the ONE number the model is allowed to contribute ──
+       A toll estimate is prose with a euro sign in front of it: unbounded, it can
+       double the trip cost and flip the budget verdict on its own. The priciest
+       French and Italian autostrade run about 0.09-0.12 EUR/km, so 0.25 EUR/km leaves
+       more than double the headroom of the priciest real network — anything above that
+       is not an estimate, it is a typo or a hallucination. Values over the cap are
+       clamped, and the clamp is reported to the user rather than applied quietly. */
+    const MAX_TOLL_EUR_PER_KM  = 0.25;
+    const MIN_TOLL_CAP_EUR     = 20;    // a 5 km day can still cross one paying tunnel
+    const MAX_TOLL_EUR_PER_DAY = 150;
+
+    function tollCapForDay(km) {
+        const k = nonNeg(km, 0);
+        return Math.min(MAX_TOLL_EUR_PER_DAY,
+            Math.max(MIN_TOLL_CAP_EUR, round2(k * MAX_TOLL_EUR_PER_KM)));
+    }
+
     /* ── Tiny pure helpers ── */
     function num(v, def) {
         if (v === null || v === undefined || v === '') return def;
@@ -112,17 +129,41 @@
         let totalFuel = 0, totalTolls = 0, totalLodging = 0, totalMeals = 0;
         let totalCost = 0, totalBudget = 0;
         let tollsEstimated = false;
+        const unknownTollDays = [];
+        const clampedTolls = [];
 
         for (let i = 0; i < planDays.length; i++) {
             const d = planDays[i] || {};
             const km = nonNeg(d.km, 0);
             const fuel = round2((km / 100) * consumption * fuelPrice);
 
-            let tolls = 0;
+            /* Three genuinely different toll states, and the UI must be able to tell
+               them apart:
+                 known 0   — the traveller avoids tolls, so zero is a computed fact;
+                 estimated — the model supplied a number (bounded, flagged);
+                 UNKNOWN   — nobody supplied anything. A computed 0 here would be a
+                             lie: it silently drops a whole cost component and then
+                             lets a "within budget" verdict rest on the gap. */
+            let tolls = 0, tollsKnown = true, fromModel = false, clamped = null;
             if (tollsEnabled) {
-                const raw = num(tollsIn[i], NaN);
-                if (isFinite(raw) && raw > 0) { tolls = round2(raw); tollsEstimated = true; }
+                const rawIn = tollsIn[i];
+                const raw = (rawIn === null || rawIn === undefined || rawIn === '')
+                    ? NaN : num(rawIn, NaN);
+                if (isFinite(raw) && raw >= 0) {
+                    const cap = tollCapForDay(km);
+                    fromModel = true;
+                    if (raw > cap) {
+                        clamped = { requested: round2(raw), capped: cap, km: round2(km) };
+                        tolls = cap;
+                    } else {
+                        tolls = round2(raw);
+                    }
+                } else {
+                    tollsKnown = false;
+                }
             }
+            if (fromModel) tollsEstimated = true;
+
             /* Lodging pays for the NIGHTS of the trip: no hotel after the final day. */
             const lodging = (i < planDays.length - 1) ? round2(lodgingRate) : 0;
             const meals = round2(mealsRate);
@@ -130,19 +171,32 @@
             const total = round2(fuel + tolls + lodging + meals);
             const budget = nonNeg(budgets[i], 0);
             const over = total > budget + 0.005;
+            /* An over-budget verdict that only exists because of the model's number is
+               a verdict the model made up; it has to say so out loud. */
+            const overFromEstimate = over && fromModel && tolls > 0 &&
+                round2(total - tolls) <= budget + 0.005;
 
+            const dayNo = num(d.day, i + 1);
             days.push({
-                day: num(d.day, i + 1),
+                day: dayNo,
                 km: round2(km),
                 fuel: fuel,
                 tolls: tolls,
+                tollsKnown: tollsKnown,
+                tollsEstimated: fromModel,
+                tollsClamped: clamped,
                 lodging: lodging,
                 meals: meals,
                 total: total,
+                /* `total` counts only what is known: with unknown tolls it is a FLOOR. */
+                incomplete: !tollsKnown,
                 budget: round2(budget),
                 over: over,
-                overBy: over ? round2(total - budget) : 0
+                overBy: over ? round2(total - budget) : 0,
+                overDependsOnEstimate: overFromEstimate
             });
+            if (!tollsKnown) unknownTollDays.push(dayNo);
+            if (clamped) clampedTolls.push({ day: dayNo, requested: clamped.requested, capped: clamped.capped, km: clamped.km });
 
             totalFuel += fuel; totalTolls += tolls; totalLodging += lodging;
             totalMeals += meals; totalCost += total; totalBudget += budget;
@@ -151,18 +205,29 @@
         const overDays = [];
         for (let i = 0; i < days.length; i++) if (days[i].over) overDays.push(days[i].day);
 
+        const cost = round2(totalCost), budgetTotal = round2(totalBudget);
+        const tollsTotal = round2(totalTolls);
+        const over = cost > budgetTotal + 0.005;
+
         return {
             days: days,
             totalFuel: round2(totalFuel),
-            totalTolls: round2(totalTolls),
+            totalTolls: tollsTotal,
             totalLodging: round2(totalLodging),
             totalMeals: round2(totalMeals),
-            totalCost: round2(totalCost),
-            totalBudget: round2(totalBudget),
+            totalCost: cost,
+            totalBudget: budgetTotal,
             overBudgetDays: overDays,
-            over: round2(totalCost) > round2(totalBudget) + 0.005,
-            overBy: round2(totalCost) > round2(totalBudget) + 0.005 ? round2(totalCost - totalBudget) : 0,
+            over: over,
+            overBy: over ? round2(cost - budgetTotal) : 0,
             tollsEstimated: tollsEstimated,
+            tollsUnknown: unknownTollDays.length > 0,
+            unknownTollDays: unknownTollDays,
+            clampedTolls: clampedTolls,
+            /* The trip total is a floor whenever any day's is. */
+            incomplete: unknownTollDays.length > 0,
+            overDependsOnEstimate: over && tollsEstimated && tollsTotal > 0 &&
+                round2(cost - tollsTotal) <= budgetTotal + 0.005,
             rates: {
                 consumption: consumption, fuelPrice: fuelPrice,
                 lodgingPerNight: lodgingRate, mealsPerDay: mealsRate
@@ -240,7 +305,7 @@
 
         const result = {
             available: false, error: null, missingDays: [],
-            days: days, filledDays: 0
+            days: days, filledDays: 0, droppedEntries: 0
         };
 
         if (raw === null || raw === undefined || raw === '') {
@@ -280,9 +345,20 @@
         for (let i = 0; i < list.length; i++) {
             const entry = list[i];
             if (!entry || typeof entry !== 'object') continue;
-            let idx = Math.floor(num(entry.day, NaN));
-            if (!isFinite(idx) || idx < 1 || idx > n) idx = i + 1;
-            if (idx < 1 || idx > n) continue;
+            /* A `day` the model actually stated is a claim about WHICH day the prose
+               belongs to. When it points outside the trip the claim is unusable — and
+               re-homing it onto the positional index attaches "visit the cathedral in
+               Burgos" to a day spent in Valencia. Drop it instead; only an ABSENT or
+               unparseable day falls back to the position in the array. */
+            const stated = num(entry.day, NaN);
+            let idx;
+            if (isFinite(stated)) {
+                idx = Math.floor(stated);
+                if (idx < 1 || idx > n) { result.droppedEntries++; continue; }
+            } else {
+                idx = i + 1;
+                if (idx < 1 || idx > n) { result.droppedEntries++; continue; }
+            }
 
             const target = days[idx - 1];
             const activities = cleanStringList(entry.activities !== undefined ? entry.activities : entry.activity);
@@ -321,14 +397,48 @@
         return out;
     }
 
+    /* Same list, but "the model said nothing" stays `null` instead of collapsing into
+       a euro-zero. computeCosts needs that distinction to report an honest UNKNOWN. */
+    function tollEstimates(enrichment) {
+        const out = [];
+        if (!enrichment || !Array.isArray(enrichment.days)) return out;
+        for (let i = 0; i < enrichment.days.length; i++) {
+            const t = enrichment.days[i] ? enrichment.days[i].tolls : null;
+            out.push(t === null || t === undefined ? null : t);
+        }
+        return out;
+    }
+
     /* ── Notices — derived from the PLAN, not from English warning strings, so
        every one of them is translatable. Engine warnings whose code is not
        covered here are still surfaced verbatim (code 'other'): never swallowed. */
     const COVERED_WARNINGS = {
         'rest-day': 1, 'over-drive-cap': 1, 'duplicate-stop-removed': 1,
         'unresolved-place': 1, 'distance-fallback': 1, 'distance-source': 1,
-        'missing-matrix': 1, 'round-trip': 1, 'unknown-distance': 1, 'stop-ignored': 1
+        'missing-matrix': 1, 'round-trip': 1, 'unknown-distance': 1, 'stop-ignored': 1,
+        'zero-distance': 1
     };
+
+    /* Engine warnings that mean "the numbers below are not real". These are not
+       colour-coded trivia: they invalidate every distance, time and cost on the page,
+       so they get the top severity, a translated string in all five locales, and they
+       suppress any reassuring budget verdict downstream. */
+    const UNRELIABLE_WARNINGS = {
+        'zero-distance': 'zeroDistance',
+        'unknown-distance': 'unknownDistance'
+    };
+    const UNRELIABLE_NOTICES = { zeroDistance: 1, unknownDistance: 1 };
+
+    /* info < warn < alert. Rendered top-down so the loudest is never buried. */
+    const LEVEL_RANK = { alert: 0, warn: 1, info: 2 };
+
+    function hasUnreliableNumbers(notices) {
+        if (!Array.isArray(notices)) return false;
+        for (let i = 0; i < notices.length; i++) {
+            if (notices[i] && UNRELIABLE_NOTICES[notices[i].code]) return true;
+        }
+        return false;
+    }
 
     function buildNotices(plan, ctx) {
         const out = [];
@@ -390,9 +500,46 @@
             }
         }
 
-        /* Distance source. */
+        /* Distance source. 'mixed' is NOT 'haversine': a matrix that is 70% real road
+           data must not tell the user there is no road data at all. The engine already
+           counts the straight-line fills — carry the counts through instead of
+           throwing them away. */
         if (c.matrixSource && c.matrixSource !== 'osrm') {
-            out.push({ code: 'haversine', level: 'warn', params: {} });
+            if (c.matrixSource === 'mixed') {
+                const filled = num(c.matrixFilledCells, NaN);
+                const osrm = num(c.matrixOsrmCells, NaN);
+                const total = (isFinite(filled) && isFinite(osrm)) ? filled + osrm : NaN;
+                if (isFinite(filled) && filled >= 0 && isFinite(total) && total > 0) {
+                    out.push({
+                        code: 'mixed', level: 'warn',
+                        params: { filled: Math.round(filled), total: Math.round(total) }
+                    });
+                } else {
+                    out.push({ code: 'mixedUnknownCount', level: 'warn', params: {} });
+                }
+            } else {
+                out.push({ code: 'haversine', level: 'alert', params: {} });
+            }
+        }
+
+        /* Tolls: an unknown is not a zero, and a clamped model number is not a fact. */
+        if (c.costs && c.costs.tollsUnknown) {
+            out.push({
+                code: 'tollsUnknown', level: 'warn',
+                params: { days: (c.costs.unknownTollDays || []).join(', ') }
+            });
+        }
+        const clamped = (c.costs && Array.isArray(c.costs.clampedTolls)) ? c.costs.clampedTolls : [];
+        for (let i = 0; i < clamped.length; i++) {
+            out.push({
+                code: 'tollsClamped', level: 'warn',
+                params: {
+                    day: clamped[i].day,
+                    value: formatAmount(clamped[i].requested),
+                    capped: formatAmount(clamped[i].capped),
+                    km: formatKm(clamped[i].km, ctx)
+                }
+            });
         }
 
         if (plan.roundTrip) {
@@ -410,15 +557,34 @@
             });
         }
 
-        /* Anything the engine reported that is not represented above. */
+        /* Engine warnings. The "numbers are not real" class gets a translated string
+           and the top severity; anything else not represented above is still surfaced
+           verbatim (code 'other') so nothing is ever swallowed. */
         const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
+        const seenUnreliable = {};
         for (let i = 0; i < warnings.length; i++) {
             const w = String(warnings[i] || '');
             const code = w.indexOf(':') > 0 ? w.slice(0, w.indexOf(':')) : w;
+            const unreliable = UNRELIABLE_WARNINGS[code];
+            if (unreliable) {
+                if (seenUnreliable[unreliable]) continue;
+                seenUnreliable[unreliable] = true;
+                out.push({ code: unreliable, level: 'alert', params: {} });
+                continue;
+            }
             if (COVERED_WARNINGS[code]) continue;
             out.push({ code: 'other', level: 'info', params: { text: w } });
         }
-        return out;
+
+        /* Stable sort by severity: the loudest notice must never be printed under a
+           list of blue trivia. */
+        return out.map(function (n, i) { return { n: n, i: i }; })
+            .sort(function (a, b) {
+                const ra = LEVEL_RANK[a.n.level] === undefined ? 2 : LEVEL_RANK[a.n.level];
+                const rb = LEVEL_RANK[b.n.level] === undefined ? 2 : LEVEL_RANK[b.n.level];
+                return ra === rb ? a.i - b.i : ra - rb;
+            })
+            .map(function (x) { return x.n; });
     }
 
     function noticeText(notice, ctx) {
@@ -439,16 +605,42 @@
         return h + ' ' + hLabel + ' ' + r + ' ' + mLabel;
     }
 
-    function formatKm(km, ctx) {
+    function roundKmForDisplay(km) {
         const v = num(km, 0);
-        const label = tr(ctx, 'unit.km');
-        return (v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + ' ' + label;
+        return v >= 10 ? Math.round(v) : Math.round(v * 10) / 10;
+    }
+
+    function formatKm(km, ctx) {
+        return roundKmForDisplay(km) + ' ' + tr(ctx, 'unit.km');
+    }
+
+    /* Trip totals are the sum of the values the user can SEE, printed without a second
+       rounding pass. Rounding the raw total independently of the per-day values makes
+       them disagree by a kilometre or a minute (1682 vs 1681 was the worst observed) —
+       quality bar B9 says the displayed numbers must add up, so round once. */
+    function displayTotals(plan) {
+        const days = (plan && Array.isArray(plan.days)) ? plan.days : [];
+        let km = 0, min = 0;
+        for (let i = 0; i < days.length; i++) {
+            km += roundKmForDisplay(days[i] && days[i].km);
+            min += Math.max(0, Math.round(num(days[i] && days[i].driveMin, 0)));
+        }
+        return { km: round2(km), min: min };
+    }
+
+    function formatKmTotal(km, ctx) {
+        const n = round2(num(km, 0));
+        const s = Math.abs(n - Math.round(n)) < 0.005 ? String(Math.round(n)) : String(Math.round(n * 10) / 10);
+        return s + ' ' + tr(ctx, 'unit.km');
     }
 
     function formatMoney(v) {
         const n = num(v, 0);
         return 'EUR ' + n.toFixed(2);
     }
+
+    /* Bare amount, for strings that already carry their own currency word. */
+    function formatAmount(v) { return num(v, 0).toFixed(2); }
 
     function parseClock(value) {
         if (typeof value !== 'string') return null;
@@ -511,7 +703,7 @@
             dailyBudget: a.dailyBudget,
             budgets: a.budgets,
             tollsEnabled: a.tollsEnabled,
-            tolls: enrichment ? tollsFromEnrichment(enrichment) : []
+            tolls: enrichment ? tollEstimates(enrichment) : []
         });
         const notices = buildNotices(plan, {
             requestedStops: a.requestedStops,
@@ -519,6 +711,8 @@
             endName: a.endName,
             places: a.places,
             matrixSource: a.matrixSource,
+            matrixFilledCells: a.matrixFilledCells,
+            matrixOsrmCells: a.matrixOsrmCells,
             maxDriveMin: a.maxDriveMin,
             costs: costs,
             t: a.t, tf: a.tf
@@ -536,76 +730,150 @@
                 dailyBudget: nonNeg(a.dailyBudget, 0),
                 departureTime: a.departureTime || '',
                 matrixSource: a.matrixSource || '',
+                matrixFilledCells: isFinite(num(a.matrixFilledCells, NaN)) ? num(a.matrixFilledCells, 0) : null,
+                matrixOsrmCells: isFinite(num(a.matrixOsrmCells, NaN)) ? num(a.matrixOsrmCells, 0) : null,
                 tollPreference: a.tollPreference || '',
-                consistent: totalsConsistent(plan, costs)
+                consistent: totalsConsistent(plan, costs),
+                numbersUnreliable: hasUnreliableNumbers(notices)
             }
         };
     }
 
     /* ── Rendering (pure HTML strings — the DOM write happens in route-form.js) ── */
+    const NOTICE_STYLE = {
+        alert: { cls: 'notice notice-alert', icon: '&#9940;' },
+        warn:  { cls: 'notice notice-warn',  icon: '&#9888;&#65039;' },
+        info:  { cls: 'notice notice-info',  icon: '&#8505;&#65039;' }
+    };
+
     function renderNotices(notices, ctx) {
         if (!Array.isArray(notices) || notices.length === 0) return '';
         let html = '<div class="notice-list">';
         for (let i = 0; i < notices.length; i++) {
             const n = notices[i];
-            const cls = n.level === 'warn' ? 'notice notice-warn' : 'notice notice-info';
-            const icon = n.level === 'warn' ? '&#9888;&#65039;' : '&#8505;&#65039;';
-            html += '<div class="' + cls + '"><span class="notice-icon">' + icon + '</span>' +
+            const style = NOTICE_STYLE[n.level] || NOTICE_STYLE.info;
+            html += '<div class="' + style.cls + '"><span class="notice-icon">' + style.icon + '</span>' +
                 '<span class="notice-text">' + esc(noticeText(n, ctx)) + '</span></div>';
         }
         return html + '</div>';
     }
 
+    /* ── The budget verdict, and the one rule that governs it ──
+       A FLOOR is always safe to assert: if the known costs already exceed the budget,
+       the trip is over budget whatever the unknowns turn out to be. A CEILING is not:
+       "within budget" is a promise about money nobody has counted. So an over-budget
+       verdict survives missing or unreliable data, and a reassuring one does not. */
+    function budgetVerdict(entry, flags, ctx) {
+        const over = !!(entry && entry.over);
+        if (flags.unreliable) {
+            return { cls: 'flag-unknown', text: tr(ctx, 'itin.budgetNotAssessable') };
+        }
+        if (over) {
+            const amount = formatMoney(entry.overBy);
+            if (entry.overDependsOnEstimate) {
+                return {
+                    cls: 'flag-over',
+                    text: trf(ctx, 'itin.overBudgetByEstimated',
+                        { amount: amount, tolls: formatMoney(entry.tolls !== undefined ? entry.tolls : entry.totalTolls) })
+                };
+            }
+            return { cls: 'flag-over', text: trf(ctx, 'itin.overBudgetBy', { amount: amount }) };
+        }
+        if (entry && entry.incomplete) {
+            return { cls: 'flag-unknown', text: tr(ctx, 'itin.withinBudgetIncomplete') };
+        }
+        return null;   /* caller supplies the reassuring wording it wants */
+    }
+
+    /* An amount that only counts what is known is a minimum, and is labelled as one. */
+    function amountText(value, incomplete, ctx) {
+        const money = formatMoney(value);
+        return incomplete ? trf(ctx, 'itin.atLeast', { amount: money }) : money;
+    }
+
+    function viewFlags(view) {
+        const costs = (view && view.costs) || {};
+        const meta = (view && view.meta) || {};
+        return {
+            unreliable: meta.numbersUnreliable === true ||
+                hasUnreliableNumbers(view && view.notices),
+            incomplete: costs.incomplete === true || costs.tollsUnknown === true
+        };
+    }
+
     function renderSummary(view, ctx) {
         const plan = view.plan || {};
         const costs = view.costs || {};
-        const overCls = costs.over ? ' summary-over' : '';
-        let html = '<div class="summary-card' + overCls + '">';
+        const flags = viewFlags(view);
+        const totals = displayTotals(plan);
+
+        let cardCls = '';
+        if (flags.unreliable) cardCls = ' summary-unreliable';
+        else if (costs.over) cardCls = ' summary-over';
+        else if (flags.incomplete) cardCls = ' summary-unknown';
+
+        let html = '<div class="summary-card' + cardCls + '">';
         html += '<div class="summary-title">' + esc(tr(ctx, 'itin.summary')) + '</div>';
         html += '<div class="summary-grid">';
         html += '<div class="summary-cell"><span class="summary-value mono">' +
-            esc(formatKm(plan.totalKm, ctx)) + '</span><span class="summary-label">' +
+            esc(formatKmTotal(totals.km, ctx)) + '</span><span class="summary-label">' +
             esc(tr(ctx, 'itin.totalKm')) + '</span></div>';
         html += '<div class="summary-cell"><span class="summary-value mono">' +
-            esc(formatDuration(plan.totalMin, ctx)) + '</span><span class="summary-label">' +
+            esc(formatDuration(totals.min, ctx)) + '</span><span class="summary-label">' +
             esc(tr(ctx, 'itin.totalTime')) + '</span></div>';
         html += '<div class="summary-cell"><span class="summary-value mono">' +
-            esc(formatMoney(costs.totalCost)) + '</span><span class="summary-label">' +
+            esc(amountText(costs.totalCost, flags.incomplete, ctx)) + '</span><span class="summary-label">' +
             esc(tr(ctx, 'itin.totalCost')) + '</span></div>';
         html += '<div class="summary-cell"><span class="summary-value mono">' +
             esc(formatMoney(costs.totalBudget)) + '</span><span class="summary-label">' +
             esc(tr(ctx, 'itin.totalBudget')) + '</span></div>';
         html += '</div>';
-        html += '<div class="summary-flag ' + (costs.over ? 'flag-over' : 'flag-ok') + '">' +
-            esc(costs.over
-                ? trf(ctx, 'itin.overBudgetBy', { amount: formatMoney(costs.overBy) })
-                : trf(ctx, 'itin.underBudgetBy', { amount: formatMoney(round2(num(costs.totalBudget, 0) - num(costs.totalCost, 0))) })) +
-            '</div>';
-        html += '<div class="summary-source mono">' +
-            esc(trf(ctx, view.meta && view.meta.matrixSource === 'osrm'
-                ? 'itin.sourceRoad' : 'itin.sourceEstimated', {})) + '</div>';
+
+        const verdict = budgetVerdict({
+            over: costs.over, overBy: costs.overBy, totalTolls: costs.totalTolls,
+            overDependsOnEstimate: costs.overDependsOnEstimate, incomplete: flags.incomplete
+        }, flags, ctx) || {
+            cls: 'flag-ok',
+            text: trf(ctx, 'itin.underBudgetBy', {
+                amount: formatMoney(round2(num(costs.totalBudget, 0) - num(costs.totalCost, 0)))
+            })
+        };
+        html += '<div class="summary-flag ' + verdict.cls + '">' + esc(verdict.text) + '</div>';
+
+        const src = view.meta && view.meta.matrixSource;
+        const srcKey = src === 'osrm' ? 'itin.sourceRoad'
+            : (src === 'mixed' ? 'itin.sourcePartial' : 'itin.sourceEstimated');
+        html += '<div class="summary-source mono">' + esc(trf(ctx, srcKey, {})) + '</div>';
         return html + '</div>';
     }
 
-    function renderCostTable(dayCost, ctx, tollsEstimated) {
+    function renderCostTable(dayCost, ctx, flags) {
+        const f = flags || { unreliable: false };
         let html = '<table class="cost-table"><tbody>';
-        const row = function (labelKey, value, extra) {
-            html += '<tr><td>' + esc(tr(ctx, labelKey)) + (extra ? ' <span class="est-flag">' +
-                esc(extra) + '</span>' : '') + '</td><td class="mono">' + esc(formatMoney(value)) + '</td></tr>';
+        const row = function (labelKey, valueText, extra, rowCls) {
+            html += '<tr' + (rowCls ? ' class="' + rowCls + '"' : '') + '><td>' +
+                esc(tr(ctx, labelKey)) + (extra ? ' <span class="est-flag">' + esc(extra) + '</span>' : '') +
+                '</td><td class="mono">' + esc(valueText) + '</td></tr>';
         };
-        row('itin.fuel', dayCost.fuel);
-        row('itin.tolls', dayCost.tolls, tollsEstimated ? tr(ctx, 'itin.estimate') : '');
-        row('itin.lodging', dayCost.lodging);
-        row('itin.meals', dayCost.meals);
+        row('itin.fuel', formatMoney(dayCost.fuel));
+        /* An unknown toll is shown as an unknown, never as a computed EUR 0.00. */
+        if (dayCost.tollsKnown === false) {
+            row('itin.tolls', tr(ctx, 'itin.unknownValue'), tr(ctx, 'itin.tollsNotEstimated'), 'cost-unknown');
+        } else {
+            row('itin.tolls', formatMoney(dayCost.tolls),
+                dayCost.tollsEstimated ? tr(ctx, 'itin.estimate') : '');
+        }
+        row('itin.lodging', formatMoney(dayCost.lodging));
+        row('itin.meals', formatMoney(dayCost.meals));
         html += '<tr class="cost-total"><td>' + esc(tr(ctx, 'itin.total')) +
-            '</td><td class="mono">' + esc(formatMoney(dayCost.total)) + '</td></tr>';
+            '</td><td class="mono">' + esc(amountText(dayCost.total, dayCost.incomplete, ctx)) + '</td></tr>';
         html += '<tr class="cost-budget"><td>' + esc(tr(ctx, 'itin.budget')) +
             '</td><td class="mono">' + esc(formatMoney(dayCost.budget)) + '</td></tr>';
         html += '</tbody></table>';
-        html += '<div class="cost-flag ' + (dayCost.over ? 'flag-over' : 'flag-ok') + '">' +
-            esc(dayCost.over
-                ? trf(ctx, 'itin.overBudgetBy', { amount: formatMoney(dayCost.overBy) })
-                : tr(ctx, 'itin.withinBudget')) + '</div>';
+
+        const verdict = budgetVerdict(dayCost, f, ctx) ||
+            { cls: 'flag-ok', text: tr(ctx, 'itin.withinBudget') };
+        html += '<div class="cost-flag ' + verdict.cls + '">' + esc(verdict.text) + '</div>';
         return html;
     }
 
@@ -702,8 +970,7 @@
         }
 
         html += renderEnrichmentBlock(enrichDay, ctx);
-        html += '<div class="day-cost">' +
-            renderCostTable(cost, ctx, view.costs && view.costs.tollsEstimated) + '</div>';
+        html += '<div class="day-cost">' + renderCostTable(cost, ctx, viewFlags(view)) + '</div>';
         return html + '</div>';
     }
 
@@ -739,11 +1006,13 @@
         if (!view || !view.plan) return '';
         const lines = [];
         const plan = view.plan, costs = view.costs;
+        const flags = viewFlags(view);
+        const totals = displayTotals(plan);
         lines.push(tr(ctx, 'itin.summary').toUpperCase());
         lines.push(view.meta.startName + ' -> ' + view.meta.endName);
-        lines.push(tr(ctx, 'itin.totalKm') + ': ' + formatKm(plan.totalKm, ctx));
-        lines.push(tr(ctx, 'itin.totalTime') + ': ' + formatDuration(plan.totalMin, ctx));
-        lines.push(tr(ctx, 'itin.totalCost') + ': ' + formatMoney(costs.totalCost) +
+        lines.push(tr(ctx, 'itin.totalKm') + ': ' + formatKmTotal(totals.km, ctx));
+        lines.push(tr(ctx, 'itin.totalTime') + ': ' + formatDuration(totals.min, ctx));
+        lines.push(tr(ctx, 'itin.totalCost') + ': ' + amountText(costs.totalCost, flags.incomplete, ctx) +
             ' / ' + tr(ctx, 'itin.totalBudget') + ': ' + formatMoney(costs.totalBudget));
         lines.push('');
         for (let i = 0; i < plan.days.length; i++) {
@@ -755,9 +1024,10 @@
                 '  [' + formatKm(d.km, ctx) + ' / ' + formatDuration(d.driveMin, ctx) + ']');
             const stops = (d.stops || []).map(function (s) { return s && s.name; }).filter(Boolean);
             if (stops.length) lines.push('  ' + tr(ctx, 'itin.stops') + ': ' + stops.join(', '));
-            lines.push('  ' + tr(ctx, 'itin.total') + ': ' + formatMoney(c.total) +
+            const dayVerdict = budgetVerdict(c, flags, ctx);
+            lines.push('  ' + tr(ctx, 'itin.total') + ': ' + amountText(c.total, c.incomplete, ctx) +
                 ' / ' + tr(ctx, 'itin.budget') + ': ' + formatMoney(c.budget) +
-                (c.over ? '  ** ' + trf(ctx, 'itin.overBudgetBy', { amount: formatMoney(c.overBy) }) + ' **' : ''));
+                (dayVerdict ? '  ** ' + dayVerdict.text + ' **' : ''));
             const en = view.enrichment && view.enrichment.days ? view.enrichment.days[i] : null;
             if (en && en.present) {
                 if (en.activities.length) lines.push('  ' + tr(ctx, 'itin.activities') + ': ' + en.activities.join('; '));
@@ -857,6 +1127,10 @@
         computeCosts: computeCosts,
         parseEnrichment: parseEnrichment,
         tollsFromEnrichment: tollsFromEnrichment,
+        tollEstimates: tollEstimates,
+        tollCapForDay: tollCapForDay,
+        hasUnreliableNumbers: hasUnreliableNumbers,
+        displayTotals: displayTotals,
         buildNotices: buildNotices,
         noticeText: noticeText,
         buildItineraryView: buildItineraryView,
@@ -869,6 +1143,7 @@
         legTimes: legTimes,
         formatDuration: formatDuration,
         formatKm: formatKm,
+        formatKmTotal: formatKmTotal,
         formatMoney: formatMoney,
         formatClock: formatClock,
         fill: fill,

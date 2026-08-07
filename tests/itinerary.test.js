@@ -56,6 +56,12 @@ const DICT = {
     'itin.fuel': 'Fuel', 'itin.tolls': 'Tolls', 'itin.lodging': 'Lodging', 'itin.meals': 'Meals',
     'itin.total': 'Day total', 'itin.budget': 'Day budget',
     'itin.withinBudget': 'Within budget', 'itin.estimate': '(estimate)',
+    'itin.unknownValue': '-', 'itin.tollsNotEstimated': '(not estimated)',
+    'itin.atLeast': 'at least {amount}',
+    'itin.withinBudgetIncomplete': 'Within budget for what is counted; tolls are missing',
+    'itin.budgetNotAssessable': 'The budget cannot be assessed',
+    'itin.overBudgetByEstimated': 'Over budget by {amount}, but only because of the AI-estimated toll ({tolls})',
+    'itin.sourcePartial': 'Partial road data',
     'itin.activities': 'Activities', 'itin.mealsIdeas': 'Where to eat',
     'itin.meal_breakfast': 'Breakfast', 'itin.meal_lunch': 'Lunch', 'itin.meal_dinner': 'Dinner',
     'itin.lodgingIdea': 'Where to sleep', 'itin.tip': 'Local tip',
@@ -69,6 +75,12 @@ const DICT = {
     'notice.sameAsEnd': '"{name}" is the end point.',
     'notice.unresolved': '"{name}" not located.',
     'notice.haversine': 'No road data.',
+    'notice.mixed': 'Partial road data: {filled} of {total} are straight-line estimates.',
+    'notice.mixedUnknownCount': 'Partial road data: some distances are straight-line estimates.',
+    'notice.zeroDistance': 'The whole itinerary computes to 0 km, so the figures below are not real.',
+    'notice.unknownDistance': 'At least one leg has no usable distance data.',
+    'notice.tollsUnknown': 'Tolls could not be estimated and are not included in any total.',
+    'notice.tollsClamped': 'The AI estimated EUR {value} of tolls on day {day} for {km}; capped at EUR {capped}.',
     'notice.roundTrip': 'Round trip back to {place}.',
     'notice.overBudget': 'Over budget on day(s) {days}.'
 };
@@ -254,19 +266,33 @@ test('C3: junk field types are coerced or dropped, never crash the renderer', fu
     assert.strictEqual(e.days[0].lodging, 'Hotel Obj');
     assert.strictEqual(e.days[0].tip, '42');
     assert.strictEqual(e.days[0].tolls, null, 'unusable toll estimates are discarded');
-    assert.deepStrictEqual(e.days[1].activities, ['Nested', '7']);
+    assert.deepStrictEqual(e.days[1].activities, [],
+        'the entry claimed day 99 of a 2-day trip: it is dropped, not re-homed onto day 2');
     assert.strictEqual(e.days[1].tolls, null, 'negative tolls are discarded');
     assert.deepStrictEqual(I.tollsFromEnrichment(e), [0, 0]);
 });
 
-test('C3: out-of-range and duplicate day numbers cannot corrupt the day list', function () {
+test('C3: an out-of-range day number is DROPPED, never attached to the wrong city', function () {
     const weird = JSON.stringify({ days: [{ day: 7, activities: ['A'] }, { day: 0, activities: ['B'] }, { day: 2, activities: ['C'] }] });
     const e = I.parseEnrichment(weird, 2);
     assert.strictEqual(e.days.length, 2);
-    assert.deepStrictEqual(e.days[0].activities, ['A'], 'day 7 falls back to its positional index');
-    assert.deepStrictEqual(e.days[1].activities, ['C']);
+    assert.deepStrictEqual(e.days[0].activities, [],
+        'day 7 of a 2-day trip is a claim about a day that does not exist — dropping it is the ' +
+        'only honest option; mapping it onto day 1 puts the wrong city in the itinerary');
+    assert.deepStrictEqual(e.days[1].activities, ['C'], 'the in-range entry is still delivered');
+    assert.strictEqual(e.droppedEntries, 2, 'day 7 and day 0 are both reported as dropped');
     assert.strictEqual(e.days[0].day, 1);
     assert.strictEqual(e.days[1].day, 2);
+    assert.deepStrictEqual(e.missingDays, [1], 'day 1 is reported as missing, not silently filled');
+});
+
+test('C3: an ABSENT day number still falls back to the position in the array', function () {
+    /* Models routinely emit an ordered list with no `day` field at all; positional
+       fallback is correct there, and only there. */
+    const e = I.parseEnrichment(JSON.stringify({ days: [{ activities: ['First'] }, { activities: ['Second'] }] }), 2);
+    assert.deepStrictEqual(e.days[0].activities, ['First']);
+    assert.deepStrictEqual(e.days[1].activities, ['Second']);
+    assert.strictEqual(e.droppedEntries, 0);
 });
 
 test('C3: a bare array and an already-parsed object are both accepted', function () {
@@ -512,6 +538,583 @@ test('RENDER: degenerate plans render without throwing', function () {
     assert.doesNotThrow(function () { I.renderItineraryHtml(view, CTX); });
     assert.strictEqual(I.renderItineraryHtml(null, CTX), '');
     assert.strictEqual(I.buildPlainSummary(null, CTX), '');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   HONESTY — the app must not tell the user things that are not true.
+   Every test below fails against the code that shipped before this suite existed.
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Load the real js/i18n.js (a classic script, not a module) so these tests read the
+   strings the browser actually shows, not a stub that can drift away from them. */
+function loadI18n() {
+    const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'js', 'i18n.js'), 'utf8');
+    const store = {};
+    const localStorage = {
+        getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+        setItem: function (k, v) { store[k] = String(v); }
+    };
+    const document = { querySelectorAll: function () { return []; }, getElementById: function () { return null; } };
+    const fn = new Function('localStorage', 'document', 'console',
+        src + '\nreturn { TRANSLATIONS: TRANSLATIONS, t: t, tf: tf, setLanguage: setLanguage, ' +
+        'onLanguageChange: onLanguageChange, lang: function () { return currentLang; } };');
+    return fn(localStorage, document, console);
+}
+const LOCALES = ['es', 'en', 'ca', 'fr', 'zh'];
+
+function flattenKeys(obj, prefix, out) {
+    out = out || [];
+    for (const k in obj) {
+        if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+        const key = prefix ? prefix + '.' + k : k;
+        if (obj[k] && typeof obj[k] === 'object') flattenKeys(obj[k], key, out);
+        else out.push(key);
+    }
+    return out;
+}
+
+/* ── I18N — every user-facing string exists in all five locales ── */
+
+test('I18N: the five locales carry exactly the same key set, with no empty strings', function () {
+    const i18n = loadI18n();
+    const reference = flattenKeys(i18n.TRANSLATIONS.es).sort();
+    assert.ok(reference.length >= 111,
+        'the dictionary only ever grows: ' + reference.length + ' keys');
+    for (let i = 0; i < LOCALES.length; i++) {
+        const loc = LOCALES[i];
+        const keys = flattenKeys(i18n.TRANSLATIONS[loc]).sort();
+        const missing = reference.filter(function (k) { return keys.indexOf(k) === -1; });
+        const extra = keys.filter(function (k) { return reference.indexOf(k) === -1; });
+        assert.deepStrictEqual(missing, [], loc + ' is missing keys');
+        assert.deepStrictEqual(extra, [], loc + ' has keys no other locale has');
+        for (let k = 0; k < keys.length; k++) {
+            const parts = keys[k].split('.');
+            let v = i18n.TRANSLATIONS[loc];
+            for (let p = 0; p < parts.length; p++) v = v[parts[p]];
+            assert.strictEqual(typeof v, 'string', loc + '.' + keys[k] + ' must be a string');
+            assert.ok(v.trim().length > 0, loc + '.' + keys[k] + ' must not be empty');
+        }
+    }
+});
+
+test('I18N: every key the renderer asks for resolves in all five locales', function () {
+    const i18n = loadI18n();
+    const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'js', 'itinerary-render.js'), 'utf8');
+    const literal = (src.match(/'(itin|notice|unit)\.[a-zA-Z_]+'/g) || [])
+        .map(function (s) { return s.slice(1, -1); });
+    /* buildNotices emits 'notice.' + code — collect the codes it can produce. */
+    const codes = (src.match(/code: '([a-zA-Z]+)'/g) || [])
+        .map(function (s) { return s.replace(/code: '|'/g, ''); })
+        .filter(function (c) { return c !== 'other'; })
+        .map(function (c) { return 'notice.' + c; });
+    /* and the meal labels, built as 'itin.meal_' + key */
+    const meals = ['itin.meal_breakfast', 'itin.meal_lunch', 'itin.meal_dinner', 'itin.meal_other'];
+    const needed = literal.concat(codes, meals)
+        /* 'itin.meal_' is a prefix the renderer concatenates onto, not a key. */
+        .filter(function (k) { return !/_$/.test(k); })
+        .filter(function (k, i, a) { return a.indexOf(k) === i; });
+    assert.ok(needed.length > 30, 'sanity: found ' + needed.length + ' keys in the renderer');
+
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        for (let k = 0; k < needed.length; k++) {
+            const v = i18n.t(needed[k]);
+            assert.strictEqual(typeof v, 'string', LOCALES[i] + ' / ' + needed[k]);
+            assert.notStrictEqual(v, needed[k],
+                needed[k] + ' is not translated in ' + LOCALES[i] + ' (t() returned the key)');
+        }
+    }
+});
+
+/* ── DEFECT 1 — the banner must not claim the costs are complete ── */
+
+test('D1: the enrichment banner never asserts that costs are complete, in any locale', function () {
+    const i18n = loadI18n();
+    /* The exact over-claim that shipped, per locale, plus the word for "complete". */
+    const forbidden = {
+        es: ['costes de abajo estan calculados y son completos', 'complet'],
+        en: ['costs below are computed and complete', 'complete'],
+        ca: ['costos de sota estan calculats i son complets', 'complet'],
+        fr: ['couts ci-dessous sont calcules et complets', 'complet'],
+        zh: ['费用均已计算完成且完整', '完整']
+    };
+    for (let i = 0; i < LOCALES.length; i++) {
+        const loc = LOCALES[i];
+        i18n.setLanguage(loc);
+        const s = i18n.t('itin.enrichUnavailable');
+        assert.ok(s.length > 0, loc + ' has no banner');
+        for (let f = 0; f < forbidden[loc].length; f++) {
+            assert.strictEqual(s.toLowerCase().indexOf(forbidden[loc][f].toLowerCase()), -1,
+                loc + ' still claims the costs are complete: "' + s + '"');
+        }
+    }
+});
+
+test('D1: a toll with no estimate is UNKNOWN, not a computed zero', function () {
+    const plan = { days: [{ day: 1, km: 300, driveMin: 180, legs: [{}] }, { day: 2, km: 300, driveMin: 180, legs: [{}] }] };
+
+    /* Offline / proxy 500: the model delivered nothing at all. */
+    const offline = I.computeCosts(plan, {
+        dailyBudget: 400, tollsEnabled: true,
+        tolls: I.tollEstimates(I.parseEnrichment(null, 2))
+    });
+    assert.strictEqual(offline.tollsUnknown, true, 'a whole cost component is missing');
+    assert.deepStrictEqual(offline.unknownTollDays, [1, 2]);
+    assert.strictEqual(offline.days[0].tollsKnown, false);
+    assert.strictEqual(offline.incomplete, true, 'the trip total is a floor, not a total');
+
+    /* The traveller who avoids tolls has a genuine, computed zero — not the same thing. */
+    const avoided = I.computeCosts(plan, { dailyBudget: 400, tollsEnabled: false, tolls: [null, null] });
+    assert.strictEqual(avoided.tollsUnknown, false, 'avoiding tolls makes zero a fact, not a gap');
+    assert.strictEqual(avoided.days[0].tollsKnown, true);
+    assert.strictEqual(avoided.incomplete, false);
+
+    /* A model-supplied 0 is also a real answer. */
+    const answered = I.computeCosts(plan, { dailyBudget: 400, tollsEnabled: true, tolls: [0, 14] });
+    assert.strictEqual(answered.tollsUnknown, false);
+    assert.strictEqual(answered.days[0].tollsKnown, true);
+    assert.strictEqual(answered.days[0].tollsEstimated, true, 'it still came from the model');
+});
+
+test('D1: an unknown toll is shown as unknown and blocks a "within budget" verdict', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 3);
+    const enrichment = I.parseEnrichment(null, 3);
+    enrichment.error = 'unavailable';
+    const view = I.buildItineraryView({
+        plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 500, tollsEnabled: true, tollPreference: 'with-tolls',
+        departureTime: '09:00', t: CTX.t, enrichment: enrichment
+    });
+    /* Budget is generous, so the old code said "Within budget" with EUR 0.00 of tolls. */
+    assert.strictEqual(view.costs.over, false, 'fixture: the known costs are inside the budget');
+    assert.strictEqual(view.costs.tollsUnknown, true);
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('>Within budget<'), -1,
+        'a verdict that ignores a missing cost component must not be given');
+    assert.match(html, /Within budget for what is counted; tolls are missing/);
+    assert.match(html, /\(not estimated\)/, 'the toll row is marked as not estimated');
+    assert.match(html, /at least EUR/, 'a total that omits a component is labelled a minimum');
+    assert.ok(html.indexOf('Tolls</td><td class="mono">EUR 0.00') === -1,
+        'an unknown toll must never render as a computed EUR 0.00');
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('tollsUnknown') >= 0, 'the gap is stated, not just implied');
+});
+
+/* ── DEFECT 2 — "the numbers below are not real" must be loud and translated ── */
+
+function zeroDistanceView(t) {
+    const ghost = function (n) { return P(n, null, null, { resolved: false }); };
+    const places = [ghost('A'), ghost('B'), ghost('C')];
+    const zeros = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const matrix = { km: zeros, min: zeros, source: 'haversine', osrmCells: 0, filledCells: 6 };
+    const plan = engine.planRoute({
+        start: places[0], end: places[2], stops: [places[1]],
+        matrix: matrix, days: 3, departureTime: '09:00', maxDriveMinPerDay: 360
+    });
+    return I.buildItineraryView({
+        plan: plan, requestedStops: ['B'], startName: 'A', endName: 'C', places: places,
+        matrixSource: 'haversine', matrixFilledCells: 6, matrixOsrmCells: 0,
+        maxDriveMin: 360, dailyBudget: 120, tollsEnabled: true, t: t
+    });
+}
+
+test('D2: a zero-distance itinerary is the loudest notice on the page, not a blue aside', function () {
+    const view = zeroDistanceView(CTX.t);
+    const zero = view.notices.filter(function (n) { return n.code === 'zeroDistance'; });
+    assert.strictEqual(zero.length, 1, 'the engine warning must reach the user as a real notice');
+    assert.strictEqual(zero[0].level, 'alert', 'not notice-info: these numbers are not real');
+    assert.strictEqual(view.notices[0].level, 'alert', 'it is printed first, above the trivia');
+
+    const text = I.noticeText(zero[0], CTX);
+    assert.strictEqual(text.indexOf('zero-distance:'), -1,
+        'the raw English engine string must not leak into the UI');
+    assert.strictEqual(text.indexOf('{'), -1, 'no unfilled placeholder');
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /notice-alert/);
+    assert.ok(html.indexOf('notice-alert') < html.indexOf('summary-card'),
+        'the alert is above the summary card, not under it');
+});
+
+test('D2: unusable numbers suppress the budget verdict instead of dressing it in green', function () {
+    const view = zeroDistanceView(CTX.t);
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('summary-card summary-over'), -1);
+    assert.match(html, /summary-card summary-unreliable/, 'the summary card is not green');
+    assert.strictEqual(html.indexOf('left'), -1, 'no "EUR 135.00 left of budget" reassurance');
+    assert.strictEqual(html.indexOf('>Within budget<'), -1);
+    assert.match(html, /The budget cannot be assessed/);
+    assert.match(html, /flag-unknown/);
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+});
+
+test('D2: the unreliable-numbers notices are translated in all five locales', function () {
+    const i18n = loadI18n();
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const view = zeroDistanceView(i18n.t);
+        const ctx = { t: i18n.t };
+        const zero = view.notices.filter(function (n) { return n.code === 'zeroDistance'; })[0];
+        const text = I.noticeText(zero, ctx);
+        assert.notStrictEqual(text, 'notice.zeroDistance', LOCALES[i] + ' has no translation');
+        assert.strictEqual(text.indexOf('the whole itinerary computes to 0 km'),
+            LOCALES[i] === 'en' ? text.indexOf('the whole itinerary computes to 0 km') : -1,
+            LOCALES[i] + ' shows raw English: "' + text + '"');
+        /* and the verdict is suppressed in that locale too */
+        const html = I.renderItineraryHtml(view, ctx);
+        assert.match(html, /flag-unknown/, LOCALES[i] + ' still shows a pass/fail budget verdict');
+    }
+});
+
+test('D2: unknown-distance is surfaced too — it was covered but never rendered', function () {
+    const plan = {
+        days: [{ day: 1, km: 10, driveMin: 10, legs: [{}] }], order: [],
+        totalKm: 10, totalMin: 10,
+        warnings: ['unknown-distance: at least one leg has no usable distance data.']
+    };
+    const notices = I.buildNotices(plan, { costs: I.computeCosts(plan, { dailyBudget: 500 }) });
+    const codes = notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('unknownDistance') >= 0,
+        'the warning was in COVERED_WARNINGS with nothing covering it — silently swallowed');
+    assert.strictEqual(notices.filter(function (n) { return n.code === 'unknownDistance'; })[0].level, 'alert');
+    assert.strictEqual(I.hasUnreliableNumbers(notices), true);
+});
+
+/* ── DEFECT 3 — 'mixed' is not 'haversine' ── */
+
+test("D3: a partly-real matrix does not claim there is no road data at all", function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    const base = {
+        startName: 'Madrid', endName: 'Barcelona', requestedStops: ['Zaragoza'],
+        maxDriveMin: 360, costs: I.computeCosts(plan, { dailyBudget: 500, tollsEnabled: false }), t: CTX.t
+    };
+    const mixed = I.buildNotices(plan, Object.assign({}, base, {
+        matrixSource: 'mixed', matrixOsrmCells: 6, matrixFilledCells: 14
+    }));
+    const hav = I.buildNotices(plan, Object.assign({}, base, {
+        matrixSource: 'haversine', matrixOsrmCells: 0, matrixFilledCells: 20
+    }));
+
+    const mixedCodes = mixed.map(function (n) { return n.code; });
+    const havCodes = hav.map(function (n) { return n.code; });
+    assert.notDeepStrictEqual(mixedCodes, havCodes,
+        "'mixed' and 'haversine' produced identical notice codes");
+    assert.ok(mixedCodes.indexOf('mixed') >= 0 && mixedCodes.indexOf('haversine') === -1);
+    assert.ok(havCodes.indexOf('haversine') >= 0 && havCodes.indexOf('mixed') === -1);
+
+    const mixedNotice = mixed.filter(function (n) { return n.code === 'mixed'; })[0];
+    assert.strictEqual(mixedNotice.level, 'warn', 'partial data is a warning');
+    assert.strictEqual(hav.filter(function (n) { return n.code === 'haversine'; })[0].level, 'alert',
+        'no road data at all is more severe than some road data');
+
+    /* the counts the engine computed must survive into the sentence */
+    assert.strictEqual(mixedNotice.params.filled, 14);
+    assert.strictEqual(mixedNotice.params.total, 20);
+    const text = I.noticeText(mixedNotice, CTX);
+    assert.match(text, /14/); assert.match(text, /20/);
+    assert.strictEqual(text.indexOf('{'), -1);
+});
+
+test('D3: mixed and haversine read differently in all five locales, and so does the source line', function () {
+    const i18n = loadI18n();
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const mixed = i18n.tf('notice.mixed', { filled: 14, total: 20 });
+        const hav = i18n.t('notice.haversine');
+        assert.notStrictEqual(mixed, hav, LOCALES[i] + ' reuses one string for both');
+        assert.notStrictEqual(mixed, 'notice.mixed', LOCALES[i] + ' has no mixed translation');
+        assert.strictEqual(mixed.indexOf('{'), -1, LOCALES[i] + ' left a placeholder');
+        assert.ok(mixed.indexOf('14') >= 0 && mixed.indexOf('20') >= 0,
+            LOCALES[i] + ' drops the counts');
+        assert.notStrictEqual(i18n.t('itin.sourcePartial'), 'itin.sourcePartial');
+        assert.notStrictEqual(i18n.t('itin.sourcePartial'), i18n.t('itin.sourceEstimated'));
+    }
+});
+
+test('D3: a mixed matrix labels the summary source line as partial, not as "no road data"', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    const view = I.buildItineraryView({
+        plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'mixed',
+        matrixOsrmCells: 6, matrixFilledCells: 14, maxDriveMin: 360,
+        dailyBudget: 500, tollsEnabled: false, t: CTX.t
+    });
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /Partial road data/);
+    assert.strictEqual(html.indexOf('>Estimated<'), -1);
+});
+
+/* ── DEFECT 4 — the one number the model supplies must be bounded and owned ── */
+
+test('D4: an absurd model toll is capped, and the cap is reported', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 3);
+    const enrichment = I.parseEnrichment(JSON.stringify({
+        days: [
+            { day: 1, tip: 'x', tollsEur: 4998 },
+            { day: 2, tip: 'x', tollsEur: 4998 },
+            { day: 3, tip: 'x', tollsEur: 4998 }
+        ]
+    }), 3);
+    const view = I.buildItineraryView({
+        plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+        places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+        dailyBudget: 120, tollsEnabled: true, t: CTX.t, enrichment: enrichment
+    });
+    for (let i = 0; i < view.costs.days.length; i++) {
+        const d = view.costs.days[i];
+        assert.ok(d.tolls <= I.tollCapForDay(d.km) + 0.005,
+            'day ' + d.day + ' kept an unbounded ' + d.tolls);
+        assert.ok(d.tolls < 4998, 'the model number went straight through');
+        assert.ok(d.tollsClamped, 'the clamp must be recorded, not applied silently');
+    }
+    assert.ok(view.costs.totalCost < 1500,
+        'a hallucinated toll must not be able to multiply the trip cost: ' + view.costs.totalCost);
+    assert.strictEqual(view.costs.clampedTolls.length, 3);
+
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('tollsClamped') >= 0, 'the user is told a number was rejected');
+    const clamp = view.notices.filter(function (n) { return n.code === 'tollsClamped'; })[0];
+    const text = I.noticeText(clamp, CTX);
+    assert.match(text, /4998\.00/, 'the rejected value is named');
+    assert.strictEqual(text.indexOf('{'), -1);
+});
+
+test('D4: a verdict that only exists because of a model number says so', function () {
+    /* Day 1: fuel 10.5 + lodging 60 + meals 35 = 105.5 against a 115 budget: inside.
+       The model's 20 EUR toll (under the cap, so used as given) is the only thing
+       that pushes it over. */
+    const plan = { days: [{ day: 1, km: 100, driveMin: 60, legs: [{}] }, { day: 2, km: 100, driveMin: 60, legs: [{}] }] };
+    const c = I.computeCosts(plan, { dailyBudget: 115, tollsEnabled: true, tolls: [20, 20] });
+    assert.strictEqual(c.days[0].tolls, 20, 'fixture: this estimate is inside the plausible bound');
+    assert.strictEqual(c.days[0].over, true);
+    assert.strictEqual(c.days[0].overDependsOnEstimate, true,
+        'without the estimate this day was inside its budget');
+
+    const view = { plan: plan, costs: c, notices: [], meta: {}, enrichment: null };
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /but only because of the AI-estimated toll/,
+        'the verdict must carry the dependency, not only the cost row');
+
+    /* Same at trip level: 151 of computed cost against a 180 budget, over only once
+       the model's 40 EUR of tolls are added. */
+    const trip = I.computeCosts(plan, { dailyBudget: 90, tollsEnabled: true, tolls: [20, 20] });
+    assert.strictEqual(trip.over, true);
+    assert.strictEqual(trip.overDependsOnEstimate, true);
+    assert.match(I.renderItineraryHtml({ plan: plan, costs: trip, notices: [], meta: {} }, CTX),
+        /summary-flag flag-over">Over budget by[^<]*AI-estimated toll/);
+
+    /* A day that is over budget on computed costs alone owns its verdict outright. */
+    const solid = I.computeCosts(plan, { dailyBudget: 10, tollsEnabled: true, tolls: [20, 20] });
+    assert.strictEqual(solid.days[0].over, true);
+    assert.strictEqual(solid.days[0].overDependsOnEstimate, false);
+    assert.strictEqual(solid.overDependsOnEstimate, false);
+});
+
+/* ── B9 — the displayed numbers add up ── */
+
+test('B9: per-day figures sum exactly to the displayed trip totals', function () {
+    /* Independent rounding of the raw total drifts from the sum of the rounded days
+       (1682 vs 1681 was the worst observed). Round once. */
+    for (let d = 2; d <= 6; d++) {
+        for (let k = 0; k < 40; k++) {
+            const plan = planFor(
+                P('A', 40 + k * 0.13, -3 - k * 0.07), P('D', 39 + k * 0.05, 1 - k * 0.02),
+                [P('B', 41 + k * 0.11, k * 0.05), P('C', 42 - k * 0.09, 2 + k * 0.03)], d);
+            const totals = I.displayTotals(plan);
+            let km = 0, min = 0;
+            for (let i = 0; i < plan.days.length; i++) {
+                const shown = I.formatKm(plan.days[i].km, CTX);
+                km += Number(shown.replace(' km', ''));
+                min += Math.round(plan.days[i].driveMin);
+            }
+            assert.ok(Math.abs(km - totals.km) < 0.001,
+                'days=' + d + ' k=' + k + ': shown days sum to ' + km + ' but the total says ' + totals.km);
+            assert.strictEqual(min, totals.min, 'days=' + d + ' k=' + k + ': minutes drift');
+            assert.strictEqual(I.formatKmTotal(totals.km, CTX), km + ' km');
+        }
+    }
+});
+
+/* ── DEFECT 5 / 6 — the live UI layer, exercised for real ──
+   route-form.js is a classic script full of globals; load it into a sandbox with a
+   fake DOM so the generation guard and the language hook are tested as behaviour,
+   not as a grep over the source. */
+function loadRouteForm(opts) {
+    const o = opts || {};
+    const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'js', 'route-form.js'), 'utf8');
+    const els = {};
+    function stub(id) {
+        return {
+            id: id, value: '', checked: false, disabled: false, textContent: '', innerHTML: '',
+            className: '', style: {}, addEventListener: function () {}
+        };
+    }
+    const ids = ['rfStartPoint', 'rfEndPoint', 'rfDestinations', 'rfTripType', 'rfDuration',
+        'rfDailyBudget', 'rfCustomBudget', 'rfTolls', 'rfDepartureTime', 'rfConsumption',
+        'rfFuelPrice', 'rfLodging', 'rfMeals', 'generateBtn', 'clearBtn', 'saveRouteBtn',
+        'resultEmpty', 'resultLoading', 'resultContent', 'resultError', 'resultHeader',
+        'resultItinerary', 'resultBody', 'progressBar', 'progressStep', 'progressDetail',
+        'progressNote', 'enrichStatus', 'budgetPerDayContainer', 'formMsg', 'advancedToggle',
+        'advancedPanel', 'advancedIcon'];
+    for (let i = 0; i < ids.length; i++) els[ids[i]] = stub(ids[i]);
+    const document = { getElementById: function (id) { return els[id] || null; } };
+
+    const i18n = loadI18n();
+    const windowObj = {
+        TravioItinerary: I,
+        planRoute: engine.planRoute,
+        geocodePlaces: function (names) {
+            return Promise.resolve(names.map(function (n) {
+                const known = { Madrid: MADRID, Barcelona: BARCELONA, Zaragoza: ZARAGOZA }[n];
+                return known || P(n, 41, 1);
+            }));
+        }
+    };
+    const fn = new Function(
+        'document', 'window', 't', 'tf', 'currentLang', 'escapeHtml', 'geocodePlaces',
+        'distanceMatrix', 'planRoute', 'fetch', 'console', 'onLanguageChange', 'setTimeout',
+        src + '\nreturn { initRouteForm: initRouteForm, generateRoute: generateRoute, ' +
+        'clearForm: clearForm, displayRoute: displayRoute, ' +
+        'rerenderCurrentRoute: rerenderCurrentRoute, route: function () { return currentRoute; } };');
+
+    const api = fn(
+        document, windowObj,
+        function (k) { return i18n.t(k); },
+        function (k, p) { return i18n.tf(k, p); },
+        i18n.lang(),
+        function (s) { return I.escapeText(s); },
+        windowObj.geocodePlaces,
+        function (places) {
+            return Promise.resolve(engine.haversineMatrix(places));
+        },
+        engine.planRoute,
+        o.fetch || function () { return Promise.reject(new Error('offline')); },
+        { warn: function () {}, error: function () {}, log: function () {} },
+        i18n.onLanguageChange,
+        setTimeout
+    );
+    api.els = els;
+    api.i18n = i18n;
+    api.initRouteForm();     // wires the buttons AND the language re-render hook
+    return api;
+}
+
+function fillForm(els) {
+    els.rfStartPoint.value = 'Madrid';
+    els.rfEndPoint.value = 'Barcelona';
+    els.rfDestinations.value = 'Zaragoza';
+    els.rfTripType.value = 'familiar';
+    els.rfDuration.value = '3';
+    els.rfDailyBudget.value = '150';
+    els.rfTolls.value = 'with-tolls';
+    els.rfDepartureTime.value = '09:00';
+}
+
+test('D6: clearing the form during enrichment does not resurrect the itinerary', function () {
+    let release = null;
+    const app = loadRouteForm({
+        fetch: function () { return new Promise(function (res) { release = res; }); }
+    });
+    fillForm(app.els);
+
+    const done = app.generateRoute();
+    /* Let the synchronous computation (steps 1-5) finish and the fetch go out. */
+    return new Promise(function (r) { setImmediate(r); })
+        .then(function () { return new Promise(function (r) { setTimeout(r, 30); }); })
+        .then(function () {
+            assert.ok(app.els.resultItinerary.innerHTML.length > 0, 'fixture: step 5 rendered');
+            assert.strictEqual(app.els.clearBtn.disabled, true,
+                'Clear must not be clickable while a generation is in flight');
+
+            /* The user clears anyway (keyboard, script, a race on the disable). */
+            app.els.clearBtn.disabled = false;
+            app.clearForm();
+            assert.strictEqual(app.route(), null);
+            assert.strictEqual(app.els.resultItinerary.innerHTML, '');
+
+            /* Now the enrichment comes back. */
+            release({ ok: true, json: function () { return Promise.resolve({ content: [{ type: 'text', text: '{"days":[]}' }] }); } });
+            return done;
+        })
+        .then(function () {
+            assert.strictEqual(app.route(), null,
+                'the late enrichment wrote a dead route back over an empty form');
+            assert.strictEqual(app.els.resultItinerary.innerHTML, '',
+                'the cleared itinerary came back from the dead');
+            assert.strictEqual(app.els.resultContent.style.display, 'none');
+            assert.strictEqual(app.els.clearBtn.disabled, false, 'Clear is usable again afterwards');
+        });
+});
+
+test('D6: loading a saved route during enrichment is not clobbered by the late write', function () {
+    let release = null;
+    const app = loadRouteForm({
+        fetch: function () { return new Promise(function (res) { release = res; }); }
+    });
+    fillForm(app.els);
+    const done = app.generateRoute();
+
+    return new Promise(function (r) { setTimeout(r, 30); })
+        .then(function () {
+            /* viewSavedRoute() invalidates the generation before it writes; simulate the
+               same sequence without Firestore. */
+            app.clearForm();                       // the invalidation viewSavedRoute performs
+            const saved = { formData: { startPoint: 'Loaded', endPoint: 'Route', duration: 1 },
+                view: null, structured: null, result: 'A SAVED ROUTE' };
+            app.displayRoute(saved);
+            assert.strictEqual(app.els.resultBody.textContent, 'A SAVED ROUTE');
+
+            release({ ok: true, json: function () { return Promise.resolve({ content: [{ type: 'text', text: '{"days":[]}' }] }); } });
+            return done;
+        })
+        .then(function () {
+            assert.strictEqual(app.els.resultBody.textContent, 'A SAVED ROUTE',
+                "the in-flight generation overwrote the user's saved route");
+        });
+});
+
+test('D5: switching language re-renders the whole itinerary, not just [data-i18n]', function () {
+    const app = loadRouteForm({});
+    fillForm(app.els);
+
+    return app.generateRoute().then(function () {
+        const es = app.els.resultItinerary.innerHTML;
+        assert.ok(es.length > 0, 'fixture: an itinerary is on screen');
+        assert.match(es, /Resumen del viaje/, 'fixture: it rendered in the default locale (es)');
+
+        app.i18n.setLanguage('fr');
+        const fr = app.els.resultItinerary.innerHTML;
+        assert.notStrictEqual(fr, es, 'the result pane stayed frozen in the previous language');
+        assert.match(fr, /Resume du voyage/, 'the summary title follows the language switch');
+        assert.strictEqual(fr.indexOf('Resumen del viaje'), -1, 'Spanish left behind in the pane');
+        assert.match(fr, /Jour 1/, 'day headings too');
+
+        app.i18n.setLanguage('zh');
+        assert.match(app.els.resultItinerary.innerHTML, /行程摘要/);
+
+        app.i18n.setLanguage('es');
+        assert.strictEqual(app.els.resultItinerary.innerHTML, es, 'switching back is lossless');
+    });
+});
+
+test('D5: the notices and the budget verdict follow the language too', function () {
+    const app = loadRouteForm({});
+    fillForm(app.els);
+    app.els.rfDailyBudget.value = '10';        // force an over-budget verdict + notice
+
+    return app.generateRoute().then(function () {
+        app.i18n.setLanguage('en');
+        const en = app.els.resultItinerary.innerHTML;
+        assert.match(en, /Over budget on day/, 'the notice is in English');
+        assert.match(en, /Over budget by/, 'so is the verdict');
+
+        app.i18n.setLanguage('ca');
+        const ca = app.els.resultItinerary.innerHTML;
+        assert.match(ca, /Pressupost superat/);
+        assert.strictEqual(ca.indexOf('Over budget on day'), -1);
+    });
 });
 
 test('EXPORTS: the module loads in Node and in the browser without ES modules', function () {

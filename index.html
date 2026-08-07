@@ -170,11 +170,16 @@ input,select,textarea{font-size:16px!important}
 .notice{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-radius:var(--radius);font-size:13px;line-height:1.45}
 .notice-info{background:var(--primary-light);color:var(--primary-darker)}
 .notice-warn{background:var(--yellow-light);color:#8a5a00}
+/* Highest severity: "the numbers below are not real". Never a whisper. */
+.notice-alert{background:var(--red-light);color:var(--red);border:1px solid rgba(239,68,68,.45);font-weight:600}
 .notice-icon{flex:0 0 auto}
 .notice-text{flex:1 1 auto}
 
 .summary-card{background:var(--green-light);border:1px solid rgba(16,185,129,.35);border-radius:8px;padding:14px 16px;margin-bottom:16px}
 .summary-card.summary-over{background:var(--red-light);border-color:rgba(239,68,68,.35)}
+/* Not green: a card whose numbers are unusable, or whose total is only a floor. */
+.summary-card.summary-unreliable{background:var(--red-light);border-color:rgba(239,68,68,.45)}
+.summary-card.summary-unknown{background:var(--yellow-light);border-color:rgba(217,164,6,.35)}
 .summary-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:10px}
 .summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 @media(max-width:640px){.summary-grid{grid-template-columns:repeat(2,1fr)}}
@@ -185,6 +190,8 @@ input,select,textarea{font-size:16px!important}
 .summary-source{margin-top:6px;font-size:11px;color:var(--mid)}
 .flag-ok{color:var(--green)}
 .flag-over{color:var(--red)}
+/* Neither ok nor over: the verdict cannot be given at all. */
+.flag-unknown{color:#8a5a00}
 
 .day-list{display:flex;flex-direction:column;gap:12px}
 .day-card{background:var(--surface);border:1px solid var(--border-light);border-left:4px solid var(--primary);border-radius:var(--radius);padding:14px 16px}
@@ -224,6 +231,7 @@ input,select,textarea{font-size:16px!important}
 .cost-table .cost-total td{font-weight:700;border-top:1px solid var(--border-light);padding-top:6px}
 .cost-table .cost-budget td{color:var(--label)}
 .est-flag{font-size:10px;color:var(--mid)}
+.cost-table .cost-unknown td{color:#8a5a00}
 .cost-flag{margin-top:6px;font-size:12px;font-weight:600;text-align:right}
 .rates-note{margin-top:12px;font-size:11px;color:var(--mid);text-align:center}
 
