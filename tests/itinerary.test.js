@@ -58,6 +58,8 @@ const DICT = {
     'itin.withinBudget': 'Within budget', 'itin.estimate': '(estimate)',
     'itin.unknownValue': '—', 'itin.tollsNotEstimated': '(not estimated)',
     'itin.tollsNotApplicable': '(not applicable)',
+    'itin.tollsCapped': '(estimate, capped)', 'itin.tollsNoDriving': '(no driving)',
+    'itin.overBudgetByWithEstimate': 'Over budget by {amount}, a figure that includes {tolls} of AI-estimated tolls',
     'itin.atLeast': 'at least {amount}',
     'itin.withinBudgetIncomplete': 'Within budget for what is counted; the total is not complete',
     'itin.budgetNotAssessable': 'The budget cannot be assessed',
@@ -730,6 +732,292 @@ test('D1: an unknown toll is shown as unknown and blocks a "within budget" verdi
     assert.ok(codes.indexOf('tollsUnknown') >= 0, 'the gap is stated, not just implied');
 });
 
+/* ══════════════ ROUND 4 ══════════════ */
+
+/* ── DEFECT 1c — a document written by the FIRST structured build must still add up ──
+   Round-1 v2 documents (commit 8699cd1) carry `tolls` and nothing else about it: no
+   basis, no per-day provenance. Reading that as "not estimated / —" printed a cost
+   table whose rows did not sum to their own stated total. ── */
+
+/* The shape a round-1 build actually wrote. Only `tolls` — the fields the renderer
+   later came to rely on simply do not exist. */
+function round1CostDay(day, km, fuel, tolls, lodging, meals, budget) {
+    const total = Math.round((fuel + tolls + lodging + meals) * 100) / 100;
+    return {
+        day: day, km: km, fuel: fuel, tolls: tolls, lodging: lodging, meals: meals,
+        total: total, budget: budget, over: total > budget + 0.005,
+        overBy: total > budget + 0.005 ? Math.round((total - budget) * 100) / 100 : 0
+    };
+}
+function round1Doc(days, budget) {
+    const costs = { days: days, totalFuel: 0, totalTolls: 0, totalLodging: 0, totalMeals: 0,
+        totalCost: 0, totalBudget: 0, overBudgetDays: [], over: false, overBy: 0,
+        tollsEstimated: false, rates: { consumption: 7, fuelPrice: 1.5, lodgingPerNight: 60, mealsPerDay: 35 } };
+    for (let i = 0; i < days.length; i++) {
+        costs.totalFuel += days[i].fuel; costs.totalTolls += days[i].tolls;
+        costs.totalLodging += days[i].lodging; costs.totalMeals += days[i].meals;
+        costs.totalCost += days[i].total; costs.totalBudget += days[i].budget;
+        if (days[i].over) costs.overBudgetDays.push(days[i].day);
+        if (days[i].tolls > 0) costs.tollsEstimated = true;
+    }
+    costs.over = costs.totalCost > costs.totalBudget + 0.005;
+    costs.overBy = costs.over ? Math.round((costs.totalCost - costs.totalBudget) * 100) / 100 : 0;
+    const plan = { days: days.map(function (d) {
+            return { day: d.day, km: d.km, driveMin: d.km, legs: [{}], stops: [],
+                startPlace: { name: 'A' }, endPlace: { name: 'B' } };
+        }), order: [], totalKm: 0, totalMin: 0, roundTrip: false, warnings: [] };
+    for (let i = 0; i < days.length; i++) { plan.totalKm += days[i].km; plan.totalMin += days[i].km; }
+    /* version 2 with no `tollsBasis` anywhere — exactly what round 1 stored. */
+    return { startPoint: 'Madrid', endPoint: 'Barcelona', result: 'DIA 1: ...',
+        structured: { version: 2, plan: plan, costs: costs, enrichment: null, notices: [], meta: { matrixSource: 'osrm' } } };
+}
+
+/* Money out of a rendered cost cell. */
+function moneyIn(s) { const n = Number(String(s).replace(/[^0-9.]/g, '')); return isFinite(n) ? n : 0; }
+function costRows(html) {
+    return (html.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || []).map(function (r) {
+        return {
+            label: (/<td>([\s\S]*?)<\/td>/.exec(r) || [, ''])[1].replace(/<[^>]+>/g, '').trim(),
+            value: (/<td class="mono">([\s\S]*?)<\/td>/.exec(r) || [, ''])[1].replace(/<[^>]+>/g, '').trim(),
+            cls: (/<tr class="([^"]*)"/.exec(r) || [, ''])[1]
+        };
+    }).filter(function (r) { return r.label && r.value; });
+}
+
+test('D1c: a round-1 saved route loads with a cost table whose rows sum to its total', function () {
+    const doc = round1Doc([
+        round1CostDay(1, 300, 31.50, 12.50, 0, 35, 200),
+        round1CostDay(2, 300, 31.50, 0, 0, 35, 200)
+    ], 200);
+    assert.strictEqual(doc.structured.costs.days[0].tollsBasis, undefined,
+        'fixture: a round-1 document has no toll provenance at all');
+    assert.strictEqual(I.isStructuredRoute(doc), true);
+
+    const view = I.viewFromSaved(doc);
+    const html = I.renderItineraryHtml(view, CTX);
+    const rows = costRows(html);
+
+    /* Day 1 carries EUR 12.50 of toll money inside its stated total. It must render as
+       money — the app cannot charge for it and deny estimating it in the same table. */
+    const day1 = rows.slice(0, 6);
+    const components = day1.filter(function (r) { return !/Day total|Day budget/.test(r.label); });
+    const sum = components.reduce(function (a, r) { return a + moneyIn(r.value); }, 0);
+    const stated = moneyIn((day1.filter(function (r) { return r.label === 'Day total'; })[0] || {}).value);
+    assert.ok(Math.abs(sum - stated) < 0.005,
+        'B9: rows sum to ' + sum.toFixed(2) + ' against a stated total of ' + stated.toFixed(2));
+    assert.strictEqual(stated, 79.00);
+
+    const tollRow = day1.filter(function (r) { return /^Tolls/.test(r.label); })[0];
+    assert.strictEqual(tollRow.value, 'EUR 12.50', 'a toll the app HAS must not read "—"');
+    assert.strictEqual(view.costs.days[0].tollsBasis, 'estimated');
+    assert.strictEqual(view.costs.days[0].incomplete, false,
+        'nothing is missing from this day, so its total is not a floor');
+    assert.match(html, /cost-flag flag-ok">Within budget</,
+        'and its verdict is given outright');
+});
+
+test('D1c: the round-1 zero it cannot explain is floored, and the day rows still sum', function () {
+    const doc = round1Doc([
+        round1CostDay(1, 300, 31.50, 12.50, 0, 35, 200),
+        round1CostDay(2, 300, 31.50, 0, 0, 35, 200)
+    ], 200);
+    const view = I.viewFromSaved(doc);
+
+    /* Round 1 stored the same 0 whether the model said zero, said nothing, or the user
+       had asked to avoid tolls. That is not a settled figure. */
+    assert.strictEqual(view.costs.days[1].tollsBasis, 'unknown');
+    assert.strictEqual(view.costs.days[1].incomplete, true);
+    assert.strictEqual(view.costs.tollsUnknown, true);
+    assert.deepStrictEqual(view.costs.unknownTollDays, [2]);
+    assert.strictEqual(view.costs.incomplete, true,
+        'the trip flag must agree with the day flags, or the summary asserts what the rows withhold');
+
+    const html = I.renderItineraryHtml(view, CTX);
+    const rows = costRows(html);
+    const day2 = rows.slice(6, 12);
+    const sum = day2.filter(function (r) { return !/Day total|Day budget/.test(r.label); })
+        .reduce(function (a, r) { return a + moneyIn(r.value); }, 0);
+    assert.ok(Math.abs(sum - 66.50) < 0.005, 'an unknown of zero still leaves the rows summing');
+    assert.match(html, /at least EUR/, 'the floor is stated');
+    assert.ok(view.notices.map(function (n) { return n.code; }).indexOf('tollsUnknown') >= 0,
+        'the reader is told why the verdict was withheld');
+});
+
+test('D1c: round-2/3 documents and legacy plain text are untouched by the migration', function () {
+    /* A document written by TODAY's build must round-trip byte-identically. */
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 3);
+    const shapes = [
+        { tollsEnabled: true, enrichment: I.parseEnrichment(JSON.stringify({ days: [
+            { day: 1, tip: 'T', tollsEur: 12.5 }, { day: 2, tip: 'T', tollsEur: 0 }, { day: 3, tip: 'T', tollsEur: 4998 }] }), 3) },
+        { tollsEnabled: true, enrichment: I.parseEnrichment(null, 3) },
+        { tollsEnabled: false, tollPreference: 'without-tolls', enrichment: I.parseEnrichment(null, 3) }
+    ];
+    for (let i = 0; i < shapes.length; i++) {
+        const view = I.buildItineraryView(Object.assign({
+            plan: plan, requestedStops: ['Zaragoza'], startName: 'Madrid', endName: 'Barcelona',
+            places: [MADRID, ZARAGOZA, BARCELONA], matrixSource: 'osrm', maxDriveMin: 360,
+            dailyBudget: 200, departureTime: '09:00', t: CTX.t
+        }, shapes[i]));
+        const doc = JSON.parse(JSON.stringify({ structured: I.serialiseView(view) }));
+        const restored = I.viewFromSaved(doc);
+        assert.strictEqual(I.renderItineraryHtml(restored, CTX), I.renderItineraryHtml(view, CTX),
+            'shape ' + i + ' does not round-trip identically');
+        assert.deepStrictEqual(restored.costs.days.map(function (d) { return d.tollsBasis; }),
+            view.costs.days.map(function (d) { return d.tollsBasis; }));
+        assert.strictEqual(restored.notices.length, view.notices.length,
+            'shape ' + i + ' gained or lost a notice on the load path');
+    }
+    /* And a pre-engine plain-text route is still not mistaken for a structured one. */
+    const legacy = { startPoint: 'Madrid', endPoint: 'Barcelona', duration: 3, result: 'DIA 1: Madrid...' };
+    assert.strictEqual(I.isStructuredRoute(legacy), false);
+    assert.strictEqual(I.viewFromSaved(legacy), null);
+});
+
+/* ── DEFECT 2c — five toll states must be five distinguishable labels ── */
+
+function tollStateRow(basisCase, t) {
+    const km = basisCase.km;
+    const costs = I.computeCosts({ days: [{ day: 1, km: km, driveMin: 60, legs: km ? [{}] : [] }] },
+        Object.assign({ dailyBudget: 500 }, basisCase.opts));
+    const html = I.renderItineraryHtml({
+        plan: { days: [{ day: 1, km: km, driveMin: 60, legs: [], startPlace: { name: 'A' }, endPlace: { name: 'B' } }] },
+        costs: costs, notices: [], meta: {}
+    }, { t: t });
+    return { basis: costs.days[0].tollsBasis, row: (html.match(/<tr[^>]*><td>[^<]*Tolls[\s\S]*?<\/tr>/) ||
+        html.match(/<tr[^>]*><td>[\s\S]{0,40}?<span class="est-flag">[\s\S]*?<\/tr>/) || ['(not found)'])[0] };
+}
+
+const TOLL_STATES = [
+    { name: 'estimated',   km: 300, opts: { tollsEnabled: true, tolls: [25] } },
+    { name: 'clamped',     km: 300, opts: { tollsEnabled: true, tolls: [9999] } },
+    { name: 'none',        km: 0,   opts: { tollsEnabled: true, tolls: [9] } },
+    { name: 'unknown',     km: 300, opts: { tollsEnabled: true, tolls: [null] } },
+    { name: 'not-avoided', km: 300, opts: { tollsEnabled: false, tolls: [null] } }
+];
+
+test('D2c: each of the five toll states renders a distinguishable label', function () {
+    const byMarker = {};
+    for (let i = 0; i < TOLL_STATES.length; i++) {
+        const got = tollStateRow(TOLL_STATES[i], CTX.t);
+        assert.strictEqual(got.basis, TOLL_STATES[i].name, 'fixture for ' + TOLL_STATES[i].name);
+        const marker = (/<span class="est-flag">([^<]*)<\/span>/.exec(got.row) || [, ''])[1];
+        assert.ok(marker, TOLL_STATES[i].name + ' has no marker at all: ' + got.row);
+        assert.ok(!byMarker[marker],
+            TOLL_STATES[i].name + ' shares the marker "' + marker + '" with ' + byMarker[marker] +
+            ' — the two are indistinguishable to anyone reading the table');
+        byMarker[marker] = TOLL_STATES[i].name;
+    }
+    assert.strictEqual(Object.keys(byMarker).length, 5);
+});
+
+test('D2c: no state is distinguished by colour alone', function () {
+    /* Strip every class attribute — which is all that .cost-unknown{color:#8a5a00} rides
+       on — and the five rows must still be five different rows. A colour-blind reader,
+       a printout and a screen reader all see this version. */
+    const plain = {};
+    for (let i = 0; i < TOLL_STATES.length; i++) {
+        const got = tollStateRow(TOLL_STATES[i], CTX.t);
+        const stripped = got.row.replace(/ class="[^"]*"/g, '');
+        assert.ok(!plain[stripped],
+            TOLL_STATES[i].name + ' is distinguished from ' + plain[stripped] +
+            ' only by a class attribute: ' + stripped);
+        plain[stripped] = TOLL_STATES[i].name;
+    }
+    /* And specifically: a computed zero must not be dressed as an AI guess. */
+    const none = tollStateRow(TOLL_STATES[2], CTX.t);
+    assert.match(none.row, /\(no driving\)/);
+    assert.strictEqual(/\(estimate\)/.test(none.row), false,
+        'a zero this app computes with certainty must not be presented as a model estimate');
+});
+
+test('D2c: the two new markers exist in all five locales and clash with nothing', function () {
+    const i18n = loadI18n();
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const markers = ['itin.estimate', 'itin.tollsCapped', 'itin.tollsNoDriving',
+            'itin.tollsNotEstimated', 'itin.tollsNotApplicable'].map(function (k) {
+            const v = i18n.t(k);
+            assert.notStrictEqual(v, k, LOCALES[i] + ' is missing ' + k);
+            return v;
+        });
+        const uniq = markers.filter(function (m, n, a) { return a.indexOf(m) === n; });
+        assert.strictEqual(uniq.length, 5,
+            LOCALES[i] + ' reuses a marker across toll states: ' + JSON.stringify(markers));
+        /* and the rendered rows in that locale are all different */
+        const seen = {};
+        for (let s = 0; s < TOLL_STATES.length; s++) {
+            const row = tollStateRow(TOLL_STATES[s], i18n.t).row.replace(/ class="[^"]*"/g, '');
+            assert.ok(!seen[row], LOCALES[i] + ': ' + TOLL_STATES[s].name + ' collides with ' + seen[row]);
+            seen[row] = TOLL_STATES[s].name;
+        }
+    }
+});
+
+/* ── DEFECT 3b — a sub-cap invention inside a headline figure needs a caveat ── */
+
+test('D3b2: an over-budget figure that is substantially model money says so', function () {
+    /* 700 km: the cap is 200, so EUR 190 passes unclamped and lands in the headline.
+       fuel 73.50 + tolls 190 + meals 35 = 298.50 against a EUR 100 budget: over by
+       198.50, of which 190.00 is unverified. */
+    const plan = { days: [{ day: 1, km: 700, driveMin: 420, legs: [{}] }] };
+    const c = I.computeCosts(plan, { dailyBudget: 100, tollsEnabled: true, tolls: [190] });
+    assert.strictEqual(c.days[0].tollsBasis, 'estimated', 'fixture: under the cap, unclamped');
+    assert.strictEqual(c.days[0].over, true);
+    assert.strictEqual(c.days[0].overDependsOnEstimate, false,
+        'fixture: it is over budget for other reasons too, so the round-2 caveat stays silent');
+    assert.strictEqual(c.days[0].overIncludesEstimate, true);
+
+    const html = I.renderItineraryHtml({ plan: plan, costs: c, notices: [], meta: {} }, CTX);
+    assert.match(html, /Over budget by EUR 198\.50, a figure that includes EUR 190\.00 of AI-estimated tolls/);
+    assert.strictEqual(/Over budget by EUR 198\.50<\/div>/.test(html), false,
+        'a flat verdict must not carry EUR 190 of model money without a caveat');
+});
+
+test('D3b2: a small estimate does not trigger the caveat, and the round-2 wording still wins', function () {
+    const plan = { days: [{ day: 1, km: 700, driveMin: 420, legs: [{}] }] };
+
+    /* EUR 5 of tolls in a EUR 113.50 total: removing it would not change what the
+       figure tells the user. No caveat, no noise. */
+    const small = I.computeCosts(plan, { dailyBudget: 100, tollsEnabled: true, tolls: [5] });
+    assert.strictEqual(small.days[0].over, true);
+    assert.strictEqual(small.days[0].overIncludesEstimate, false);
+    assert.match(I.renderItineraryHtml({ plan: plan, costs: small, notices: [], meta: {} }, CTX),
+        /cost-flag flag-over">Over budget by EUR 13\.50<\/div>/);
+
+    /* And where the estimate is the ONLY reason, the stronger round-2 sentence is used
+       rather than the weaker "includes" one. */
+    const only = I.computeCosts(plan, { dailyBudget: 130, tollsEnabled: true, tolls: [40] });
+    assert.strictEqual(only.days[0].overDependsOnEstimate, true);
+    assert.strictEqual(only.days[0].overIncludesEstimate, false, 'the two must be mutually exclusive');
+    assert.match(I.renderItineraryHtml({ plan: plan, costs: only, notices: [], meta: {} }, CTX),
+        /but only because of the AI-estimated toll/);
+});
+
+test('D3b2: the caveat applies to the trip verdict too, in all five locales', function () {
+    const i18n = loadI18n();
+    const plan = { days: [
+        { day: 1, km: 700, driveMin: 420, legs: [{}] },
+        { day: 2, km: 700, driveMin: 420, legs: [{}] }
+    ] };
+    const c = I.computeCosts(plan, { dailyBudget: 100, tollsEnabled: true, tolls: [190, 190] });
+    assert.strictEqual(c.over, true);
+    assert.strictEqual(c.overDependsOnEstimate, false);
+    assert.strictEqual(c.overIncludesEstimate, true);
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const s = i18n.tf('itin.overBudgetByWithEstimate', { amount: 'EUR 1.00', tolls: 'EUR 2.00' });
+        assert.notStrictEqual(s, 'itin.overBudgetByWithEstimate', LOCALES[i] + ' is missing it');
+        assert.strictEqual(s.indexOf('{'), -1, LOCALES[i] + ' left a placeholder');
+        assert.notStrictEqual(s, i18n.tf('itin.overBudgetBy', { amount: 'EUR 1.00' }),
+            LOCALES[i] + ' reuses the plain wording');
+        const html = I.renderItineraryHtml({ plan: plan, costs: c, notices: [], meta: {} }, { t: i18n.t });
+        assert.ok(html.indexOf('summary-flag flag-over">' + I.escapeText(
+            i18n.tf('itin.overBudgetByWithEstimate',
+                { amount: 'EUR ' + c.overBy.toFixed(2), tolls: 'EUR ' + c.totalTolls.toFixed(2) }))) >= 0,
+            LOCALES[i] + ' trip verdict does not carry the caveat');
+    }
+});
+
 /* ── DEFECT 1b (round 3) — "avoid tolls" is a request the pipeline never acts on ──
    Nothing adds exclude=toll to the road-graph calls, so choosing "without tolls"
    changes the route not at all. Printing EUR 0.00 there invents the one fact the app
@@ -871,8 +1159,9 @@ test('D2b: a CLAMPED day is a floor, with its budget verdict withheld', function
     assert.strictEqual(html.indexOf('>Within budget<'), -1, 'no clean verdict on a reduced total');
     assert.match(html, /at least EUR/);
     assert.match(html, /cost-flag flag-unknown/);
-    /* and the shown figure still carries the estimate marker */
-    assert.match(html, /<td>Tolls <span class="est-flag">\(estimate\)<\/span>/);
+    /* and the shown figure carries a marker of its own, not one shared with a plain
+       estimate and not colour alone (see D2c) */
+    assert.match(html, /<td>Tolls <span class="est-flag">\(estimate, capped\)<\/span>/);
 
     /* A floor verdict, by contrast, survives the cut: if the REDUCED total is already
        over budget, the real one is too. That one is still asserted. */

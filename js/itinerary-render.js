@@ -50,6 +50,14 @@
     const FIXED_CROSSING_ALLOWANCE_EUR = 100;
     const MAX_TOLL_EUR_PER_DAY        = 200;
 
+    /* A toll under the bound passes unclamped and lands inside the headline total. When
+       it is a large enough slice of that total, the headline is substantially a model
+       guess and has to say so — otherwise "Over budget by EUR 198.50" reads as arithmetic
+       when EUR 190.00 of it is unverified. A fifth of the total is the line: below that,
+       removing the estimate would not change what the figure is telling the user; above
+       it, it would. */
+    const MATERIAL_ESTIMATE_SHARE = 0.2;
+
     function tollCapForDay(km) {
         const k = nonNeg(km, 0);
         if (k <= 0) return 0;           // no driving, no tolls
@@ -217,6 +225,10 @@
                a verdict the model made up; it has to say so out loud. */
             const overFromEstimate = over && fromModel && tolls > 0 &&
                 round2(total - tolls) <= budget + 0.005;
+            /* Over budget for other reasons too, but with enough model money inside the
+               figure that the figure is not really arithmetic. */
+            const overWithEstimate = over && fromModel && tolls > 0 && !overFromEstimate &&
+                total > 0 && tolls >= MATERIAL_ESTIMATE_SHARE * total;
 
             const dayNo = num(d.day, i + 1);
             days.push({
@@ -236,7 +248,8 @@
                 budget: round2(budget),
                 over: over,
                 overBy: over ? round2(total - budget) : 0,
-                overDependsOnEstimate: overFromEstimate
+                overDependsOnEstimate: overFromEstimate,
+                overIncludesEstimate: overWithEstimate
             });
             if (basis === 'unknown') unknownTollDays.push(dayNo);
             if (basis === 'not-avoided') notAvoidedTollDays.push(dayNo);
@@ -276,6 +289,9 @@
             incompleteDays: incompleteDays,
             overDependsOnEstimate: over && tollsEstimated && tollsTotal > 0 &&
                 round2(cost - tollsTotal) <= budgetTotal + 0.005,
+            overIncludesEstimate: over && tollsEstimated && tollsTotal > 0 &&
+                round2(cost - tollsTotal) > budgetTotal + 0.005 &&
+                cost > 0 && tollsTotal >= MATERIAL_ESTIMATE_SHARE * cost,
             rates: {
                 consumption: consumption, fuelPrice: fuelPrice,
                 lodgingPerNight: lodgingRate, mealsPerDay: mealsRate
@@ -480,6 +496,19 @@
     /* info < warn < alert. Rendered top-down so the loudest is never buried. */
     const LEVEL_RANK = { alert: 0, warn: 1, info: 2 };
 
+    /* Stable sort by severity: the loudest notice must never be printed under a list of
+       blue trivia. */
+    function sortNoticesBySeverity(list) {
+        if (!Array.isArray(list)) return [];
+        return list.map(function (n, i) { return { n: n, i: i }; })
+            .sort(function (a, b) {
+                const ra = LEVEL_RANK[a.n && a.n.level] === undefined ? 2 : LEVEL_RANK[a.n.level];
+                const rb = LEVEL_RANK[b.n && b.n.level] === undefined ? 2 : LEVEL_RANK[b.n.level];
+                return ra === rb ? a.i - b.i : ra - rb;
+            })
+            .map(function (x) { return x.n; });
+    }
+
     function hasUnreliableNumbers(notices) {
         if (!Array.isArray(notices)) return false;
         for (let i = 0; i < notices.length; i++) {
@@ -645,15 +674,7 @@
             out.push({ code: 'other', level: 'info', params: { text: w } });
         }
 
-        /* Stable sort by severity: the loudest notice must never be printed under a
-           list of blue trivia. */
-        return out.map(function (n, i) { return { n: n, i: i }; })
-            .sort(function (a, b) {
-                const ra = LEVEL_RANK[a.n.level] === undefined ? 2 : LEVEL_RANK[a.n.level];
-                const rb = LEVEL_RANK[b.n.level] === undefined ? 2 : LEVEL_RANK[b.n.level];
-                return ra === rb ? a.i - b.i : ra - rb;
-            })
-            .map(function (x) { return x.n; });
+        return sortNoticesBySeverity(out);
     }
 
     /* Which notice params are NUMBERS carrying a unit, and which unit. Notices store
@@ -865,11 +886,18 @@
         }
         if (over) {
             const amount = formatMoney(entry.overBy);
+            const tolls = formatMoney(entry.tolls !== undefined ? entry.tolls : entry.totalTolls);
             if (entry.overDependsOnEstimate) {
                 return {
                     cls: 'flag-over',
-                    text: trf(ctx, 'itin.overBudgetByEstimated',
-                        { amount: amount, tolls: formatMoney(entry.tolls !== undefined ? entry.tolls : entry.totalTolls) })
+                    text: trf(ctx, 'itin.overBudgetByEstimated', { amount: amount, tolls: tolls })
+                };
+            }
+            /* Over budget on its own merits, but the figure is substantially model money. */
+            if (entry.overIncludesEstimate) {
+                return {
+                    cls: 'flag-over',
+                    text: trf(ctx, 'itin.overBudgetByWithEstimate', { amount: amount, tolls: tolls })
                 };
             }
             return { cls: 'flag-over', text: trf(ctx, 'itin.overBudgetBy', { amount: amount }) };
@@ -878,6 +906,23 @@
             return { cls: 'flag-unknown', text: tr(ctx, 'itin.withinBudgetIncomplete') };
         }
         return null;   /* caller supplies the reassuring wording it wants */
+    }
+
+    /* ── Toll provenance for a day that may predate the basis field ──
+       The FIRST rule is not about provenance at all, it is about arithmetic: a day that
+       carries money in `tolls` has that money inside its `total`, so it must render as
+       money. Round-1 saved documents (the first structured save) stored only the amount,
+       and reading them as "not estimated / —" left a cost table whose rows did not sum
+       to their own stated total — the app declaring it had never estimated a toll it was
+       at that moment charging the user for. Quality bar B9 is not negotiable on a load
+       path, so a positive toll wins over every other signal. */
+    function tollBasisOf(dayCost) {
+        const d = dayCost || {};
+        if (d.tollsBasis) return d.tollsBasis;
+        if (num(d.tolls, 0) > 0) return 'estimated';
+        if (d.tollsKnown === false) return 'unknown';
+        if (num(d.km, 0) <= 0) return 'none';
+        return d.tollsEstimated ? 'estimated' : 'unknown';
     }
 
     /* An amount that only counts what is known is a minimum, and is labelled as one. */
@@ -926,7 +971,8 @@
 
         const verdict = budgetVerdict({
             over: costs.over, overBy: costs.overBy, totalTolls: costs.totalTolls,
-            overDependsOnEstimate: costs.overDependsOnEstimate, incomplete: flags.incomplete
+            overDependsOnEstimate: costs.overDependsOnEstimate,
+            overIncludesEstimate: costs.overIncludesEstimate, incomplete: flags.incomplete
         }, flags, ctx) || {
             cls: 'flag-ok',
             text: trf(ctx, 'itin.underBudgetBy', {
@@ -951,18 +997,21 @@
                 '</td><td class="mono">' + esc(valueText) + '</td></tr>';
         };
         row('itin.fuel', formatMoney(dayCost.fuel));
-        /* Nothing computes tolls, so nothing but a plausible model estimate is printed
-           as a euro amount. Both non-answers render as an unknown, with the marker that
-           says WHICH non-answer it is. */
-        const basis = dayCost.tollsBasis ||
-            (dayCost.tollsKnown === false ? 'unknown' : (dayCost.tollsEstimated ? 'estimated' : 'unknown'));
+        /* Nothing computes tolls, so every state prints the marker that says exactly
+           what its number is: an estimate, a capped estimate, a certainty because there
+           was no driving, or one of the two different non-answers. Five states, five
+           markers — none of them distinguished by colour alone. */
+        const basis = tollBasisOf(dayCost);
         if (basis === 'not-avoided') {
             row('itin.tolls', tr(ctx, 'itin.unknownValue'), tr(ctx, 'itin.tollsNotApplicable'), 'cost-unknown');
         } else if (basis === 'unknown') {
             row('itin.tolls', tr(ctx, 'itin.unknownValue'), tr(ctx, 'itin.tollsNotEstimated'), 'cost-unknown');
+        } else if (basis === 'clamped') {
+            row('itin.tolls', formatMoney(dayCost.tolls), tr(ctx, 'itin.tollsCapped'), 'cost-unknown');
+        } else if (basis === 'none') {
+            row('itin.tolls', formatMoney(dayCost.tolls), tr(ctx, 'itin.tollsNoDriving'), '');
         } else {
-            row('itin.tolls', formatMoney(dayCost.tolls), tr(ctx, 'itin.estimate'),
-                basis === 'clamped' ? 'cost-unknown' : '');
+            row('itin.tolls', formatMoney(dayCost.tolls), tr(ctx, 'itin.estimate'), '');
         }
         row('itin.lodging', formatMoney(dayCost.lodging));
         row('itin.meals', formatMoney(dayCost.meals));
@@ -1208,14 +1257,89 @@
             saved.structured.plan.days.length > 0);
     }
 
+    /* ── Loading a document written before the toll states existed ──
+       Round-1 v2 documents carry `tolls` and nothing else about it. Deriving the basis
+       here rather than in the renderer keeps one source of truth, and lets the trip-level
+       flags agree with the per-day ones — otherwise the rows floor their totals while the
+       summary keeps asserting a complete one. Documents that already carry `tollsBasis`
+       (round 2 onwards) are returned untouched. */
+    function migrateSavedCosts(costs) {
+        if (!costs || !Array.isArray(costs.days) || costs.days.length === 0) return costs;
+        let legacy = false;
+        for (let i = 0; i < costs.days.length; i++) {
+            if (costs.days[i] && costs.days[i].tollsBasis === undefined) { legacy = true; break; }
+        }
+        if (!legacy) return costs;
+
+        const out = {};
+        for (const k in costs) if (Object.prototype.hasOwnProperty.call(costs, k)) out[k] = costs[k];
+
+        const days = [], unknownDays = [], incompleteDays = [];
+        for (let i = 0; i < costs.days.length; i++) {
+            const src = costs.days[i] || {};
+            const d = {};
+            for (const k in src) if (Object.prototype.hasOwnProperty.call(src, k)) d[k] = src[k];
+            const basis = tollBasisOf(d);
+            d.tollsBasis = basis;
+            d.tollsKnown = (basis === 'estimated' || basis === 'clamped' || basis === 'none');
+            d.tollsEstimated = (basis === 'estimated' || basis === 'clamped');
+            d.tollsClamped = d.tollsClamped || null;
+            d.incomplete = !(basis === 'estimated' || basis === 'none');
+            const tolls = num(d.tolls, 0), total = num(d.total, 0), budget = num(d.budget, 0);
+            d.overDependsOnEstimate = !!d.over && d.tollsEstimated && tolls > 0 &&
+                round2(total - tolls) <= budget + 0.005;
+            d.overIncludesEstimate = !!d.over && d.tollsEstimated && tolls > 0 &&
+                !d.overDependsOnEstimate && total > 0 && tolls >= MATERIAL_ESTIMATE_SHARE * total;
+            if (basis === 'unknown') unknownDays.push(num(d.day, i + 1));
+            if (d.incomplete) incompleteDays.push(num(d.day, i + 1));
+            days.push(d);
+        }
+        out.days = days;
+        out.unknownTollDays = unknownDays;
+        out.tollsUnknown = unknownDays.length > 0;
+        /* A round-1 document cannot say whether "without tolls" was chosen — it stored
+           the same zero either way — so this stays false rather than being guessed. */
+        out.tollsNotAvoided = false;
+        out.notAvoidedTollDays = [];
+        out.clampedTolls = Array.isArray(costs.clampedTolls) ? costs.clampedTolls : [];
+        out.incompleteDays = incompleteDays;
+        out.incomplete = incompleteDays.length > 0;
+
+        const totalTolls = num(out.totalTolls, 0), totalCost = num(out.totalCost, 0),
+            totalBudget = num(out.totalBudget, 0);
+        out.tollsEstimated = totalTolls > 0 || costs.tollsEstimated === true;
+        out.overDependsOnEstimate = !!out.over && out.tollsEstimated && totalTolls > 0 &&
+            round2(totalCost - totalTolls) <= totalBudget + 0.005;
+        out.overIncludesEstimate = !!out.over && out.tollsEstimated && totalTolls > 0 &&
+            !out.overDependsOnEstimate && totalCost > 0 &&
+            totalTolls >= MATERIAL_ESTIMATE_SHARE * totalCost;
+        return out;
+    }
+
     function viewFromSaved(saved) {
         if (!isStructuredRoute(saved)) return null;
         const s = saved.structured;
+        const costs = migrateSavedCosts(s.costs || computeCosts(s.plan, {}));
+        const notices = Array.isArray(s.notices) ? s.notices.slice() : [];
+        /* If the migration discovered a gap the document never recorded, say so — the
+           day rows now withhold their verdicts and the reader is owed the reason. */
+        if (costs && costs.tollsUnknown) {
+            let stated = false;
+            for (let i = 0; i < notices.length; i++) {
+                if (notices[i] && notices[i].code === 'tollsUnknown') { stated = true; break; }
+            }
+            if (!stated) {
+                notices.push({
+                    code: 'tollsUnknown', level: 'warn',
+                    params: { days: (costs.unknownTollDays || []).join(', ') }
+                });
+            }
+        }
         return {
             plan: s.plan,
-            costs: s.costs || computeCosts(s.plan, {}),
+            costs: costs,
             enrichment: s.enrichment || null,
-            notices: Array.isArray(s.notices) ? s.notices : [],
+            notices: sortNoticesBySeverity(notices),
             meta: s.meta || {}
         };
     }
