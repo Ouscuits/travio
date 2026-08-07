@@ -1058,6 +1058,165 @@ test('D1d: round-2/3 documents skip the notice migration entirely', function () 
     assert.strictEqual(I.renderItineraryHtml(restored, CTX), I.renderItineraryHtml(live, CTX));
 });
 
+/* ══════════════ ROUND 6 ══════════════ */
+
+/* ── D6 — the reconciliation migrated the alerts but not their CONSEQUENCE ──
+   Round 3 established the rule (withholding the verdict in the summary while asserting
+   it in a notice is the same lie in a smaller font) and enforced it inside buildNotices,
+   i.e. on the live path only. The load path derived the alerts, set numbersUnreliable and
+   withheld every verdict — then passed the stored notice list through unfiltered, so a
+   yellow notice judged the budget from numbers the same screen had just called fictional.
+
+   The window is TWO builds wide: round 2 shipped the overBudget notice before round 3
+   added the suppression, so both writers are covered below. The stored-notice arrays are
+   exactly what each build emitted for this trip (verified against the real modules at
+   8699cd1 and 19a08e8). ── */
+
+const LEGACY_WRITERS = {
+    /* commit 8699cd1 — no zeroDistance code at all: the engine sentence was stored as
+       untranslated prose, and unknown-distance was in COVERED_WARNINGS with nothing
+       rendering it. 'haversine' was pushed for EVERY non-osrm source. */
+    'round 1': function (over) {
+        const n = [{ code: 'unresolved', level: 'warn', params: { name: 'A' } },
+                   { code: 'haversine', level: 'warn', params: {} }];
+        if (over) n.push({ code: 'overBudget', level: 'warn', params: { days: '1, 2, 3', count: 3 } });
+        n.push({ code: 'other', level: 'info', params: { text: ZERO_DISTANCE_WARNING } });
+        return n;
+    },
+    /* commit 19a08e8 — the alert tier exists, but overBudget is still unconditional. */
+    'round 2': function (over) {
+        const n = [{ code: 'haversine', level: 'alert', params: {} },
+                   { code: 'unknownDistance', level: 'alert', params: {} },
+                   { code: 'zeroDistance', level: 'alert', params: {} },
+                   { code: 'unresolved', level: 'warn', params: { name: 'A' } },
+                   { code: 'tollsUnknown', level: 'warn', params: { days: '1, 2, 3' } }];
+        if (over) n.push({ code: 'overBudget', level: 'warn', params: { days: '1, 2, 3', count: 3 } });
+        return n;
+    }
+};
+
+test('D6: a pre-round-3 document does not judge the budget it has just refused to judge', function () {
+    for (const writer in LEGACY_WRITERS) {
+        const doc = round1DocWithWarnings(
+            [UNKNOWN_DISTANCE_WARNING, ZERO_DISTANCE_WARNING],
+            LEGACY_WRITERS[writer](true), { km: 0, budget: 20 });
+        assert.ok(doc.structured.notices.some(function (n) { return n.code === 'overBudget'; }),
+            writer + ' fixture: the document really does carry the notice');
+        assert.ok(doc.structured.costs.overBudgetDays.length > 0,
+            writer + ' fixture: the fictional costs really do exceed the budget');
+
+        const view = I.viewFromSaved(doc);
+        const codes = view.notices.map(function (n) { return n.code; });
+        assert.strictEqual(view.meta.numbersUnreliable, true, writer);
+        assert.strictEqual(codes.indexOf('overBudget'), -1,
+            writer + ': the summary and the day cards refuse to judge the budget, and a ' +
+            'notice judges it anyway from the same numbers');
+
+        const html = I.renderItineraryHtml(view, CTX);
+        assert.match(html, /summary-flag flag-unknown/, writer + ': verdict must stay withheld');
+        assert.strictEqual(html.indexOf('Over budget on day'), -1, writer);
+        assert.strictEqual(html.indexOf('Over budget by'), -1, writer);
+        assert.match(html, /The budget cannot be assessed/, writer);
+    }
+});
+
+test('D6: the loaded document matches what the live path produces for the same trip', function () {
+    /* The live path has emitted no overBudget notice for an unusable-numbers trip since
+       round 3. Loading a saved one must not differ. */
+    const ghost = function (n) { return P(n, null, null, { resolved: false }); };
+    const places = [ghost('A'), ghost('B'), ghost('C')];
+    const zeros = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const plan = engine.planRoute({ start: places[0], end: places[2], stops: [places[1]],
+        matrix: { km: zeros, min: zeros, source: 'haversine', osrmCells: 0, filledCells: 6 },
+        days: 3, departureTime: '09:00', maxDriveMinPerDay: 360 });
+    const live = I.buildItineraryView({ plan: plan, requestedStops: ['B'], startName: 'A', endName: 'C',
+        places: places, matrixSource: 'haversine', matrixFilledCells: 6, matrixOsrmCells: 0,
+        maxDriveMin: 360, dailyBudget: 20, tollsEnabled: true, t: CTX.t });
+    assert.ok(live.costs.overBudgetDays.length > 0, 'fixture: the arithmetic does say over budget');
+    assert.strictEqual(live.notices.some(function (n) { return n.code === 'overBudget'; }), false,
+        'fixture: and the live path already suppresses the notice');
+
+    for (const writer in LEGACY_WRITERS) {
+        const doc = round1DocWithWarnings([UNKNOWN_DISTANCE_WARNING, ZERO_DISTANCE_WARNING],
+            LEGACY_WRITERS[writer](true), { km: 0, budget: 20 });
+        const loaded = I.viewFromSaved(doc);
+        assert.strictEqual(loaded.notices.some(function (n) { return n.code === 'overBudget'; }),
+            live.notices.some(function (n) { return n.code === 'overBudget'; }),
+            writer + ': the load path disagrees with the live path');
+    }
+});
+
+test('D6: a HEALTHY pre-round-3 document still gets its over-budget notice and verdict', function () {
+    for (const writer in LEGACY_WRITERS) {
+        const stored = LEGACY_WRITERS[writer](true).filter(function (n) {
+            return n.code !== 'other' && n.code !== 'zeroDistance' && n.code !== 'unknownDistance';
+        });
+        const doc = round1DocWithWarnings(
+            ['rest-day: day 3 has no driving — rest / explore B.'], stored, { km: 300, budget: 40 });
+        const view = I.viewFromSaved(doc);
+        assert.strictEqual(view.meta.numbersUnreliable, false, writer);
+        assert.ok(view.notices.map(function (n) { return n.code; }).indexOf('overBudget') >= 0,
+            writer + ': suppression must be conditional, not blanket');
+        const html = I.renderItineraryHtml(view, CTX);
+        assert.match(html, /Over budget on day/, writer);
+        assert.match(html, /summary-flag flag-over/, writer);
+        assert.strictEqual(html.indexOf('The budget cannot be assessed'), -1, writer);
+    }
+});
+
+test('D6: a pre-round-3 "mixed" matrix stops claiming there is no road data at all', function () {
+    /* Builds before round 3 pushed 'haversine' for EVERY non-osrm source, so the stored
+       notice says "no road data" while this build's summary source line, read from the
+       same meta.matrixSource, says "partial road data". */
+    const doc = round1DocWithWarnings(
+        ['distance-source: partial road data — 2 of 6 matrix cells are straight-line estimates.'],
+        [{ code: 'haversine', level: 'warn', params: {} }], { km: 300, budget: 400 });
+    doc.structured.meta.matrixSource = 'mixed';
+
+    const view = I.viewFromSaved(doc);
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.strictEqual(codes.indexOf('haversine'), -1,
+        'a 70%-real matrix must not be reported as having no road data');
+    assert.ok(codes.indexOf('mixedUnknownCount') >= 0,
+        'round-1 meta carries no cell counts, so the countless variant is used');
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /Partial road data/);
+    assert.strictEqual(html.indexOf('No road data'), -1, 'the card contradicted itself');
+
+    /* With counts stored (round 2 onwards) the counted sentence is used. */
+    const withCounts = round1DocWithWarnings(
+        ['distance-source: partial road data — 2 of 6 matrix cells are straight-line estimates.'],
+        [{ code: 'haversine', level: 'warn', params: {} }], { km: 300, budget: 400 });
+    withCounts.structured.meta.matrixSource = 'mixed';
+    withCounts.structured.meta.matrixFilledCells = 2;
+    withCounts.structured.meta.matrixOsrmCells = 4;
+    const counted = I.viewFromSaved(withCounts).notices.filter(function (n) { return n.code === 'mixed'; })[0];
+    assert.ok(counted, 'the counts must be used when the document has them');
+    assert.strictEqual(counted.params.filled, 2);
+    assert.strictEqual(counted.params.total, 6);
+
+    /* And a genuinely road-data-free document keeps its haversine notice. */
+    const hav = round1DocWithWarnings(['distance-source: no road data at all.'],
+        [{ code: 'haversine', level: 'warn', params: {} }], { km: 300, budget: 400 });
+    assert.ok(I.viewFromSaved(hav).notices.map(function (n) { return n.code; }).indexOf('haversine') >= 0);
+});
+
+test('D6: prose without a matching warning now carries the severity, not just the text', function () {
+    /* Defensive residue — no shipped writer produces it, since round 1 always stored
+       plan.warnings and the prose only ever came from a warning. Closing it costs one
+       branch: the prose carries its own `code:` prefix, which is the same evidence. */
+    const doc = round1DocWithWarnings([], LEGACY_WRITERS['round 1'](true), { km: 0, budget: 20 });
+    assert.deepStrictEqual(doc.structured.plan.warnings, [], 'fixture: warnings stripped');
+    const view = I.viewFromSaved(doc);
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('zeroDistance') >= 0, 'the prose is evidence in its own right');
+    assert.strictEqual(codes.indexOf('other'), -1, 'and it is not printed twice');
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+    assert.strictEqual(codes.indexOf('overBudget'), -1, 'with the same consequence as any other route');
+    assert.match(I.renderItineraryHtml(view, CTX), /The budget cannot be assessed/);
+});
+
 /* ── D5b — a trip verdict must not contradict the day card below it ── */
 
 test('D5b: "only because of the estimate" is not claimed over a day that owns its overrun', function () {

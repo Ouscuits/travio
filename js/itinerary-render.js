@@ -1347,20 +1347,39 @@
        The evidence is in the document: plan.warnings holds both strings verbatim. Derive
        the class from there, drop the stale untranslated duplicate, and let the normal
        machinery translate, rank and sort it. */
-    function reconcileSavedNotices(plan, stored) {
+    function unreliableCodeIn(text) {
+        const s = String(text === null || text === undefined ? '' : text);
+        const code = s.indexOf(':') > 0 ? s.slice(0, s.indexOf(':')) : s;
+        return UNRELIABLE_WARNINGS[code] || null;
+    }
+
+    function reconcileSavedNotices(plan, stored, meta) {
         const warnings = (plan && Array.isArray(plan.warnings)) ? plan.warnings : [];
         const list = Array.isArray(stored) ? stored : [];
+        const m = meta || {};
 
-        /* What the plan itself reports. Derived first, so a stale untranslated duplicate
-           is only dropped when there is a real alert to replace it — a document with the
-           prose but no warnings keeps the prose rather than losing the information. */
+        /* Every source of the "numbers are not real" class the document can offer, read
+           first because what follows depends on it. plan.warnings is the primary one; an
+           older build's untranslated {code:'other'} prose carries the same `code:` prefix
+           and is evidence in its own right, not merely a duplicate — so a document that
+           somehow held the prose without the warning still gets the severity, not just
+           the text. */
         const derived = {};
         for (let i = 0; i < warnings.length; i++) {
-            const w = String(warnings[i] || '');
-            const code = w.indexOf(':') > 0 ? w.slice(0, w.indexOf(':')) : w;
-            const mapped = UNRELIABLE_WARNINGS[code];
+            const mapped = unreliableCodeIn(warnings[i]);
             if (mapped) derived[mapped] = true;
         }
+        let unreliable = false;
+        for (let i = 0; i < list.length; i++) {
+            const n = list[i];
+            if (!n || !n.code) continue;
+            if (UNRELIABLE_NOTICES[n.code]) { unreliable = true; continue; }
+            if (n.code === 'other') {
+                const mapped = unreliableCodeIn(n.params && n.params.text);
+                if (mapped) derived[mapped] = true;
+            }
+        }
+        for (const k in derived) if (Object.prototype.hasOwnProperty.call(derived, k)) unreliable = true;
 
         const present = {};
         const out = [];
@@ -1368,11 +1387,27 @@
             const n = list[i];
             if (!n || !n.code) continue;
             if (UNRELIABLE_NOTICES[n.code]) { present[n.code] = true; out.push(n); continue; }
-            if (n.code === 'other') {
-                const text = String((n.params && n.params.text) || '');
-                const code = text.indexOf(':') > 0 ? text.slice(0, text.indexOf(':')) : text;
-                const mapped = UNRELIABLE_WARNINGS[code];
-                if (mapped && derived[mapped]) continue;   // replaced by the derived alert
+            /* Now represented by the translated, alert-level notice below. */
+            if (n.code === 'other' && unreliableCodeIn(n.params && n.params.text)) continue;
+            /* The round-3 rule, which until now was enforced on the live path only:
+               withholding the verdict in the summary while asserting it in a notice is
+               the same lie in a smaller font. Builds before round 3 stored this notice
+               unconditionally, so it reaches any route saved between round 1 and round 3
+               from a run whose distances were unusable AND whose fictional costs
+               exceeded budget. */
+            if (n.code === 'overBudget' && unreliable) continue;
+            /* Builds before round 3 pushed 'haversine' for EVERY non-osrm source, so a
+               70%-real matrix carries a notice saying there is no road data at all —
+               directly contradicting the summary source line this build renders from
+               meta.matrixSource. The stored source is authoritative; re-code the notice
+               to match it. */
+            if (n.code === 'haversine' && m.matrixSource === 'mixed') {
+                const filled = num(m.matrixFilledCells, NaN), osrm = num(m.matrixOsrmCells, NaN);
+                const total = (isFinite(filled) && isFinite(osrm)) ? filled + osrm : NaN;
+                out.push((isFinite(filled) && filled >= 0 && isFinite(total) && total > 0)
+                    ? { code: 'mixed', level: 'warn', params: { filled: Math.round(filled), total: Math.round(total) } }
+                    : { code: 'mixedUnknownCount', level: 'warn', params: {} });
+                continue;
             }
             out.push(n);
         }
@@ -1387,7 +1422,7 @@
         if (!isStructuredRoute(saved)) return null;
         const s = saved.structured;
         const costs = migrateSavedCosts(s.costs || computeCosts(s.plan, {}));
-        const notices = reconcileSavedNotices(s.plan, s.notices);
+        const notices = reconcileSavedNotices(s.plan, s.notices, s.meta);
         /* If the migration discovered a gap the document never recorded, say so — the
            day rows now withhold their verdicts and the reader is owed the reason. */
         if (costs && costs.tollsUnknown) {
