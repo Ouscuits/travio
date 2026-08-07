@@ -768,6 +768,23 @@
                check — it is the one every-cell claim the counters can actually prove. */
             const noRoadProven = !outOfRange && !bothZero && osrmCells === 0;
 
+            /* A supplied counter of zero is an exact statement about its own set, so it
+               settles the whole matrix without any coverage argument: osrmCells === 0
+               fixes |A| = 0, hence every cell is wholly estimated and filledCells is
+               pinned at offDiagonal. filledCells === 0 is the mirror. When such a zero is
+               present, a sum below the floor is NOT unknown provenance — the provenance
+               has just been proven — it is the other counter contradicting the zero. The
+               two findings need different words, and the shortfall's "where those
+               distances came from cannot be confirmed" is simply false here.
+
+               Only a SUPPLIED zero counts. The label-implied zero is used to refute, and
+               a value inferred from the very claim under test proves nothing about where
+               the distances came from. */
+            const zeroOsrm = !outOfRange && osrmCells === 0;
+            const zeroFilled = !outOfRange && filled === 0;
+            const mutuallyImpossible = zeroOsrm && zeroFilled && offDiagonal > 0;
+            const settledByZero = zeroOsrm !== zeroFilled;      // exactly one decisive zero
+
             /* Cells whose km AND min are both estimates, versus cells that mix the two.
                |A n B| = |A| + |B| - offDiagonal, so entirely-estimated = offDiagonal - A
                and part-estimated = A + B - offDiagonal. Both identities assume the
@@ -785,7 +802,23 @@
                     String(matrix.osrmCells) + ', filledCells ' + String(matrix.filledCells) +
                     ') are not whole cell counts between 0 and ' + offDiagonal +
                     ', so the provenance of these distances cannot be confirmed.');
-            } else if (coverageShort) {
+            } else if (coverageShort && mutuallyImpossible) {
+                warnings.push('distance-source: the matrix counters contradict each other: ' +
+                    'osrmCells 0 says every cell is wholly estimated while filledCells 0 says ' +
+                    'every cell came from the road graph, and both cannot be true of ' +
+                    offDiagonal + ' cells.');
+            } else if (coverageShort && settledByZero && zeroOsrm && filled !== null) {
+                warnings.push('distance-source: the matrix counters contradict each other: ' +
+                    'osrmCells 0 proves every cell is wholly estimated, so filledCells must ' +
+                    'be ' + offDiagonal + ', not ' + filled + '.');
+            } else if (coverageShort && settledByZero && zeroFilled && osrmCells !== null) {
+                warnings.push('distance-source: the matrix counters contradict each other: ' +
+                    'filledCells 0 proves every cell came from the road graph, so osrmCells ' +
+                    'must be ' + offDiagonal + ', not ' + osrmCells + '.');
+            } else if (coverageShort && !settledByZero) {
+                /* No decisive zero, so the uncovered cells really are of unknown origin.
+                   The counters overlap, so their sum only bounds how many cells they
+                   attest — the shortfall is a minimum, not an exact figure. */
                 warnings.push('distance-source: the matrix counters (osrmCells ' +
                     (osrmCells === null ? String(osrmForFloor) + ', implied by the "' + src +
                         '" label' : String(osrmCells)) +
@@ -793,7 +826,7 @@
                     (filled === null ? String(filledForFloor) + ', implied by the "' + src +
                         '" label' : String(filled)) +
                     ') attest at most ' + attested + ' of the ' + offDiagonal +
-                    ' off-diagonal cells, leaving ' + (offDiagonal - attested) +
+                    ' off-diagonal cells, leaving at least ' + (offDiagonal - attested) +
                     ' unaccounted for; where those distances came from cannot be confirmed, ' +
                     'so no count of estimated legs is derived from them.');
             }

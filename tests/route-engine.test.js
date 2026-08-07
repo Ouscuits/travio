@@ -901,11 +901,12 @@ test('B5: the counters OVERLAP — their sum exceeding the cell count is not an 
         'B5: a plain partly-filled matrix is unchanged: ' + wr);
     assert.ok(!/carry a real road value/.test(wr), 'B5: nothing is half-estimated here: ' + wr);
 
-    // Both counters zero on a 30-cell matrix accounts for nothing and cannot be true.
+    // Both counters zero on a 30-cell matrix accounts for nothing and cannot be true —
+    // each zero is decisive and pins the other at 30, so they refute each other.
     const nothing = matrixWithSource(places, 'mixed', { osrmCells: 0, filledCells: 0 });
     const s = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: nothing, days: 3 });
     assert.ok(s.warnings.some(function (x) {
-        return x.indexOf('distance-source:') === 0 && /cannot be confirmed/.test(x);
+        return x.indexOf('distance-source:') === 0 && /contradict each other/.test(x);
     }), 'B5: counters that account for no cell at all are reported');
 
     // ...but a 1x1 matrix has no off-diagonal cell, so 0/0 there is correct and silent.
@@ -937,16 +938,10 @@ test('B5: counters that do not cover every cell are refused, never turned into a
         // A 'mixed' label over a hole: the old code reported "25 of 30 cells are
         // straight-line estimates" when the provider only ever attested 5.
         { label: 'mixed', counters: { osrmCells: 5, filledCells: 5 }, attested: 10 },
-        // An 'osrm' label over a hole: the old code said nothing whatsoever.
-        { label: 'osrm', counters: { osrmCells: 5, filledCells: 0 }, attested: 5 },
-        // A 'haversine' label over a hole. osrmCells === 0 does soundly prove that every
-        // cell is an estimate, so that claim is allowed here — but no COUNT may be.
-        { label: 'haversine', counters: { osrmCells: 0, filledCells: 2 }, attested: 2, provesNoRoad: true },
-        // The extreme case, which the coverage floor subsumes.
-        { label: 'mixed', counters: { osrmCells: 0, filledCells: 0 }, attested: 0 },
         /* One counter absent. The laws are biconditionals, so a known label pins the
            missing one ('osrm' => filledCells 0, 'haversine' => osrmCells 0) and the floor
-           becomes checkable even from a single supplied counter. */
+           becomes checkable even from a single supplied counter. Neither supplied counter
+           is a decisive zero, so the uncovered cells really are of unknown origin. */
         { label: 'osrm', counters: { osrmCells: 5, filledCells: undefined }, attested: 5 },
         { label: 'haversine', counters: { osrmCells: undefined, filledCells: 2 }, attested: 2 }
     ].forEach(function (c) {
@@ -959,8 +954,11 @@ test('B5: counters that do not cover every cell are refused, never turned into a
         }), 'B5: ' + tag + ' must report the shortfall and name it: ' + all);
         assert.ok(w.some(function (x) { return /cannot be confirmed/.test(x); }),
             'B5: ' + tag + ' provenance is unconfirmed: ' + all);
-        assert.ok(w.some(function (x) { return x.indexOf((M - c.attested) + ' unaccounted for') !== -1; }),
-            'B5: ' + tag + ' says how many cells came from nowhere: ' + all);
+        /* The counters overlap, so their sum only bounds how many cells they attest —
+           the number unaccounted for is a minimum, not an exact figure. */
+        assert.ok(w.some(function (x) {
+            return x.indexOf('at least ' + (M - c.attested) + ' unaccounted for') !== -1;
+        }), 'B5: ' + tag + ' bounds how many cells came from nowhere: ' + all);
 
         /* The point of the floor: with it broken, no derived figure may be printed.
            Every "N of 30" phrase that quantifies estimated cells is a fabrication. */
@@ -968,17 +966,8 @@ test('B5: counters that do not cover every cell are refused, never turned into a
             'B5: ' + tag + ' must not invent a count of estimated cells: ' + all);
         assert.ok(!w.some(function (x) { return /carry a real road value/.test(x); }),
             'B5: ' + tag + ' must not invent a count of half-real cells: ' + all);
-
-        /* "every distance is an estimate" is a fact only when a supplied osrmCells === 0
-           says so — that needs no coverage. Otherwise it is an unbacked every-cell claim. */
-        const claimsEveryCell = w.some(function (x) { return /no road data at all/.test(x); });
-        if (c.provesNoRoad) {
-            assert.ok(claimsEveryCell,
-                'B5: ' + tag + ' osrmCells === 0 does prove every cell is an estimate: ' + all);
-        } else {
-            assert.ok(!claimsEveryCell,
-                'B5: ' + tag + ' must not claim every cell is an estimate: ' + all);
-        }
+        assert.ok(!w.some(function (x) { return /no road data at all/.test(x); }),
+            'B5: ' + tag + ' must not claim every cell is an estimate: ' + all);
     });
 
     // A label-only 'haversine' verdict must read as the provider's claim, not as a fact.
@@ -1004,6 +993,76 @@ test('B5: counters that do not cover every cell are refused, never turned into a
     const justUnder = shortfall('mixed', { osrmCells: 24, filledCells: 5 });
     assert.ok(justUnder.some(function (x) { return /attest at most 29 of the 30/.test(x); }),
         'B5: 29 of 30 is one cell short and must be caught: ' + justUnder.join(' // '));
+});
+
+test('B5: a decisive zero settles provenance, so a shortfall there is an inconsistency', function () {
+    /* A supplied counter of ZERO is an exact statement about its own set and needs no
+       coverage argument: osrmCells === 0 fixes |A| = 0, so every cell is wholly estimated
+       and filledCells is pinned at M. When such a zero sits next to a sum below the floor,
+       the two findings are NOT "cells came from nowhere" — the provenance has just been
+       proven — they are the other counter contradicting the zero.
+
+       The engine used to emit both at once and disagree with itself: "where those
+       distances came from cannot be confirmed" immediately followed by "no road data at
+       all — every distance is a straight-line estimate", which is exactly the (maximal)
+       count the first sentence had just refused to derive. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);      // M = 30
+    const M = 30;
+
+    function warn(label, counters) {
+        const m = matrixWithSource(places, label, counters);
+        const p = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: m, days: 3 });
+        return p.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; });
+    }
+
+    // Mirror 1 — osrmCells 0 with filledCells below M.
+    const a = warn('haversine', { osrmCells: 0, filledCells: 2 });
+    const allA = a.join(' // ');
+    assert.ok(a.some(function (x) {
+        return /contradict each other/.test(x) &&
+            /osrmCells 0 proves every cell is wholly estimated/.test(x) &&
+            x.indexOf('filledCells must be ' + M + ', not 2') !== -1;
+    }), 'B5: the finding is a counter inconsistency, and it names the value required: ' + allA);
+    assert.ok(a.some(function (x) { return /no road data at all/.test(x); }),
+        'B5: osrmCells 0 still proves every cell is an estimate: ' + allA);
+    assert.ok(!a.some(function (x) { return /came from cannot be confirmed/.test(x); }),
+        'B5: provenance was just PROVEN, so nothing may call it unconfirmable: ' + allA);
+    assert.ok(!a.some(function (x) { return /attest at most/.test(x); }),
+        'B5: a shortfall is the wrong frame once a decisive zero has settled the matrix: ' + allA);
+
+    // Mirror 2 — filledCells 0 with osrmCells below M.
+    const b = warn('osrm', { osrmCells: 2, filledCells: 0 });
+    const allB = b.join(' // ');
+    assert.ok(b.some(function (x) {
+        return /contradict each other/.test(x) &&
+            /filledCells 0 proves every cell came from the road graph/.test(x) &&
+            x.indexOf('osrmCells must be ' + M + ', not 2') !== -1;
+    }), 'B5: the mirror is reported the same way: ' + allB);
+    assert.ok(!b.some(function (x) { return /came from cannot be confirmed/.test(x); }),
+        'B5: filledCells 0 settles provenance too: ' + allB);
+    assert.ok(!b.some(function (x) { return /attest at most/.test(x); }), 'B5: ' + allB);
+
+    // Both zero — each proves the other must be M, so they refute each other.
+    const c = warn('mixed', { osrmCells: 0, filledCells: 0 });
+    const allC = c.join(' // ');
+    assert.ok(c.some(function (x) {
+        return /contradict each other/.test(x) && x.indexOf('both cannot be true of ' + M) !== -1;
+    }), 'B5: two decisive zeros are mutually impossible: ' + allC);
+    assert.ok(!c.some(function (x) { return /no road data at all/.test(x); }),
+        'B5: neither zero can be trusted when they contradict, so nothing is proven: ' + allC);
+
+    // A decisive zero with the other counter ABSENT has nothing to contradict it: the
+    // label-implied value is not the provider's claim and cannot make it inconsistent.
+    const d = warn('haversine', { osrmCells: 0, filledCells: undefined });
+    assert.ok(!d.some(function (x) { return /contradict each other/.test(x); }),
+        'B5: an absent counter contradicts nothing: ' + d.join(' // '));
+    assert.ok(d.some(function (x) { return /no road data at all/.test(x); }),
+        'B5: and the decisive zero still proves the every-cell claim: ' + d.join(' // '));
+
+    // Sanity: a decisive zero WITH the floor met stays silent about coverage.
+    const e = warn('haversine', { osrmCells: 0, filledCells: M });
+    assert.ok(!e.some(function (x) { return /contradict each other/.test(x); }),
+        'B5: filledCells === 30 is exactly what osrmCells 0 requires: ' + e.join(' // '));
 });
 
 test('B5: an "osrm" label with no counters behind it is unverified, not clean', function () {
