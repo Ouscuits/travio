@@ -13,6 +13,7 @@
  * Public API (see docs/ENGINE_CONTRACT.md) — `window.TravioGeo`, plus the same
  * names bound directly on `window` for convenience:
  *   geocodePlaces(names, opts)  -> Promise<Place[]>     Nominatim, serialised >=1100ms
+ *   geocodeOutliers(places, opts) -> [{name,displayName,km}]  PURE, SYNC, no network
  *   distanceMatrix(places, opts)-> Promise<Matrix>      OSRM table, haversine fallback
  *   routeGeometry(places, opts) -> Promise<[lat,lon][]> OSRM route polyline, straight fallback
  *   decodePolyline, haversineKm, normalisePlaceName, clearGeoCache
@@ -21,7 +22,126 @@
  * Injection seam — every network/time/storage dependency can be stubbed:
  *   opts = { fetchImpl, sleepImpl, now, storage, minIntervalMs, cacheTtlMs,
  *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, maxSnapKm,
- *            roadFactor, speedKmh, userAgent, language }
+ *            roadFactor, speedKmh, userAgent, language, geocodeLimit,
+ *            clusterMinAnchors, clusterMoveKm,
+ *            outlierMultiple, outlierMinKm, outlierMinPlaces }
+ *
+ * GEOCODING PROVENANCE — the second half of this file's job, and the newer half.
+ *   Ten review rounds went into validating what OSRM returns and none into validating
+ *   what Nominatim returns. A real user typed `Santillana de Mar, Leon, Fisterra, Lugo`
+ *   for a trip round northern Spain and got 24,179 km and 268 hours. Nothing was broken:
+ *   the module took Nominatim's FIRST hit, checked only that the coordinates were in
+ *   range, and a village in Mexico is perfectly in range. Verified live, 2026-08:
+ *       'Santillana de Mar'  -> 22.136, -100.952   San Luis Potosi, MEXICO   1 candidate
+ *       'Santillana del Mar' -> 43.391,   -4.108   Cantabria, correct        1 candidate
+ *       'Finisterre'         -> 48.245,   -4.044   Finistere, FRANCE         1 candidate
+ *       'Fisterra'           -> 42.929,   -9.263   A Coruna, correct         3 candidates
+ *       'Leon'               -> 31.272,  -95.995   Leon County, TEXAS        5 candidates
+ *       'Leon' (accented)    -> 45.758,    4.832   LYON, France              5 candidates
+ *   Note the first three: ONE candidate each. Ambiguity detection cannot save them —
+ *   Nominatim is not uncertain, it is confidently answering a different question. Only
+ *   the three signals below can, and only the third reaches that case.
+ *
+ *   THE APP CANNOT KNOW THE USER MEANT SPAIN. Lyon -> Brittany is a real trip. So this
+ *   module never rejects a geocode; it reports what it did:
+ *     - displayName    the full label of what was chosen ("San Luis Potosi, Mexico"),
+ *                      never discarded, '' when nothing was resolved. Costs no heuristic
+ *                      and would by itself have shown the user the fault in two seconds.
+ *     - candidates     how many USABLE results the geocoder offered, i.e. the size of the
+ *                      set the choice was made from. Results whose coordinates are
+ *                      unusable are dropped before anything is chosen, so they are not
+ *                      counted — the number describes the choice, not the HTTP body.
+ *                      >1 means the name was ambiguous. 0 when unresolved.
+ *     - chosenByCluster  true when a NON-FIRST candidate was preferred (see below).
+ *   A cache entry written before candidate lists existed reports candidates: 1, which is
+ *   honest — one candidate is all that was kept. Such entries expire within 30 days.
+ *
+ *   CLUSTER PREFERENCE — allowed, but never silent.
+ *   "Choosing a candidate nearer the cluster is allowed; doing it silently is not."
+ *   ORDERING. Geocoding is sequential at >=1100 ms and the cluster does not exist until
+ *   some places have resolved, so an incremental "pick against the cluster so far" would
+ *   give a different answer depending on which name the user typed FIRST — a decision
+ *   varying with irrelevant input — and would need a stabilising second pass anyway.
+ *   Instead the request asks for `limit=GEO_GEOCODE_LIMIT` and keeps the WHOLE candidate
+ *   list, so by the end of the (unchanged) network phase every candidate is already in
+ *   hand. Selection is then a PURE second pass over the collected lists:
+ *       phase 1  one request per uncached name, same queue, same >=1100 ms spacing,
+ *                same single-flight guarantee, same number of requests as before;
+ *                provisional choice = candidate[0], exactly today's behaviour
+ *       phase 2  no network at all: anchor on the places whose name was UNAMBIGUOUS
+ *                (exactly one candidate), take their median centre, and for each
+ *                ambiguous place prefer the candidate nearest it
+ *   Cost: zero extra requests, zero extra latency, and the result is order-independent.
+ *   THE ANCHOR IS A MEDIAN, NOT A MEAN. In the user's real case the unambiguous places
+ *   are Santillana de Mar (MEXICO), Finisterre (FRANCE), Bilbao and Gijon — a mean sits
+ *   in the Atlantic, the component-wise median sits at 43.40, -4.85, in northern Spain.
+ *   A median needs to be outvoted to be wrong, hence GEO_CLUSTER_MIN_ANCHORS = 3: with
+ *   fewer anchors one bad one carries the centre, and relocating everything to match a
+ *   wrong anchor would manufacture a coherent-looking wrong trip that the outlier check
+ *   below could no longer see. Under three anchors NOTHING is relocated — no evidence,
+ *   no decision — and `candidates > 1` still carries the ambiguity to the UI.
+ *   GEO_CLUSTER_MOVE_KM = 100 stops the flag becoming noise. Nominatim routinely returns
+ *   several nodes for ONE town, and picking a different node of the same town is not a
+ *   relocation worth telling anyone about. Both anchors measured on the live answers
+ *   above: the widest spread between duplicate entries for the same town is 34 km (the
+ *   two "Leon, Castilla y Leon" nodes; Fisterra's three span 14 km, Lugo's Spanish three
+ *   13 km, Oviedo's two 2.8 km), and the closest pair of genuinely DIFFERENT places
+ *   inside one candidate list is ~1000 km (Leon County TX vs Leon County FL). 100 km is
+ *   x2.9 above the largest duplicate and x10 below the smallest distinct pair.
+ *   On the user's case this moves 'Leon' from Texas to Lyon — still not what he meant,
+ *   but 852 km from his trip instead of 7,704, and FLAGGED, which is the whole point.
+ *
+ * OUTLIERS — geocodeOutliers(places, opts) -> [{ name, displayName, km }]
+ *   PURE and SYNCHRONOUS: no network, no clock, no storage, no globals. Places whose
+ *   distance from the median centre of the resolved set is a large multiple of the median
+ *   spread AND large in absolute terms. Sorted furthest first. Empty for a coherent trip.
+ *
+ *   THRESHOLDS, from measurement. 60 itineraries were scored: real trips built from known
+ *   coordinates, plus the user's real failure re-run with the live answers above.
+ *   TWO constants are needed, and the second one is the interesting one:
+ *
+ *   1. GEO_OUTLIER_MIN_KM = 5000. A RATIO ALONE IS WORTHLESS, and this is the class the
+ *      first fixture did not contain — exactly the trap this file has fallen into twice
+ *      before (see RETRACTED, below). A hub-and-spoke trip (several stops inside one city
+ *      plus one ordinary domestic destination) has a median spread of ~4 km, so the ratio
+ *      explodes on a perfectly sane plan: London stops + Edinburgh x136, Tokyo stops +
+ *      Sapporo x230, New York stops + Miami x470, Perth stops + Sydney x740. Every one of
+ *      those is a legitimate itinerary and no ratio threshold survives them.
+ *      Both anchors are real: the furthest LEGITIMATE hub-and-spoke destination measured
+ *      is 3,289 km (Perth->Sydney, at ratio x740), and the nearest wrong-continent
+ *      geocode that must be caught is 7,704 km ('Leon' -> Texas). Geometric midpoint
+ *      sqrt(3289 x 7704) = 5,034, hence 5,000 km — x1.52 clear above the worst real case
+ *      and x1.54 clear below the case it exists to catch.
+ *   2. GEO_OUTLIER_MULTIPLE = 15. The floor alone is not enough either: real trips do
+ *      cross 5,000 km. Anchors, again both real: the worst COHERENT ratio among places
+ *      beyond the floor is x9.69 (Vladivostok in a Moscow-St Petersburg-Kazan-Vladivostok
+ *      drive, 6,099 km out), and the weakest ratio among the wrong-continent cases that
+ *      must be caught is x23.09 (four Spanish cities plus the Mexican "Santillana").
+ *      sqrt(9.69 x 23.09) = 14.96, hence 15 — x1.55 and x1.54 clear on the two sides.
+ *   The two derivations landed on nearly identical margins independently, and the clean
+ *   region of the sweep is floor 4,000-7,000 x multiple 12-20; 5,000 x 15 is its centre,
+ *   not its edge. Verified over the corpus: zero false positives, zero false negatives.
+ *
+ *   WHAT THIS DELIBERATELY DOES NOT CATCH, and why that is right. 'Finisterre' -> Brittany
+ *   is 552 km from the Spanish cluster and 'Leon' -> Lyon is 852 km. Neither is flagged,
+ *   because neither is distinguishable BY GEOMETRY from a trip that really does extend
+ *   into France — the contract's own line, "the app cannot know the user meant Spain".
+ *   Those two cases are served by `displayName` ("Finistere, Bretagne, France") and by
+ *   `candidates`, which is what those fields are for. Trying to catch them with distance
+ *   would mean flagging every trip that crosses a border, and a detector that fires on
+ *   ordinary trips is one users learn to ignore — which would cost the Mexico case too.
+ *
+ *   ACCEPTED FALSE POSITIVES: a genuinely transoceanic itinerary is flagged. Paris stops
+ *   plus Guadeloupe (6,754 km) or Reunion (9,363 km) are real French domestic trips and
+ *   both fire. The output is a NOTE naming a place and a distance, not a rejection, and
+ *   "Saint-Denis is 9,363 km from your other destinations" is true — while a road planner
+ *   asked to drive there is producing exactly the plan this branch exists to make visible.
+ *
+ *   KNOWN LIMITATION: when roughly half the places are wrong, geometry has nothing to say.
+ *   Six places in Spain and six in Mexico give a median centre in mid-Atlantic and a
+ *   median spread of thousands of km, so the ratio collapses towards 1 and the list comes
+ *   back empty. This is honest — there is no majority to be an outlier FROM — and it is
+ *   the reason `displayName` is mandatory rather than a fallback.
  *
  * RATE LIMITING — ONE queue, ALL THREE network entry points.
  *   geocodePlaces (Nominatim), distanceMatrix (OSRM /table) and routeGeometry (OSRM
@@ -329,6 +449,18 @@
                                                     // a road before it is a different place
     const GEO_QUEUE_SLACK_MS  = 500;                // grace before the queue tail self-releases
 
+    /* Geocoding provenance — see GEOCODING PROVENANCE and OUTLIERS in the header.
+       Every constant below is derived from measurement, and the derivation is written
+       down beside it there, not here. */
+    const GEO_GEOCODE_LIMIT       = 5;      // candidates asked of Nominatim (was 1)
+    const GEO_DISPLAY_NAME_MAX    = 300;    // defensive cap; live labels run 40-150 chars
+    const GEO_CLUSTER_MIN_ANCHORS = 3;      // fewer unambiguous places -> relocate nothing
+    const GEO_CLUSTER_MOVE_KM     = 100;    // below this it is the same town, not a move
+    const GEO_OUTLIER_MULTIPLE    = 15;     // x median spread from the median centre
+    const GEO_OUTLIER_MIN_KM      = 5000;   // and this far in absolute terms
+    const GEO_OUTLIER_MIN_PLACES  = 3;      // two places are always equidistant from
+                                            // their own median: nothing to compare
+
     /* ── Environment seams (all lazy, all guarded) ── */
     function geoGlobalObject() {
         if (typeof globalThis !== 'undefined') return globalThis;
@@ -376,7 +508,30 @@
             roadFactor:     typeof o.roadFactor === 'number' && o.roadFactor > 0 ? o.roadFactor : GEO_ROAD_FACTOR,
             speedKmh:       typeof o.speedKmh === 'number' && o.speedKmh > 0 ? o.speedKmh : GEO_SPEED_KMH,
             userAgent:      o.userAgent || '',
-            language:       o.language || ''
+            language:       o.language || '',
+            geocodeLimit:   typeof o.geocodeLimit === 'number' && o.geocodeLimit >= 1
+                                ? Math.floor(o.geocodeLimit) : GEO_GEOCODE_LIMIT,
+            clusterMinAnchors: typeof o.clusterMinAnchors === 'number' && o.clusterMinAnchors >= 1
+                                ? Math.floor(o.clusterMinAnchors) : GEO_CLUSTER_MIN_ANCHORS,
+            clusterMoveKm:  typeof o.clusterMoveKm === 'number' && o.clusterMoveKm >= 0
+                                ? o.clusterMoveKm : GEO_CLUSTER_MOVE_KM
+        };
+    }
+
+    /*
+     * geocodeOutliers is PURE and SYNCHRONOUS by contract, so it deliberately does NOT go
+     * through geoOptions — that would reach for fetch, localStorage and a clock it must
+     * never touch. Three numbers, read directly, nothing else.
+     */
+    function geoOutlierOptions(opts) {
+        const o = opts && typeof opts === 'object' ? opts : {};
+        return {
+            multiple:  typeof o.outlierMultiple === 'number' && o.outlierMultiple > 0
+                           ? o.outlierMultiple : GEO_OUTLIER_MULTIPLE,
+            minKm:     typeof o.outlierMinKm === 'number' && o.outlierMinKm >= 0
+                           ? o.outlierMinKm : GEO_OUTLIER_MIN_KM,
+            minPlaces: typeof o.outlierMinPlaces === 'number' && o.outlierMinPlaces >= 2
+                           ? Math.floor(o.outlierMinPlaces) : GEO_OUTLIER_MIN_PLACES
         };
     }
 
@@ -423,6 +578,19 @@
         return s.replace(/\s+/g, ' ');
     }
 
+    /* A label is a string or it is nothing. Capped, so a hostile or broken body cannot
+       push an unbounded blob into localStorage; live Nominatim labels run 40-150 chars. */
+    function geoDisplayName(v) {
+        if (typeof v !== 'string') return '';
+        return v.length > GEO_DISPLAY_NAME_MAX ? v.slice(0, GEO_DISPLAY_NAME_MAX) : v;
+    }
+
+    /*
+     * Every Place this module produces carries the three provenance fields, always, with
+     * the same types — a consumer must never have to test for their presence, and an
+     * `undefined` displayName would read on screen as a place with no name rather than as
+     * a place that could not be resolved.
+     */
     function geoMakePlace(name, lat, lon, source, extra) {
         const ok = geoIsFiniteNumber(lat) && geoIsFiniteNumber(lon) && geoValidLatLon(lat, lon);
         const place = {
@@ -430,12 +598,24 @@
             lat: ok ? lat : null,
             lon: ok ? lon : null,
             resolved: ok,
-            source: source
+            source: source,
+            displayName: '',
+            candidates: 0,
+            chosenByCluster: false
         };
         if (extra) {
             for (const k in extra) {
                 if (Object.prototype.hasOwnProperty.call(extra, k)) place[k] = extra[k];
             }
+        }
+        place.displayName = geoDisplayName(place.displayName);
+        place.candidates = geoIsFiniteNumber(place.candidates) && place.candidates >= 0
+            ? Math.floor(place.candidates) : 0;
+        place.chosenByCluster = place.chosenByCluster === true;
+        /* Nothing was chosen, so there is no label of what was chosen. */
+        if (!ok) {
+            place.displayName = '';
+            place.chosenByCluster = false;
         }
         return place;
     }
@@ -454,6 +634,55 @@
         const c = 2 * Math.atan2(Math.sqrt(s), Math.sqrt(Math.max(0, 1 - s)));
         const km = GEO_EARTH_R_KM * c;
         return isFinite(km) ? km : 0;
+    }
+
+    /* ── Robust centre of a set of points ── */
+    /*
+     * MEDIAN, not mean, and the reason is the bug this exists for: in the user's real
+     * case one of four anchors was in Mexico, and a mean sits in the Atlantic while the
+     * component-wise median sits in northern Spain. A median has to be OUTVOTED to move.
+     */
+    function geoMedian(values) {
+        const s = values.slice().sort(function (a, b) { return a - b; });
+        const n = s.length;
+        if (n === 0) return 0;
+        const mid = n >> 1;
+        return (n % 2) ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    }
+
+    /*
+     * Longitude is circular, so a plain median is wrong across the antimeridian: the
+     * middle of 179 and -179 is 180, not 0. Placing the trip's centre on the far side of
+     * the planet would make every place in it look like an outlier. Cut the circle at the
+     * WIDEST empty gap — the one arrangement in which the points form a single arc — then
+     * take an ordinary median of the unwrapped values. O(n log n), n <= a few dozen.
+     */
+    function geoMedianLon(values) {
+        const n = values.length;
+        if (n === 0) return 0;
+        const s = values.slice().sort(function (a, b) { return a - b; });
+        let widest = -1, cut = n - 1;
+        for (let i = 0; i < n; i++) {
+            const gap = (i === n - 1) ? (s[0] + 360 - s[i]) : (s[i + 1] - s[i]);
+            if (gap > widest) { widest = gap; cut = i; }
+        }
+        const unwrapped = new Array(n);
+        for (let i = 0; i < n; i++) {
+            const idx = (cut + 1 + i) % n;
+            unwrapped[i] = idx <= cut ? s[idx] + 360 : s[idx];
+        }
+        let m = geoMedian(unwrapped);
+        while (m > 180) m -= 360;
+        while (m < -180) m += 360;
+        return m;
+    }
+
+    /* points: [{lat, lon}, ...] — caller guarantees they are valid coordinates. */
+    function geoMedianCentre(points) {
+        const lats = new Array(points.length);
+        const lons = new Array(points.length);
+        for (let i = 0; i < points.length; i++) { lats[i] = points[i].lat; lons[i] = points[i].lon; }
+        return { lat: geoMedian(lats), lon: geoMedianLon(lons) };
     }
 
     function geoNoop() { /* deliberately empty */ }
@@ -613,10 +842,39 @@
     /*
      * A cached entry gets EXACTLY the validation the network path performs — a poisoned
      * localStorage must not be able to inject coordinates that the parser would have
-     * rejected, because those coordinates go straight into the OSRM URL. A future-dated
-     * timestamp (beyond a small clock skew) is treated as expired: `now - ts > ttl` is
-     * false forever for `ts = 9e15`, so it would otherwise be an immortal entry.
+     * rejected, because those coordinates go straight into the OSRM URL. That now applies
+     * per CANDIDATE as well as to the entry as a whole. A future-dated timestamp (beyond
+     * a small clock skew) is treated as expired: `now - ts > ttl` is false forever for
+     * `ts = 9e15`, so it would otherwise be an immortal entry.
+     *
+     * Returns the CANDIDATE LIST, never a single point.
+     *
+     * FORMAT, and why it is compatible in both directions. `lat`/`lon`/`displayName` still
+     * describe the geocoder's FIRST candidate exactly as before, so an entry written by
+     * this version is readable by the previous one; `cands` is additive, so an entry
+     * written by the previous version is readable here and simply yields one candidate.
+     * Bumping the key prefix instead would have orphaned every existing entry in the
+     * user's localStorage with no code left that knows how to remove them.
+     *
+     * WHAT IS CACHED IS THE GEOCODER'S ANSWER, NEVER THE TRIP'S CHOICE. Cluster preference
+     * depends on the other places in the same request, so caching a cluster-chosen point
+     * would bake a decision made for one trip into every later trip that names the same
+     * place. The list is stored raw and in the geocoder's own order; the choice is redone
+     * from scratch on every call.
      */
+    function geoCacheCandidate(c) {
+        let lat, lon, label;
+        if (Array.isArray(c)) {
+            lat = geoCoordNum(c[0]); lon = geoCoordNum(c[1]); label = geoDisplayName(c[2]);
+        } else if (c && typeof c === 'object') {
+            lat = geoCoordNum(c.lat); lon = geoCoordNum(c.lon); label = geoDisplayName(c.displayName);
+        } else {
+            return null;
+        }
+        if (!geoValidLatLon(lat, lon)) return null;
+        return { lat: lat, lon: lon, displayName: label };
+    }
+
     function geoCacheRead(name, cfg) {
         if (!cfg.storage) return null;
         let raw = null;
@@ -637,15 +895,33 @@
             geoCacheDrop(name, cfg);
             return null;
         }
-        return { lat: lat, lon: lon, displayName: entry.displayName || '' };
+
+        const list = [{ lat: lat, lon: lon, displayName: geoDisplayName(entry.displayName) }];
+        if (Array.isArray(entry.cands) && entry.cands.length) {
+            const parsed = [];
+            for (let i = 0; i < entry.cands.length && parsed.length < cfg.geocodeLimit; i++) {
+                const c = geoCacheCandidate(entry.cands[i]);
+                if (c) parsed.push(c);            // an unusable candidate is dropped, not served
+            }
+            if (parsed.length) return parsed;
+        }
+        return list;
     }
 
-    function geoCacheWrite(name, lat, lon, displayName, cfg) {
+    /* `list` is the candidate list as the geocoder returned it — see the note above. */
+    function geoCacheWrite(name, list, cfg) {
         if (!cfg.storage || typeof cfg.storage.setItem !== 'function') return;
-        if (!geoValidLatLon(lat, lon)) return;
+        if (!Array.isArray(list) || !list.length) return;
+        if (!geoValidLatLon(list[0].lat, list[0].lon)) return;
+        const cands = [];
+        for (let i = 0; i < list.length && i < cfg.geocodeLimit; i++) {
+            cands.push([list[i].lat, list[i].lon, list[i].displayName]);
+        }
         try {
             cfg.storage.setItem(geoCacheKey(name), JSON.stringify({
-                lat: lat, lon: lon, displayName: displayName || '', ts: cfg.now()
+                lat: list[0].lat, lon: list[0].lon,
+                displayName: list[0].displayName || '',
+                ts: cfg.now(), cands: cands
             }));
         } catch (e) { /* quota / private mode — cache is best-effort */ }
     }
@@ -671,18 +947,99 @@
     }
 
     /* ── Geocoding ── */
+    /*
+     * limit=GEO_GEOCODE_LIMIT, not 1. Asking for one answer makes ambiguity invisible:
+     * 'Leon' has five candidates and 'Lugo' has five, and the module could not say so
+     * because it never asked. It is the SAME request either way — no extra round trip,
+     * no extra spacing, nothing the OSM usage policy notices.
+     */
     function geoNominatimUrl(name, cfg) {
-        return cfg.nominatimUrl + '?format=jsonv2&limit=1&q=' + encodeURIComponent(name);
+        return cfg.nominatimUrl + '?format=jsonv2&limit=' + cfg.geocodeLimit +
+               '&q=' + encodeURIComponent(name);
     }
 
-    function geoParseNominatim(data) {
+    /*
+     * -> [{ lat, lon, displayName }, ...] in the geocoder's own order, or null if nothing
+     * usable came back. A result whose coordinates are unusable is dropped rather than
+     * failing the whole lookup: it is not a destination anyone could have meant, and it
+     * is not counted in `candidates` either — that number describes the set the choice
+     * was made from, not the size of the HTTP body.
+     */
+    function geoParseNominatim(data, cfg) {
         if (!data) return null;
-        const first = Array.isArray(data) ? data[0] : data;
-        if (!first || typeof first !== 'object') return null;
-        const lat = geoCoordNum(first.lat);
-        const lon = geoCoordNum(first.lon);
-        if (!geoValidLatLon(lat, lon)) return null;
-        return { lat: lat, lon: lon, displayName: first.display_name || '' };
+        const arr = Array.isArray(data) ? data : [data];
+        const limit = cfg && cfg.geocodeLimit > 0 ? cfg.geocodeLimit : GEO_GEOCODE_LIMIT;
+        const out = [];
+        for (let i = 0; i < arr.length && out.length < limit; i++) {
+            const r = arr[i];
+            if (!r || typeof r !== 'object') continue;
+            const lat = geoCoordNum(r.lat);
+            const lon = geoCoordNum(r.lon);
+            if (!geoValidLatLon(lat, lon)) continue;
+            out.push({ lat: lat, lon: lon, displayName: geoDisplayName(r.display_name) });
+        }
+        return out.length ? out : null;
+    }
+
+    function geoPlaceFromCandidates(name, list, source) {
+        const c = list[0];
+        return geoMakePlace(name, c.lat, c.lon, source, {
+            displayName: c.displayName,
+            candidates: list.length,
+            chosenByCluster: false
+        });
+    }
+
+    /*
+     * PHASE 2 of geocoding — pure, no network, runs once every candidate list is in hand.
+     * See CLUSTER PREFERENCE in the header for why the choice is made here rather than
+     * incrementally during the (rate-limited, sequential) network phase.
+     *
+     * Mutates `out` in place. Every relocation sets `chosenByCluster`, without exception:
+     * a user whose trip really does span continents must not have a destination quietly
+     * moved, so the flag is what makes the choice reviewable rather than imposed.
+     */
+    function geoPreferCluster(out, candidateLists, cfg) {
+        /* Anchors: resolved places whose name was UNAMBIGUOUS. A name repeated by the
+           user is one place, not two votes — normalised-name dedup keeps the median
+           honest about how many distinct anchors there really are. */
+        const anchors = [];
+        const seen = Object.create(null);
+        for (let i = 0; i < out.length; i++) {
+            const list = candidateLists[i];
+            if (!out[i] || !out[i].resolved || !list || list.length !== 1) continue;
+            const key = normalisePlaceName(out[i].name);
+            if (seen[key]) continue;
+            seen[key] = true;
+            anchors.push({ lat: list[0].lat, lon: list[0].lon });
+        }
+        if (anchors.length < cfg.clusterMinAnchors) return;
+
+        const centre = geoMedianCentre(anchors);
+
+        for (let i = 0; i < out.length; i++) {
+            const list = candidateLists[i];
+            if (!out[i] || !out[i].resolved || !list || list.length < 2) continue;
+
+            let best = 0;
+            let bestKm = haversineKm(centre.lat, centre.lon, list[0].lat, list[0].lon);
+            for (let k = 1; k < list.length; k++) {
+                const d = haversineKm(centre.lat, centre.lon, list[k].lat, list[k].lon);
+                if (d < bestKm) { bestKm = d; best = k; }   // strict: ties keep the earlier
+            }
+            if (best === 0) continue;
+
+            /* Nominatim routinely returns several nodes for ONE town. Swapping between
+               them is not a relocation and must not raise a flag the UI would have to
+               explain — see GEO_CLUSTER_MOVE_KM in the header. */
+            const moved = haversineKm(list[0].lat, list[0].lon, list[best].lat, list[best].lon);
+            if (moved <= cfg.clusterMoveKm) continue;
+
+            out[i].lat = list[best].lat;
+            out[i].lon = list[best].lon;
+            out[i].displayName = list[best].displayName;
+            out[i].chosenByCluster = true;
+        }
     }
 
     /*
@@ -690,17 +1047,20 @@
      * Sequential (>=1100ms apart, one request in flight at a time), cached, and
      * strictly index-aligned to `names`: never throws, never reorders, never drops.
      * A failed lookup yields { lat:null, lon:null, resolved:false } at its own index.
+     * Two phases — network, then a pure cluster pass. Phase 2 issues no requests.
      */
     async function geocodePlaces(names, opts) {
         const cfg = geoOptions(opts);
         const list = Array.isArray(names) ? names : (names ? [names] : []);
         const out = new Array(list.length);
+        const candidateLists = new Array(list.length);
         const localCache = new Map();   // dedupe repeated names inside one call
 
         for (let i = 0; i < list.length; i++) {
             const raw = list[i];
             const name = (raw === null || raw === undefined) ? '' : String(raw);
             const key = normalisePlaceName(name);
+            candidateLists[i] = null;
 
             if (!key) {
                 out[i] = geoMakePlace(name, null, null, 'osm', { error: 'empty-name' });
@@ -709,31 +1069,90 @@
 
             if (localCache.has(key)) {
                 const hit = localCache.get(key);
-                out[i] = geoMakePlace(name, hit.lat, hit.lon, 'cache', { displayName: hit.displayName });
+                candidateLists[i] = hit;
+                out[i] = geoPlaceFromCandidates(name, hit, 'cache');
                 continue;
             }
 
             const cached = geoCacheRead(name, cfg);
             if (cached) {
                 localCache.set(key, cached);
-                out[i] = geoMakePlace(name, cached.lat, cached.lon, 'cache', { displayName: cached.displayName });
+                candidateLists[i] = cached;
+                out[i] = geoPlaceFromCandidates(name, cached, 'cache');
                 continue;
             }
 
             /* Network path — serialised and throttled through the shared queue. */
-            const hit = geoParseNominatim(await geoRequest(geoNominatimUrl(name, cfg), cfg));
+            const hit = geoParseNominatim(await geoRequest(geoNominatimUrl(name, cfg), cfg), cfg);
 
             if (hit) {
                 localCache.set(key, hit);
-                geoCacheWrite(name, hit.lat, hit.lon, hit.displayName, cfg);
-                out[i] = geoMakePlace(name, hit.lat, hit.lon, 'osm', { displayName: hit.displayName });
+                geoCacheWrite(name, hit, cfg);
+                candidateLists[i] = hit;
+                out[i] = geoPlaceFromCandidates(name, hit, 'osm');
             } else {
                 /* Failures are NOT cached — a transient outage must not poison the cache. */
                 out[i] = geoMakePlace(name, null, null, 'osm', { error: 'not-found' });
             }
         }
 
+        geoPreferCluster(out, candidateLists, cfg);
         return out;
+    }
+
+    /*
+     * geocodeOutliers(places, opts) -> [{ name, displayName, km }]
+     * PURE and SYNCHRONOUS. No network, no clock, no storage, no globals — see OUTLIERS
+     * in the header for both thresholds and the evidence behind them.
+     *
+     * A place is named only when it is BOTH a large multiple of the median spread from the
+     * median centre AND far in absolute terms. Either test alone has a measured failure
+     * mode: the ratio alone fires on any hub-and-spoke trip (median spread ~4 km makes
+     * every ratio explode), and the floor alone fires on real continental drives.
+     *
+     * Zero median spread is not a special case: the tests are written as MULTIPLICATION,
+     * so a set of places at identical coordinates yields 0 > 0 (false, nothing flagged)
+     * and identical places plus one far one yields km > 0 (true) — both correct, and
+     * neither divides.
+     */
+    function geocodeOutliers(places, opts) {
+        const cfg = geoOutlierOptions(opts);
+        const list = Array.isArray(places) ? places : [];
+        const pts = [];
+
+        for (let i = 0; i < list.length; i++) {
+            const p = list[i];
+            if (!p || typeof p !== 'object') continue;
+            const lat = geoCoordNum(p.lat);
+            const lon = geoCoordNum(p.lon);
+            if (!geoValidLatLon(lat, lon) || p.resolved === false) continue;
+            pts.push({
+                name: (p.name === null || p.name === undefined) ? '' : String(p.name),
+                displayName: geoDisplayName(p.displayName),
+                lat: lat, lon: lon
+            });
+        }
+        if (pts.length < cfg.minPlaces) return [];
+
+        const centre = geoMedianCentre(pts);
+        const dist = new Array(pts.length);
+        for (let i = 0; i < pts.length; i++) {
+            dist[i] = haversineKm(centre.lat, centre.lon, pts[i].lat, pts[i].lon);
+        }
+        const spread = geoMedian(dist);
+
+        const found = [];
+        for (let i = 0; i < pts.length; i++) {
+            if (dist[i] > spread * cfg.multiple && dist[i] > cfg.minKm) {
+                found.push({ name: pts[i].name, displayName: pts[i].displayName, km: geoRound(dist[i], 1) });
+            }
+        }
+        /* Furthest first; name breaks ties so the order is total and deterministic. */
+        found.sort(function (a, b) {
+            if (b.km !== a.km) return b.km - a.km;
+            return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+        });
+        return found;
     }
 
     /* ── Distance matrix ── */
@@ -1270,6 +1689,7 @@
     /* ── Exports ── only the documented API leaves this scope ── */
     const api = {
         geocodePlaces: geocodePlaces,
+        geocodeOutliers: geocodeOutliers,
         distanceMatrix: distanceMatrix,
         routeGeometry: routeGeometry,
         decodePolyline: decodePolyline,
@@ -1279,7 +1699,12 @@
         resetGeoRateLimit: resetGeoRateLimit,
         GEO_MIN_INTERVAL_MS: GEO_MIN_INTERVAL_MS,
         GEO_ROAD_FACTOR: GEO_ROAD_FACTOR,
-        GEO_SPEED_KMH: GEO_SPEED_KMH
+        GEO_SPEED_KMH: GEO_SPEED_KMH,
+        /* Published so the UI can explain its own thresholds instead of restating them —
+           one physical constant living in two files will drift (see the 88 vs 90 note). */
+        GEO_GEOCODE_LIMIT: GEO_GEOCODE_LIMIT,
+        GEO_OUTLIER_MULTIPLE: GEO_OUTLIER_MULTIPLE,
+        GEO_OUTLIER_MIN_KM: GEO_OUTLIER_MIN_KM
     };
 
     if (typeof window !== 'undefined') {
@@ -1293,8 +1718,9 @@
             }
         }
         window.TravioGeo = browserApi;
-        /* Same seven documented functions bound directly, for the UI wiring. */
+        /* Same eight documented functions bound directly, for the UI wiring. */
         window.geocodePlaces      = geocodePlaces;
+        window.geocodeOutliers    = geocodeOutliers;
         window.distanceMatrix     = distanceMatrix;
         window.routeGeometry      = routeGeometry;
         window.decodePolyline     = decodePolyline;

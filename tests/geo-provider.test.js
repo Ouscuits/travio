@@ -217,7 +217,9 @@ test('geocode: resolves places, preserves input order and index alignment', asyn
     });
     assert.strictEqual(fetchImpl.calls.length, 3);
     assert.ok(fetchImpl.calls[0].indexOf('format=jsonv2') !== -1, 'uses jsonv2');
-    assert.ok(fetchImpl.calls[0].indexOf('limit=1') !== -1, 'uses limit=1');
+    /* limit=1 made ambiguity invisible: the module could not report that 'Leon' has five
+       candidates because it never asked for them. Same request, same rate limit. */
+    assert.ok(fetchImpl.calls[0].indexOf('limit=5') !== -1, 'asks for several candidates');
 });
 
 test('geocode: cache hit avoids a second fetch', async function () {
@@ -1304,8 +1306,8 @@ test('geometry: unresolved places are skipped and thin input needs no request', 
 /* D5b: `resetGeoRateLimit` is deliberately NOT here — it is a Node-only test seam and
    a way to break the OSM usage policy from the page. See the D5b test below. */
 const DOCUMENTED_GLOBALS = [
-    'TravioGeo', 'geocodePlaces', 'distanceMatrix', 'routeGeometry', 'decodePolyline',
-    'haversineKm', 'normalisePlaceName', 'clearGeoCache'
+    'TravioGeo', 'geocodePlaces', 'geocodeOutliers', 'distanceMatrix', 'routeGeometry',
+    'decodePolyline', 'haversineKm', 'normalisePlaceName', 'clearGeoCache'
 ];
 
 function loadInFakeBrowser(times) {
@@ -2411,4 +2413,712 @@ test('utils: clearGeoCache removes only Travio keys and tolerates no storage', f
     assert.strictEqual(storage._data.has('unrelated.key'), true);
     assert.strictEqual(storage._data.has(cacheKeyFor('Madrid')), false);
     assert.strictEqual(clearGeoCache({ storage: null }), 0);
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   G1-G4: geocoding provenance
+
+   A real user typed `Santillana de Mar, Leon, Fisterra, Lugo` for a trip round
+   northern Spain and got 24,179 km and 268 hours of driving. Nothing threw and
+   nothing was numerically wrong: "Santillana de Mar" is a village in MEXICO and
+   "Leon" is a county in TEXAS, and the engine faithfully planned the drive. Ten
+   review rounds had validated what OSRM returns and none what Nominatim does.
+
+   Every candidate list below is the LIVE reply from
+   nominatim.openstreetmap.org/search?format=jsonv2&limit=5, measured 2026-08.
+   Nothing here is invented, and nothing here touches the network.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const { geocodeOutliers } = geo;
+
+/* [lat, lon, display_name] — exactly as Nominatim returned them, in its order. */
+const LIVE = {
+    'Santillana de Mar': [[22.1356454, -100.9519141, 'Santillana de Mar, Colonia Espanita, San Luis Potosi, Municipio de San Luis Potosi, San Luis Potosi, 78378, Mexico']],
+    'Finisterre': [[48.2451153, -4.0440902, 'Finistere, Bretagne, France metropolitaine, France']],
+    'Fisterra': [
+        [42.9286659, -9.2626624, 'Fisterra, A Coruna, Galicia, Espana'],
+        [42.8825, -9.2722222, 'Cabo Fisterra, Fisterra, A Coruna, Galicia, 15155, Espana'],
+        [43.0046737, -9.1318361, 'Fisterra, A Coruna, Galicia, Espana']],
+    'Leon': [
+        [31.2715127, -95.9953382, 'Leon County, Texas, United States'],
+        [30.4683062, -84.2549068, 'Leon County, Florida, United States'],
+        [40.740465, -93.7465075, 'Leon, Decatur County, Iowa, 50144, United States'],
+        [37.6902964, -96.7822508, 'Leon, Butler County, Kansas, United States'],
+        [45.7578137, 4.8320114, 'Lyon, Metropole de Lyon, Rhone, Auvergne-Rhone-Alpes, France metropolitaine, France']],
+    'Lugo': [
+        [43.0395266, -7.4567985, 'Lugo, Galicia, Espana'],
+        [42.9913123, -7.5908294, 'Lugo, Galicia, Espana'],
+        [44.4765987, 11.89807, 'Lugo, Unione dei comuni della Bassa Romagna, Ravenna, Emilia-Romagna, 48022, Italia'],
+        [42.961254, -7.5243782, 'Lugo, Galicia, Espana'],
+        [45.3667996, 12.1333816, 'Lugo, Lughetto, Campagna Lupia, Venezia, Veneto, 30010, Italia']],
+    'Oviedo': [
+        [43.3533452, -5.8795096, 'Oviedo, Asturias / Asturies, Espana'],
+        [28.6702526, -81.2084941, 'Oviedo, Seminole County, Florida, 32765, United States'],
+        [17.8436883, -71.4284827, 'Oviedo, Pedernales, 21901, Republica Dominicana'],
+        [43.3618625, -5.8483581, 'Oviedo / Uvieu, Oviedo, Asturias / Asturies, 33003, Espana'],
+        [17.7901489, -71.4129089, 'oviedo, Oviedo, Pedernales, 21901, Republica Dominicana']],
+    'Bilbao': [[43.2630018, -2.9350039, 'Bilbao, Bizkaia, Euskadi, Espana']],
+    'Santander': [
+        [43.4618932, -3.8100255, 'Santander, Cantabria, Espana'],
+        [7.0000085, -73.2500086, 'Santander, RAP Gran Santander, Colombia'],
+        [9.4170689, 123.3351935, 'Santander, Cebu, Central Visayas, 6026, Philippines']],
+    'Gijon': [[43.5449422, -5.66275, 'Gijon / Xixon, Asturias / Asturies, Espana']]
+};
+
+function liveBody(name) {
+    const rows = LIVE[name];
+    if (!rows) return [];
+    return rows.map(function (r) {
+        return { lat: String(r[0]), lon: String(r[1]), display_name: r[2] };
+    });
+}
+
+/* Serves the live reply for whichever known name appears in the query string. */
+function liveLookup(url) {
+    const q = decodeURIComponent(String(url));
+    /* longest first, so a shorter name can never shadow a longer one containing it */
+    const names = Object.keys(LIVE).sort(function (a, b) { return b.length - a.length; });
+    for (let i = 0; i < names.length; i++) {
+        if (q.indexOf('q=' + names[i]) !== -1) return liveBody(names[i]);
+    }
+    return [];
+}
+
+function liveFetch() {
+    return makeFetch(function (url) { return liveLookup(url); });
+}
+
+/* The exact trip that produced the bug report, plus the rest of the itinerary. */
+const USER_TRIP = ['Santillana de Mar', 'Leon', 'Fisterra', 'Lugo',
+                   'Oviedo', 'Bilbao', 'Santander', 'Gijon', 'Finisterre'];
+
+function byName(places, name) {
+    return places.filter(function (p) { return p.name === name; })[0];
+}
+
+/* ── G1: displayName — the signal that costs no heuristic at all ── */
+
+test('G1: displayName carries the full label of what was actually chosen', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Santillana de Mar'], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out[0].resolved, true, 'it resolved — nothing was ever broken');
+    assert.ok(out[0].displayName.indexOf('Mexico') !== -1,
+        'the label says Mexico: ' + out[0].displayName);
+    assert.ok(out[0].displayName.indexOf('San Luis Potosi') !== -1, 'and names the town');
+    /* This one field, and no heuristic whatsoever, is what would have shown the user
+       in two seconds that his Cantabrian village was 8,700 km away. */
+});
+
+test('G1: displayName survives the cache round trip', async function () {
+    resetGeoRateLimit();
+    const storage = makeStorage();
+    const fetchImpl = liveFetch();
+    const opts = geoOpts({ fetchImpl: fetchImpl, storage: storage });
+
+    const first = await geocodePlaces(['Santillana de Mar'], opts);
+    assert.strictEqual(first[0].source, 'osm');
+
+    const second = await geocodePlaces(['santillana de mar'], opts);
+    assert.strictEqual(fetchImpl.calls.length, 1, 'served from cache');
+    assert.strictEqual(second[0].source, 'cache');
+    assert.strictEqual(second[0].displayName, first[0].displayName,
+        'a cached place is not an anonymous coordinate pair');
+    assert.strictEqual(second[0].candidates, first[0].candidates, 'and remembers the ambiguity');
+});
+
+test('G1: every Place carries the three provenance fields, always, with stable types', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function (url, init, i) {
+        if (i === 0) return nominatimHit(40, -3, 'Somewhere, Espana');
+        if (i === 1) return new Error('offline');
+        return [];
+    });
+    const out = await geocodePlaces(['Good', 'Dead', 'Empty', '', null], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out.length, 5);
+    out.forEach(function (p, i) {
+        assert.strictEqual(typeof p.displayName, 'string', i + ': displayName is always a string');
+        assert.strictEqual(typeof p.candidates, 'number', i + ': candidates is always a number');
+        assert.strictEqual(typeof p.chosenByCluster, 'boolean', i + ': chosenByCluster is always a boolean');
+    });
+    assert.strictEqual(out[0].displayName, 'Somewhere, Espana');
+    for (let i = 1; i < out.length; i++) {
+        assert.strictEqual(out[i].resolved, false);
+        assert.strictEqual(out[i].displayName, '',
+            'nothing was chosen, so there is no label of what was chosen (not undefined)');
+        assert.strictEqual(out[i].candidates, 0);
+        assert.strictEqual(out[i].chosenByCluster, false);
+    }
+});
+
+test('G1: a non-string or oversized display_name never reaches a Place', async function () {
+    resetGeoRateLimit();
+    const huge = new Array(5001).join('x');
+    const fetchImpl = makeFetch(function (url, init, i) {
+        if (i === 0) return [{ lat: '1', lon: '1', display_name: { toString: function () { return 'nope'; } } }];
+        if (i === 1) return [{ lat: '2', lon: '2', display_name: 12345 }];
+        if (i === 2) return [{ lat: '3', lon: '3' }];
+        return [{ lat: '4', lon: '4', display_name: huge }];
+    });
+    const out = await geocodePlaces(['A', 'B', 'C', 'D'], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out[0].displayName, '', 'an object is not a label, and never "[object Object]"');
+    assert.strictEqual(out[1].displayName, '', 'a number is not a label');
+    assert.strictEqual(out[2].displayName, '', 'an absent label is an empty label');
+    assert.ok(out[3].displayName.length <= 300 && out[3].displayName.length > 0,
+        'an unbounded blob is capped before it can reach localStorage');
+    out.forEach(function (p) { assert.strictEqual(p.resolved, true, 'the coordinates still work'); });
+});
+
+/* ── G2: candidates — "the choice was among several" ── */
+
+test('G2: candidates reports how many the geocoder offered', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Leon', 'Fisterra', 'Bilbao'], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out[0].candidates, 5, "'Leon' is ambiguous — five candidates");
+    assert.strictEqual(out[1].candidates, 3, "'Fisterra' — three");
+    assert.strictEqual(out[2].candidates, 1, "'Bilbao' — one, unambiguous");
+    assert.ok(out[0].candidates > 1, 'candidates > 1 is the ambiguity signal the UI needs');
+});
+
+test('G2: ambiguity detection cannot save the case that caused the bug', async function () {
+    /* The point of this test is the LIMIT of requirement 2, recorded so nobody later
+       assumes candidates>1 covers the reported failure. It does not: Nominatim is not
+       uncertain about "Santillana de Mar", it is confidently answering about Mexico,
+       and it offers exactly one candidate for it. */
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Santillana de Mar', 'Finisterre'], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out[0].candidates, 1, 'one candidate: no ambiguity to detect');
+    assert.strictEqual(out[1].candidates, 1, 'same for the Breton "Finisterre"');
+    assert.strictEqual(out[0].chosenByCluster, false, 'and nothing to prefer either');
+    /* Only displayName (G1) and geocodeOutliers (G4) reach this case. */
+});
+
+test('G2: results with unusable coordinates are dropped, not counted, not chosen', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function () {
+        return [
+            { lat: '999', lon: '0', display_name: 'Out of range' },
+            { lat: true, lon: true, display_name: 'Number(true) is 1' },
+            { lat: '43.26', lon: '-2.93', display_name: 'Bilbao, Espana' }
+        ];
+    });
+    const out = await geocodePlaces(['Mixed'], geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(out[0].resolved, true, 'one usable result is enough');
+    assert.strictEqual(out[0].lat, 43.26, 'the usable one was taken');
+    assert.strictEqual(out[0].displayName, 'Bilbao, Espana');
+    assert.strictEqual(out[0].candidates, 1,
+        'candidates describes the set the choice was made from, not the size of the body');
+});
+
+test('G2: a candidate list survives the cache in a backwards-compatible entry', async function () {
+    resetGeoRateLimit();
+    const storage = makeStorage();
+    const fetchImpl = liveFetch();
+    const opts = geoOpts({ fetchImpl: fetchImpl, storage: storage });
+
+    await geocodePlaces(['Leon'], opts);
+    const raw = JSON.parse(storage._data.get(cacheKeyFor('Leon')));
+    assert.strictEqual(raw.lat, 31.2715127, 'the old fields still describe the first candidate');
+    assert.strictEqual(typeof raw.displayName, 'string');
+    assert.strictEqual(raw.cands.length, 5, 'and the whole list is kept alongside them');
+
+    const again = await geocodePlaces(['Leon'], opts);
+    assert.strictEqual(fetchImpl.calls.length, 1, 'no second request');
+    assert.strictEqual(again[0].candidates, 5, 'ambiguity is not forgotten by a cache hit');
+});
+
+test('G2: an entry written before candidate lists existed still reads, as one candidate', async function () {
+    resetGeoRateLimit();
+    const seed = {};
+    seed[cacheKeyFor('Old')] = JSON.stringify({ lat: 43.26, lon: -2.93, displayName: 'Bilbao, Espana', ts: Date.now() });
+    const storage = makeStorage(seed);
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Old'], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+
+    assert.strictEqual(fetchImpl.calls.length, 0, 'the old entry is still usable');
+    assert.strictEqual(out[0].source, 'cache');
+    assert.strictEqual(out[0].lat, 43.26);
+    assert.strictEqual(out[0].displayName, 'Bilbao, Espana');
+    assert.strictEqual(out[0].candidates, 1, 'one candidate is all that was ever stored');
+});
+
+test('G2: a poisoned candidate inside a cache entry is dropped, never served', async function () {
+    resetGeoRateLimit();
+    const seed = {};
+    seed[cacheKeyFor('Poison')] = JSON.stringify({
+        lat: 43.26, lon: -2.93, displayName: 'Bilbao', ts: Date.now(),
+        cands: [[43.26, -2.93, 'Bilbao'], [9999, -77777, 'Injected'], [true, true, 'Coerced'], 'garbage']
+    });
+    const storage = makeStorage(seed);
+    const out = await geocodePlaces(['Poison'], geoOpts({ fetchImpl: liveFetch(), storage: storage }));
+
+    assert.strictEqual(out[0].candidates, 1, 'only the valid candidate survived');
+    assert.strictEqual(out[0].lat, 43.26);
+    /* The cache path gets exactly the validation the network path does — those
+       coordinates would otherwise go straight into an OSRM URL. */
+});
+
+/* ── G3: cluster preference — allowed, but never silent ── */
+
+test("G3: the user's real case — 'Leon' moves off Texas, and says so", async function () {
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: fetchImpl }));
+
+    const leon = byName(out, 'Leon');
+    assert.strictEqual(leon.chosenByCluster, true, 'a non-first candidate was preferred, and it is flagged');
+    assert.ok(leon.displayName.indexOf('Lyon') !== -1,
+        'the label names what was taken instead: ' + leon.displayName);
+    assert.ok(Math.abs(leon.lat - 45.7578137) < 1e-6 && Math.abs(leon.lon - 4.8320114) < 1e-6);
+
+    /* 7,700 km from the Spanish cluster before, ~850 km after. Still not what the user
+       meant — the app cannot know that — but it is now a fact he can see and correct. */
+    const before = haversineKm(31.2715127, -95.9953382, 43.4, -4.85);
+    const after = haversineKm(leon.lat, leon.lon, 43.4, -4.85);
+    assert.ok(before > 7000, 'Texas was ' + Math.round(before) + ' km from the trip');
+    assert.ok(after < 1000 && after < before / 5, 'Lyon is ' + Math.round(after) + ' km from it');
+});
+
+test('G3: NOTHING is ever relocated silently', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: fetchImpl }));
+
+    /* The contract's rule: "Choosing a candidate nearer the cluster is allowed; doing it
+       silently is not." Verified structurally — chosenByCluster is true for exactly
+       those places whose chosen coordinates differ from the geocoder's FIRST answer. */
+    let moves = 0;
+    out.forEach(function (p) {
+        const list = LIVE[p.name];
+        if (!list) return;
+        const first = list[0];
+        const moved = Math.abs(p.lat - first[0]) > 1e-9 || Math.abs(p.lon - first[1]) > 1e-9;
+        assert.strictEqual(p.chosenByCluster, moved,
+            p.name + ': chosenByCluster must mean exactly "this is not the geocoder\'s first answer"');
+        if (moved) {
+            moves++;
+            const taken = list.filter(function (c) { return Math.abs(c[0] - p.lat) < 1e-9; })[0];
+            assert.strictEqual(p.displayName, taken[2],
+                p.name + ': the label describes the candidate actually taken');
+        }
+    });
+    assert.strictEqual(moves, 1, 'exactly one destination was relocated on this trip');
+});
+
+test('G3: another node of the SAME town is not a relocation and raises no flag', async function () {
+    /* Nominatim returns three Fisterra nodes spanning 14 km and two Oviedo nodes 2.8 km
+       apart, and one of them is marginally nearer the cluster centre. Flagging that
+       would turn the signal into noise, and the user's destination did not move. */
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: fetchImpl }));
+
+    ['Fisterra', 'Oviedo', 'Lugo', 'Santander'].forEach(function (name) {
+        const p = byName(out, name);
+        assert.strictEqual(p.chosenByCluster, false, name + ': same town, no flag');
+        assert.strictEqual(p.lat, LIVE[name][0][0], name + ": kept the geocoder's own first answer");
+        assert.ok(p.candidates > 1, name + ': but the ambiguity is still reported');
+    });
+});
+
+test('G3: with too few unambiguous anchors, nothing is relocated at all', async function () {
+    /* No cluster, no evidence, no decision. A single wrong anchor would otherwise drag
+       every ambiguous place to match it and manufacture a coherent-looking wrong trip —
+       which geocodeOutliers could then no longer see. */
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Leon', 'Lugo', 'Bilbao'], geoOpts({ fetchImpl: fetchImpl }));
+
+    const leon = byName(out, 'Leon');
+    assert.strictEqual(leon.chosenByCluster, false, 'one anchor is a point, not a cluster');
+    assert.strictEqual(leon.lat, 31.2715127, 'Texas is still on show — and displayName says so');
+    assert.ok(leon.displayName.indexOf('Texas') !== -1);
+    assert.strictEqual(leon.candidates, 5, 'ambiguity is still reported to the UI');
+});
+
+test('G3: the choice does not depend on which name the user typed first', async function () {
+    /* An incremental "prefer against the cluster so far" would answer differently for a
+       reordered list — a decision varying with irrelevant input. The pure second pass
+       cannot: every candidate is in hand before any choice is made. */
+    resetGeoRateLimit();
+    const forward = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: liveFetch() }));
+    resetGeoRateLimit();
+    const backward = await geocodePlaces(USER_TRIP.slice().reverse(), geoOpts({ fetchImpl: liveFetch() }));
+
+    const key = function (list) {
+        return list.slice().sort(function (a, b) { return a.name < b.name ? -1 : 1; })
+            .map(function (p) { return p.name + '@' + p.lat + ',' + p.lon + ',' + p.chosenByCluster; });
+    };
+    assert.deepStrictEqual(key(forward), key(backward), 'same answer, whatever the input order');
+});
+
+test('G3: the cluster pass costs no request, no spacing and no concurrency', async function () {
+    /* The rate limiter and the single-flight guarantee cost a review round each. Asking
+       for limit=5 means every candidate is already in hand when phase 2 runs, so phase 2
+       issues nothing at all. */
+    resetGeoRateLimit();
+    const clock = makeClock(4000000);
+    const fetchImpl = makeFetch(function (url) { clock.advance(20); return liveLookup(url); });
+    const starts = [];
+    const wrapped = function (url, init) { starts.push(clock.now()); return fetchImpl(url, init); };
+
+    const out = await geocodePlaces(USER_TRIP, {
+        fetchImpl: wrapped, storage: null, now: clock.now, sleepImpl: clock.sleep
+    });
+
+    assert.strictEqual(out.length, USER_TRIP.length, 'index alignment preserved');
+    assert.strictEqual(fetchImpl.calls.length, USER_TRIP.length,
+        'exactly one request per name — the cluster pass added none');
+    assert.strictEqual(fetchImpl.maxInFlight, 1, 'never more than one request in flight');
+    assert.deepStrictEqual(fetchImpl.log.slice(0, 4), ['start:0', 'end:0', 'start:1', 'end:1'],
+        'requests do not overlap');
+    for (let i = 1; i < starts.length; i++) {
+        assert.ok(starts[i] - starts[i - 1] >= 1100,
+            'spacing ' + (starts[i] - starts[i - 1]) + 'ms >= 1100ms');
+    }
+    /* And the flag still landed, so this really was a run of phase 2. */
+    assert.strictEqual(byName(out, 'Leon').chosenByCluster, true);
+});
+
+test('G3: the cache stores the geocoder answer, never the trip-specific choice', async function () {
+    /* A cluster choice depends on the OTHER places in the same request. Caching it would
+       bake a decision made for one trip into every later trip naming the same place. */
+    resetGeoRateLimit();
+    const storage = makeStorage();
+    const trip = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: liveFetch(), storage: storage }));
+    assert.strictEqual(byName(trip, 'Leon').chosenByCluster, true, 'relocated in this trip');
+
+    const stored = JSON.parse(storage._data.get(cacheKeyFor('Leon')));
+    assert.strictEqual(stored.lat, 31.2715127, 'but Texas — the raw first answer — is what was cached');
+    assert.strictEqual(stored.cands.length, 5, 'the whole list, in the geocoder order');
+
+    resetGeoRateLimit();
+    const alone = await geocodePlaces(['Leon'], geoOpts({ fetchImpl: liveFetch(), storage: storage }));
+    assert.strictEqual(alone[0].chosenByCluster, false, 'a later, different trip re-decides from scratch');
+    assert.strictEqual(alone[0].lat, 31.2715127);
+});
+
+test('G3: a place with no candidates, and a malformed reply, do not disturb the cluster pass', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function (url) {
+        const q = decodeURIComponent(String(url));
+        if (q.indexOf('q=Nowhere') !== -1) return [];
+        if (q.indexOf('q=Junk') !== -1) return { not: 'an array' };
+        if (q.indexOf('q=Dead') !== -1) return new Error('socket hang up');
+        return liveLookup(url);
+    });
+    const names = ['Bilbao', 'Nowhere', 'Gijon', 'Junk', 'Santillana de Mar', 'Leon', 'Finisterre', 'Dead'];
+    const out = await geocodePlaces(names, geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.deepStrictEqual(out.map(function (p) { return p.name; }), names, 'nothing dropped or reordered');
+    ['Nowhere', 'Junk', 'Dead'].forEach(function (n) {
+        assert.strictEqual(byName(out, n).resolved, false, n + ' is unresolved');
+        assert.strictEqual(byName(out, n).candidates, 0);
+        assert.strictEqual(byName(out, n).displayName, '');
+    });
+    assert.strictEqual(byName(out, 'Leon').chosenByCluster, true, 'the cluster still formed from the rest');
+});
+
+test('G3: a duplicated name is one anchor, not two votes', async function () {
+    /* Bilbao three times plus Gijon looks like four unambiguous places but is only two
+       distinct ones, which is below the anchor minimum. Counting duplicates would let a
+       user tilt the median simply by repeating a destination. */
+    resetGeoRateLimit();
+    const fetchImpl = liveFetch();
+    const out = await geocodePlaces(['Bilbao', 'bilbao', 'BILBAO', 'Gijon', 'Leon'],
+        geoOpts({ fetchImpl: fetchImpl }));
+
+    assert.strictEqual(fetchImpl.calls.length, 3, 'the repeat was fetched once');
+    assert.strictEqual(byName(out, 'Leon').chosenByCluster, false, 'two distinct anchors is not a cluster');
+    assert.strictEqual(out[0].lat, out[1].lat, 'the duplicates still agree with each other');
+    assert.strictEqual(out[1].lat, out[2].lat);
+});
+
+/* ── G4: geocodeOutliers — name the odd one out ── */
+
+function pl(name, lat, lon, displayName) {
+    return { name: name, lat: lat, lon: lon, resolved: true, source: 'osm',
+             displayName: displayName || name, candidates: 1, chosenByCluster: false };
+}
+
+/* The itinerary as the user meant it. */
+const N_SPAIN = [
+    pl('Santillana del Mar', 43.391, -4.108), pl('Leon', 42.599, -5.567),
+    pl('Fisterra', 42.929, -9.263), pl('Lugo', 43.012, -7.556),
+    pl('Oviedo', 43.362, -5.849), pl('Bilbao', 43.263, -2.935),
+    pl('Santander', 43.462, -3.810), pl('Gijon', 43.545, -5.663),
+    pl('Ribadeo', 43.537, -7.041), pl('Cangas de Onis', 43.351, -5.128),
+    pl('Potes', 43.153, -4.622), pl('A Coruna', 43.362, -8.412)
+];
+/* The itinerary as it was actually planned. */
+const N_SPAIN_BROKEN = N_SPAIN.map(function (p) {
+    return p.name === 'Santillana del Mar'
+        ? pl('Santillana de Mar', 22.1356454, -100.9519141, LIVE['Santillana de Mar'][0][2])
+        : p;
+});
+/* Four points a few km apart inside one city — the shape that destroys a ratio-only rule. */
+function cityStops(prefix, lat, lon) {
+    return [pl(prefix + ' 1', lat + 0.02, lon + 0.01), pl(prefix + ' 2', lat - 0.02, lon + 0.02),
+            pl(prefix + ' 3', lat + 0.01, lon - 0.03), pl(prefix + ' 4', lat - 0.03, lon - 0.01)];
+}
+
+test("G4: the user's real case is named, with the label that explains it", function () {
+    const found = geocodeOutliers(N_SPAIN_BROKEN);
+    assert.strictEqual(found.length, 1, 'exactly one place is the odd one out');
+    assert.strictEqual(found[0].name, 'Santillana de Mar');
+    assert.ok(found[0].km > 8000, 'it is ' + Math.round(found[0].km) + ' km from the rest of the trip');
+    assert.ok(found[0].displayName.indexOf('Mexico') !== -1,
+        'and the note can say WHY: ' + found[0].displayName);
+});
+
+test('G4: the same itinerary, geocoded correctly, is silent', function () {
+    assert.deepStrictEqual(geocodeOutliers(N_SPAIN), [], 'a coherent trip flags nothing');
+});
+
+test('G4: legitimately spread-out trips are NOT flagged', function () {
+    /* The false-positive side is the one that makes the feature worthless. */
+    const cases = [
+        ['Lisbon-Berlin-Athens', [pl('Lisbon', 38.72, -9.14), pl('Berlin', 52.52, 13.40), pl('Athens', 37.98, 23.73)]],
+        ['a genuine Lyon-Brittany run', [pl('Lyon', 45.76, 4.83), pl('Quimper', 47.996, -4.098)]],
+        ['Lyon-Brittany-Paris', [pl('Lyon', 45.76, 4.83), pl('Quimper', 47.996, -4.098), pl('Paris', 48.857, 2.352)]],
+        ['grand European tour', [pl('Lisbon', 38.72, -9.14), pl('Madrid', 40.42, -3.70), pl('Paris', 48.86, 2.35),
+            pl('Berlin', 52.52, 13.40), pl('Rome', 41.90, 12.50), pl('Athens', 37.98, 23.73),
+            pl('Istanbul', 41.01, 28.98), pl('Stockholm', 59.33, 18.07)]],
+        ['Norway to the Arctic', [pl('Oslo', 59.91, 10.75), pl('Bergen', 60.39, 5.32), pl('Trondheim', 63.43, 10.40),
+            pl('Tromso', 69.65, 18.96), pl('Kirkenes', 69.73, 30.05)]],
+        ['Route 66', [pl('Chicago', 41.88, -87.63), pl('St Louis', 38.63, -90.20), pl('Oklahoma City', 35.47, -97.52),
+            pl('Amarillo', 35.22, -101.83), pl('Albuquerque', 35.08, -106.65), pl('Flagstaff', 35.20, -111.65),
+            pl('Los Angeles', 34.05, -118.24)]],
+        ['Japan including Sapporo', [pl('Tokyo', 35.68, 139.69), pl('Kyoto', 35.01, 135.77), pl('Osaka', 34.69, 135.50),
+            pl('Hiroshima', 34.39, 132.46), pl('Fukuoka', 33.59, 130.40), pl('Sapporo', 43.06, 141.35)]],
+        ['Morocco by ferry', [pl('Madrid', 40.42, -3.70), pl('Granada', 37.18, -3.60), pl('Tarifa', 36.01, -5.60),
+            pl('Tangier', 35.77, -5.80), pl('Fez', 34.03, -5.00), pl('Marrakech', 31.63, -8.01)]],
+        ['USA coast to coast', [pl('New York', 40.71, -74.01), pl('Chicago', 41.88, -87.63), pl('Denver', 39.74, -104.99),
+            pl('Las Vegas', 36.17, -115.14), pl('San Francisco', 37.77, -122.42)]],
+        ['Canada Trans-Canada', [pl('Halifax', 44.65, -63.58), pl('Montreal', 45.50, -73.57), pl('Toronto', 43.65, -79.38),
+            pl('Winnipeg', 49.90, -97.14), pl('Calgary', 51.05, -114.07), pl('Vancouver', 49.28, -123.12)]],
+        ['Chile, long and thin', [pl('Arica', -18.48, -70.31), pl('Santiago', -33.45, -70.67),
+            pl('Puerto Montt', -41.47, -72.94), pl('Punta Arenas', -53.16, -70.91)]],
+        ['Silk Road', [pl('Istanbul', 41.01, 28.98), pl('Tehran', 35.69, 51.39), pl('Samarkand', 39.65, 66.98),
+            pl('Kashgar', 39.47, 75.99), pl('Xian', 34.34, 108.94)]],
+        ['trans-Africa', [pl('Cape Town', -33.92, 18.42), pl('Johannesburg', -26.20, 28.05),
+            pl('Nairobi', -1.29, 36.82), pl('Cairo', 30.04, 31.24)]],
+        ['Pan-American south', [pl('Ushuaia', -54.80, -68.30), pl('Buenos Aires', -34.60, -58.38),
+            pl('Lima', -12.05, -77.04), pl('Bogota', 4.71, -74.07), pl('Panama', 8.98, -79.52)]]
+    ];
+    cases.forEach(function (c) {
+        assert.deepStrictEqual(geocodeOutliers(c[1]), [], c[0] + ' must not be flagged');
+    });
+});
+
+test('G4: a ratio alone would be worthless — hub-and-spoke trips are not flagged', function () {
+    /* Four stops inside one city give a median spread of ~4 km, so the RATIO of an
+       ordinary domestic destination explodes: x136 for Edinburgh, x230 for Sapporo,
+       x470 for Miami, x740 for Sydney. Every one of these is a real itinerary, and this
+       is the class the first threshold fixture did not contain — the exact mistake this
+       file has recorded twice already under RETRACTED. */
+    const cases = [
+        ['London stops + Edinburgh', cityStops('London', 51.507, -0.128).concat([pl('Edinburgh', 55.953, -3.188)])],
+        ['Barcelona stops + Madrid', cityStops('Barcelona', 41.385, 2.173).concat([pl('Madrid', 40.417, -3.704)])],
+        ['Tokyo stops + Sapporo', cityStops('Tokyo', 35.682, 139.692).concat([pl('Sapporo', 43.062, 141.354)])],
+        ['New York stops + Miami', cityStops('NYC', 40.713, -74.006).concat([pl('Miami', 25.762, -80.192)])],
+        ['Sydney stops + Cairns', cityStops('Sydney', -33.868, 151.209).concat([pl('Cairns', -16.920, 145.771)])],
+        ['Perth stops + Sydney', cityStops('Perth', -31.953, 115.857).concat([pl('Sydney', -33.868, 151.209)])],
+        ['Madrid stops + Tenerife', cityStops('Madrid', 40.417, -3.704).concat([pl('Tenerife', 28.463, -16.252)])],
+        ['Anchorage stops + Seattle', cityStops('Anchorage', 61.218, -149.900).concat([pl('Seattle', 47.606, -122.332)])],
+        ['Lisbon stops + Azores', cityStops('Lisbon', 38.722, -9.139).concat([pl('Ponta Delgada', 37.741, -25.669)])],
+        ['Moscow stops + Sochi', cityStops('Moscow', 55.755, 37.617).concat([pl('Sochi', 43.586, 39.723)])]
+    ];
+    cases.forEach(function (c) {
+        assert.deepStrictEqual(geocodeOutliers(c[1]), [],
+            c[0] + ': a legitimate hub-and-spoke trip must stay silent');
+    });
+});
+
+test('G4: an absolute floor alone would be worthless too — real continental drives are not flagged', function () {
+    /* Vladivostok is 6,099 km from the centre of a Moscow-St Petersburg-Kazan drive, well
+       past the 5,000 km floor, and the trip is real. Only the ratio spares it. */
+    const russia = [pl('Moscow', 55.75, 37.62), pl('St Petersburg', 59.94, 30.31),
+                    pl('Kazan', 55.79, 49.12), pl('Vladivostok', 43.12, 131.89)];
+    assert.deepStrictEqual(geocodeOutliers(russia), [], 'both tests must pass before anything is named');
+
+    const transSiberian = [pl('Moscow', 55.75, 37.62), pl('Kazan', 55.79, 49.12),
+        pl('Yekaterinburg', 56.84, 60.61), pl('Novosibirsk', 55.03, 82.92),
+        pl('Irkutsk', 52.29, 104.28), pl('Vladivostok', 43.12, 131.89)];
+    assert.deepStrictEqual(geocodeOutliers(transSiberian), []);
+});
+
+test('G4: both wrong-continent geocodes from the report are caught, at every trip size', function () {
+    const texas = N_SPAIN.map(function (p) {
+        return p.name === 'Leon' ? pl('Leon', 31.2715127, -95.9953382, 'Leon County, Texas, United States') : p;
+    });
+    const found = geocodeOutliers(texas);
+    assert.strictEqual(found.length, 1);
+    assert.strictEqual(found[0].name, 'Leon');
+    assert.ok(found[0].displayName.indexOf('Texas') !== -1);
+
+    /* The rule must not depend on the trip being long. */
+    for (let n = 3; n <= N_SPAIN_BROKEN.length; n++) {
+        const hit = geocodeOutliers(N_SPAIN_BROKEN.slice(0, n));
+        assert.strictEqual(hit.length, 1, n + ' places: still exactly one outlier');
+        assert.strictEqual(hit[0].name, 'Santillana de Mar', n + ' places');
+    }
+});
+
+test('G4: two wrong places are both named, furthest first and deterministically', function () {
+    const both = N_SPAIN_BROKEN.map(function (p) {
+        return p.name === 'Leon' ? pl('Leon', 31.2715127, -95.9953382, 'Leon County, Texas, United States') : p;
+    });
+    const found = geocodeOutliers(both);
+    assert.strictEqual(found.length, 2);
+    assert.ok(found[0].km >= found[1].km, 'furthest first');
+    assert.deepStrictEqual(found.map(function (f) { return f.name; }).slice().sort(),
+        ['Leon', 'Santillana de Mar']);
+    assert.deepStrictEqual(geocodeOutliers(both), found, 'same input, same output');
+});
+
+test('G4: it is pure and synchronous — no network, no clock, no storage, no mutation', function () {
+    const input = N_SPAIN_BROKEN.slice();
+    const snapshot = JSON.parse(JSON.stringify(input));
+
+    const exploding = function () { throw new Error('geocodeOutliers must not reach for this'); };
+    const found = geocodeOutliers(input, {
+        fetchImpl: exploding, sleepImpl: exploding, now: exploding,
+        storage: { getItem: exploding, setItem: exploding, removeItem: exploding }
+    });
+
+    assert.ok(Array.isArray(found), 'a plain array, not a Promise');
+    assert.strictEqual(typeof found.then, 'undefined');
+    assert.strictEqual(found.length, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(input)), snapshot, 'the input is untouched');
+});
+
+test('G4: degenerate inputs never throw', function () {
+    const one = [pl('Alone', 40, -3)];
+    const two = [pl('A', 40, -3), pl('B', 22, -100)];
+    const identical = [pl('A', 40, -3), pl('B', 40, -3), pl('C', 40, -3), pl('D', 40, -3)];
+    const dupNames = [pl('Madrid', 40.42, -3.70), pl('Madrid', 40.42, -3.70), pl('Madrid', 40.42, -3.70)];
+    const unresolved = N_SPAIN.map(function (p) {
+        return { name: p.name, lat: null, lon: null, resolved: false, source: 'osm',
+                 displayName: '', candidates: 0, chosenByCluster: false };
+    });
+
+    const cases = [
+        ['no argument', undefined], ['null', null], ['a number', 42], ['a string', 'Madrid'],
+        ['empty', []], ['one place', one], ['two places', two],
+        ['identical coordinates (median spread is zero)', identical],
+        ['duplicate names', dupNames], ['every place unresolved', unresolved],
+        ['holes and junk', [null, undefined, 42, 'x', {}, { lat: 'abc', lon: null }, pl('Real', 40, -3)]],
+        ['out-of-range coordinates', [{ lat: 9999, lon: -77777, resolved: true, name: 'Bad' },
+            pl('A', 40, -3), pl('B', 41, -3), pl('C', 42, -3)]],
+        ['a place with no displayName', [{ name: 'X', lat: 40, lon: -3, resolved: true },
+            { name: 'Y', lat: 41, lon: -3, resolved: true }, { name: 'Z', lat: 42, lon: -3, resolved: true }]],
+        ['resolved:false alongside good ones',
+            [Object.assign({}, pl('Ghost', 22, -100), { resolved: false })].concat(N_SPAIN.slice(0, 4))]
+    ];
+    cases.forEach(function (c) {
+        let out;
+        assert.doesNotThrow(function () { out = geocodeOutliers(c[1]); }, c[0] + ' must not throw');
+        assert.ok(Array.isArray(out), c[0] + ' returns an array');
+        out.forEach(function (o) {
+            assert.strictEqual(typeof o.name, 'string', c[0] + ': name');
+            assert.strictEqual(typeof o.displayName, 'string', c[0] + ': displayName');
+            assert.ok(Number.isFinite(o.km) && o.km >= 0, c[0] + ': km is a finite distance');
+        });
+    });
+
+    assert.deepStrictEqual(geocodeOutliers(one), [], 'one place has nothing to be far from');
+    assert.deepStrictEqual(geocodeOutliers(two), [],
+        'two places are always equidistant from their own median — no majority to be odd from');
+    assert.deepStrictEqual(geocodeOutliers(identical), [],
+        'zero median spread must not divide, and must not flag');
+    assert.deepStrictEqual(geocodeOutliers(dupNames), []);
+    assert.deepStrictEqual(geocodeOutliers(unresolved), []);
+});
+
+test('G4: zero median spread plus one distant place still names it', function () {
+    /* The complement of the case above: the spread is 0, so the tests read 0 > 0 for the
+       cluster and km > 0 for the stray. Multiplication, never division. */
+    const stacked = [pl('A', 40, -3), pl('B', 40, -3), pl('C', 40, -3),
+                     pl('Mexico', 22.1356454, -100.9519141, 'San Luis Potosi, Mexico')];
+    const found = geocodeOutliers(stacked);
+    assert.strictEqual(found.length, 1);
+    assert.strictEqual(found[0].name, 'Mexico');
+    assert.ok(found[0].km > 8000);
+});
+
+test('G4: half wrong is honestly unanswerable, and says nothing rather than guessing', function () {
+    /* Six in Spain and six in Mexico: the median centre is mid-Atlantic and the median
+       spread is thousands of km, so no place is an outlier. There is no majority to be
+       odd from, and inventing one would be exactly the failure this branch exists to
+       kill. This is why displayName is mandatory rather than a fallback. */
+    const split = N_SPAIN.slice(0, 6).concat([
+        pl('Leon MX', 21.122, -101.683), pl('Santillana MX', 22.136, -100.952),
+        pl('Merida MX', 20.967, -89.617), pl('Puebla MX', 19.041, -98.206),
+        pl('Oaxaca MX', 17.062, -96.725), pl('Toluca MX', 19.292, -99.654)
+    ]);
+    assert.deepStrictEqual(geocodeOutliers(split), [],
+        'geometry has nothing to say here, so it says nothing');
+});
+
+test('G4: thresholds are injectable, and both are load-bearing', function () {
+    assert.strictEqual(geo.GEO_OUTLIER_MULTIPLE, 15);
+    assert.strictEqual(geo.GEO_OUTLIER_MIN_KM, 5000);
+    assert.strictEqual(geo.GEO_GEOCODE_LIMIT, 5);
+
+    /* Dropping the floor to zero exposes the ratio alone — and the hub-and-spoke case it
+       would wrongly flag, which is the evidence the floor exists on. */
+    const hub = cityStops('London', 51.507, -0.128).concat([pl('Edinburgh', 55.953, -3.188)]);
+    assert.deepStrictEqual(geocodeOutliers(hub), [], 'silent with the shipped floor');
+    assert.strictEqual(geocodeOutliers(hub, { outlierMinKm: 0 }).length, 1,
+        'and loud without it — the floor is not decoration');
+
+    /* Likewise the multiple: without it, a real continental drive is condemned. */
+    const russia = [pl('Moscow', 55.75, 37.62), pl('St Petersburg', 59.94, 30.31),
+                    pl('Kazan', 55.79, 49.12), pl('Vladivostok', 43.12, 131.89)];
+    assert.deepStrictEqual(geocodeOutliers(russia), []);
+    assert.strictEqual(geocodeOutliers(russia, { outlierMultiple: 4 }).length, 1,
+        'the multiple is load-bearing too');
+});
+
+test('G4: longitude is circular — a Pacific trip is not placed on the far side of the world', function () {
+    /* A plain median of 174 and -171 is 1.5, in Africa, which would make every place in
+       the trip look thousands of km from its own centre. The circle is cut at the widest
+       empty gap instead, so the points form a single arc before the median is taken. */
+    const pacific = [pl('Auckland', -36.85, 174.76), pl('Suva', -18.14, 178.44),
+                     pl('Nadi', -17.80, 177.44), pl('Apia', -13.83, -171.77),
+                     pl('Nukualofa', -21.14, -175.20)];
+    assert.deepStrictEqual(geocodeOutliers(pacific), [], 'a real Pacific itinerary is coherent');
+
+    /* And the detector still works across the antimeridian. */
+    const withStray = pacific.concat([pl('Lisbon', 38.72, -9.14, 'Lisboa, Portugal')]);
+    const found = geocodeOutliers(withStray);
+    assert.strictEqual(found.length, 1, 'a genuine stray is still named');
+    assert.strictEqual(found[0].name, 'Lisbon');
+});
+
+test('G4: end to end — the pipeline reports what it chose AND what looks wrong', async function () {
+    resetGeoRateLimit();
+    const out = await geocodePlaces(USER_TRIP, geoOpts({ fetchImpl: liveFetch() }));
+    const strays = geocodeOutliers(out);
+
+    assert.strictEqual(strays.length, 1, 'the Mexican village is named, and only it');
+    assert.strictEqual(strays[0].name, 'Santillana de Mar');
+    assert.ok(strays[0].displayName.indexOf('Mexico') !== -1, 'and the note can say what was chosen');
+
+    /* Everything the UI needs to explain the 24,179 km plan, without deciding for him. */
+    assert.strictEqual(byName(out, 'Leon').chosenByCluster, true, 'a relocation, declared');
+    assert.strictEqual(byName(out, 'Finisterre').chosenByCluster, false);
+    assert.ok(byName(out, 'Finisterre').displayName.indexOf('France') !== -1,
+        'the Breton Finisterre is not flagged by geometry — but its label names France, ' +
+        'which is the whole reason displayName is not optional');
+    assert.ok(byName(out, 'Fisterra').candidates > 1, 'ambiguity is reported where it exists');
 });
