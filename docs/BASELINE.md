@@ -1,5 +1,17 @@
 # Travio — Functional Baseline (pre-change)
 
+> **This document is a historical record. It describes the app as it was at tag
+> `baseline-pre-routing-fix` (commit 2852c09), not as it is now.** Everything in the
+> "Baseline behaviour of the routing feature" table below has since been replaced:
+> the route is computed by `js/route-engine.js`, distances and times come from a real
+> road graph via `js/geo-provider.js`, and costs and provenance are handled in
+> `js/itinerary-render.js`. See `docs/QUALITY_BAR.md` for where the work landed against
+> the chosen bar, and `docs/ENGINE_CONTRACT.md` for the interfaces.
+>
+> It is kept unedited because the five workflows listed under "Workflows that must not
+> regress" are still the regression contract, and because the table is the evidence for
+> *why* the rewrite was necessary. Do not read it as documentation of current behaviour.
+
 Captured 2026-08-06 from tag `baseline-pre-routing-fix` (commit 2852c09), served via
 `python -m http.server 8099`, driven with Playwright/Chrome at 1440×1000.
 Screenshot: `docs/img/baseline-planner.png`.
