@@ -9,6 +9,12 @@ const TRANSLATIONS = {
             startPoint: 'Punto de partida', startPointPh: 'ej: Madrid',
             endPoint: 'Punto final', endPointPh: 'ej: Madrid (viaje circular)',
             destinations: 'Destinos a visitar', destinationsHint: '(separados por comas)', destinationsPh: 'ej: Santiago, Finisterre, A Coruna',
+            countryScope: 'Paises del viaje', countryScopeHint: '(opcional)',
+            countryScopePh: 'ej: Espana (o ES)', countryScopeAdd: 'Anadir',
+            countryScopeAny: 'Sin limite: los lugares se buscan en todo el mundo.',
+            countryScopeUnknown: 'No reconozco "{name}" como pais. Escribelo en cualquiera de los idiomas de la app, o usa su codigo ISO de dos letras (ES, FR, PT).',
+            countryScopeDuplicate: '{country} ya esta en la lista.',
+            countryScopeRemove: 'Quitar {country}',
             tripType: 'Tipo de viaje',
             family: 'Familiar', couple: 'En pareja', adventure: 'Aventura', motorcycle: 'En moto',
             duration: 'Duracion (dias)', dailyBudget: 'Presupuesto diario (EUR)',
@@ -39,6 +45,16 @@ const TRANSLATIONS = {
             enriching: 'Anadiendo recomendaciones locales',
             done: 'Itinerario listo',
             ratePolicy: 'El servicio de mapas permite una consulta por segundo, asi que esto tarda unos segundos.'
+        },
+        scope: {
+            active: 'Los lugares se buscan solo en: {countries}',
+            progress: 'Buscando solo en {countries}',
+            quietErrors: 'La busqueda se ha limitado a {countries}. Eso evita que un nombre acabe en otro continente, pero no evita que acabe en otro sitio del mismo pais: "Finisterre" existe tambien en Toledo, a 600 km de Fisterra, y ninguna comprobacion automatica puede distinguirlo. Mira abajo donde ha quedado cada lugar.',
+            blocked: 'La ruta no se ha calculado.',
+            notFound: 'No he encontrado "{name}" en {countries}.',
+            notFoundHelp: 'No he ampliado la busqueda al resto del mundo por mi cuenta: eso es justo lo que convierte un pueblo de Cantabria en uno de Mexico. Escribe el nombre con mas precision (anade la comarca o la provincia) o anade el pais que falta a la lista, y genera la ruta otra vez.',
+            savedWith: 'Esta ruta guardada se planifico buscando los lugares solo en {countries}.',
+            savedWithout: 'Esta ruta guardada se planifico sin limitar la busqueda por pais.'
         },
         itin: {
             summary: 'Resumen del viaje',
@@ -158,6 +174,12 @@ const TRANSLATIONS = {
             startPoint: 'Starting point', startPointPh: 'e.g: London',
             endPoint: 'End point', endPointPh: 'e.g: London (round trip)',
             destinations: 'Destinations to visit', destinationsHint: '(comma separated)', destinationsPh: 'e.g: Edinburgh, Glasgow, Inverness',
+            countryScope: 'Countries on this trip', countryScopeHint: '(optional)',
+            countryScopePh: 'e.g: Spain (or ES)', countryScopeAdd: 'Add',
+            countryScopeAny: 'No limit: places are searched worldwide.',
+            countryScopeUnknown: 'I do not recognise "{name}" as a country. Type it in any of the app languages, or use its two-letter ISO code (ES, FR, PT).',
+            countryScopeDuplicate: '{country} is already on the list.',
+            countryScopeRemove: 'Remove {country}',
             tripType: 'Trip type',
             family: 'Family', couple: 'Couple', adventure: 'Adventure', motorcycle: 'Motorcycle',
             duration: 'Duration (days)', dailyBudget: 'Daily budget (EUR)',
@@ -188,6 +210,16 @@ const TRANSLATIONS = {
             enriching: 'Adding local recommendations',
             done: 'Itinerary ready',
             ratePolicy: 'The map service allows one lookup per second, so this takes a few seconds.'
+        },
+        scope: {
+            active: 'Places are searched only in: {countries}',
+            progress: 'Searching only in {countries}',
+            quietErrors: 'The search was limited to {countries}. That stops a name landing on another continent, but not somewhere else in the same country: "Finisterre" also exists in Toledo, 600 km from Fisterra, and no automatic check can tell the two apart. Look below at where each place ended up.',
+            blocked: 'The route was not computed.',
+            notFound: 'I could not find "{name}" in {countries}.',
+            notFoundHelp: 'I did not widen the search to the rest of the world on my own: that is exactly what turns a village in Cantabria into one in Mexico. Write the name more precisely (add the region or the province), or add the missing country to the list, and generate the route again.',
+            savedWith: 'This saved route was planned with places searched only in {countries}.',
+            savedWithout: 'This saved route was planned without limiting the search by country.'
         },
         itin: {
             summary: 'Trip summary',
@@ -307,6 +339,12 @@ const TRANSLATIONS = {
             startPoint: 'Punt de partida', startPointPh: 'ex: Barcelona',
             endPoint: 'Punt final', endPointPh: 'ex: Barcelona (viatge circular)',
             destinations: 'Destinacions a visitar', destinationsHint: '(separades per comes)', destinationsPh: 'ex: Girona, Figueres, Cadaques',
+            countryScope: 'Paisos del viatge', countryScopeHint: '(opcional)',
+            countryScopePh: 'ex: Espanya (o ES)', countryScopeAdd: 'Afegeix',
+            countryScopeAny: 'Sense limit: els llocs es busquen a tot el mon.',
+            countryScopeUnknown: 'No reconec "{name}" com a pais. Escriu-lo en qualsevol dels idiomes de l\'app, o fes servir el seu codi ISO de dues lletres (ES, FR, PT).',
+            countryScopeDuplicate: '{country} ja es a la llista.',
+            countryScopeRemove: 'Treu {country}',
             tripType: 'Tipus de viatge',
             family: 'Familiar', couple: 'En parella', adventure: 'Aventura', motorcycle: 'En moto',
             duration: 'Durada (dies)', dailyBudget: 'Pressupost diari (EUR)',
@@ -337,6 +375,16 @@ const TRANSLATIONS = {
             enriching: 'Afegint recomanacions locals',
             done: 'Itinerari a punt',
             ratePolicy: 'El servei de mapes permet una consulta per segon, per aixo triga uns segons.'
+        },
+        scope: {
+            active: 'Els llocs es busquen nomes a: {countries}',
+            progress: 'Cercant nomes a {countries}',
+            quietErrors: 'La cerca s\'ha limitat a {countries}. Aixo evita que un nom acabi en un altre continent, pero no que acabi en un altre lloc del mateix pais: "Finisterre" tambe existeix a Toledo, a 600 km de Fisterra, i cap comprovacio automatica no ho pot distingir. Mira a sota on ha quedat cada lloc.',
+            blocked: 'La ruta no s\'ha calculat.',
+            notFound: 'No he trobat "{name}" a {countries}.',
+            notFoundHelp: 'No he ampliat la cerca a la resta del mon pel meu compte: aixo es justament el que converteix un poble de Cantabria en un de Mexic. Escriu el nom amb mes precisio (afegeix la comarca o la provincia) o afegeix el pais que falta a la llista, i torna a generar la ruta.',
+            savedWith: 'Aquesta ruta desada es va planificar cercant els llocs nomes a {countries}.',
+            savedWithout: 'Aquesta ruta desada es va planificar sense limitar la cerca per pais.'
         },
         itin: {
             summary: 'Resum del viatge',
@@ -456,6 +504,12 @@ const TRANSLATIONS = {
             startPoint: 'Point de depart', startPointPh: 'ex: Paris',
             endPoint: 'Point d\'arrivee', endPointPh: 'ex: Paris (voyage circulaire)',
             destinations: 'Destinations a visiter', destinationsHint: '(separees par des virgules)', destinationsPh: 'ex: Lyon, Marseille, Nice',
+            countryScope: 'Pays du voyage', countryScopeHint: '(facultatif)',
+            countryScopePh: 'ex: Espagne (ou ES)', countryScopeAdd: 'Ajouter',
+            countryScopeAny: 'Sans limite : les lieux sont cherches dans le monde entier.',
+            countryScopeUnknown: 'Je ne reconnais pas "{name}" comme un pays. Ecrivez-le dans une des langues de l\'application, ou utilisez son code ISO a deux lettres (ES, FR, PT).',
+            countryScopeDuplicate: '{country} est deja dans la liste.',
+            countryScopeRemove: 'Retirer {country}',
             tripType: 'Type de voyage',
             family: 'Famille', couple: 'Couple', adventure: 'Aventure', motorcycle: 'Moto',
             duration: 'Duree (jours)', dailyBudget: 'Budget quotidien (EUR)',
@@ -486,6 +540,16 @@ const TRANSLATIONS = {
             enriching: 'Ajout des recommandations locales',
             done: 'Itineraire pret',
             ratePolicy: 'Le service de cartes autorise une requete par seconde, cela prend donc quelques secondes.'
+        },
+        scope: {
+            active: 'Les lieux sont cherches uniquement dans : {countries}',
+            progress: 'Recherche limitee a {countries}',
+            quietErrors: 'La recherche a ete limitee a {countries}. Cela evite qu\'un nom atterrisse sur un autre continent, mais pas ailleurs dans le meme pays : "Finisterre" existe aussi a Tolede, a 600 km de Fisterra, et aucun controle automatique ne peut les distinguer. Regardez ci-dessous ou chaque lieu a ete situe.',
+            blocked: 'La route n\'a pas ete calculee.',
+            notFound: 'Je n\'ai pas trouve "{name}" dans {countries}.',
+            notFoundHelp: 'Je n\'ai pas elargi la recherche au reste du monde de moi-meme : c\'est precisement ce qui transforme un village de Cantabrie en un village du Mexique. Ecrivez le nom plus precisement (ajoutez la region ou la province), ou ajoutez le pays manquant a la liste, puis generez de nouveau la route.',
+            savedWith: 'Cette route enregistree a ete planifiee en cherchant les lieux uniquement dans {countries}.',
+            savedWithout: 'Cette route enregistree a ete planifiee sans limiter la recherche par pays.'
         },
         itin: {
             summary: 'Resume du voyage',
@@ -605,6 +669,12 @@ const TRANSLATIONS = {
             startPoint: '出发点', startPointPh: '例如：北京',
             endPoint: '终点', endPointPh: '例如：北京（环形旅行）',
             destinations: '要访问的目的地', destinationsHint: '（用逗号分隔）', destinationsPh: '例如：上海、杭州、苏州',
+            countryScope: '行程涉及的国家', countryScopeHint: '（可选）',
+            countryScopePh: '例如：西班牙（或 ES）', countryScopeAdd: '添加',
+            countryScopeAny: '不限范围：在全球搜索地点。',
+            countryScopeUnknown: '无法识别"{name}"这个国家。请用本应用的任一语言输入国家名称，或使用两位 ISO 代码（ES、FR、PT）。',
+            countryScopeDuplicate: '{country} 已在列表中。',
+            countryScopeRemove: '移除 {country}',
             tripType: '旅行类型',
             family: '家庭', couple: '情侣', adventure: '冒险', motorcycle: '摩托车',
             duration: '持续时间（天）', dailyBudget: '每日预算（EUR）',
@@ -635,6 +705,16 @@ const TRANSLATIONS = {
             enriching: '正在添加当地推荐',
             done: '行程已就绪',
             ratePolicy: '地图服务每秒仅允许一次查询，因此需要等待几秒钟。'
+        },
+        scope: {
+            active: '仅在以下国家搜索地点：{countries}',
+            progress: '仅在 {countries} 内搜索',
+            quietErrors: '搜索范围已限定为 {countries}。这能避免地名落到另一个大洲，但无法避免它落到同一国家的其他地方："Finisterre" 在托莱多也有一处，距离 Fisterra 约 600 公里，任何自动检查都无法区分。请查看下方每个地点的实际位置。',
+            blocked: '未计算路线。',
+            notFound: '在 {countries} 内找不到"{name}"。',
+            notFoundHelp: '我没有自行把搜索扩大到世界其他地方：正是这种做法会把坎塔布里亚的村庄变成墨西哥的村庄。请把地名写得更精确（加上地区或省份），或把缺少的国家加入列表，然后重新生成路线。',
+            savedWith: '这条已保存的路线在规划时只在 {countries} 内搜索地点。',
+            savedWithout: '这条已保存的路线在规划时没有限定国家范围。'
         },
         itin: {
             summary: '行程摘要',
@@ -748,6 +828,151 @@ const TRANSLATIONS = {
 };
 
 let currentLang = localStorage.getItem('travio-lang') || 'es';
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   COUNTRY NAMES — for the optional country scope (see COUNTRY SCOPE in
+   js/geo-provider.js, which owns the list of codes and builds the request)
+   ══════════════════════════════════════════════════════════════════════════════
+   WHY THESE ARE NOT IN TRANSLATIONS. 249 countries x 5 locales is 1,245 strings that
+   would have to be typed, reviewed and kept in parity by hand, and every one of them
+   already exists inside the browser: `Intl.DisplayNames` renders a region code in any
+   locale, including Catalan and Chinese ("ES" -> Espana / Spain / Espanya / Espagne /
+   西班牙). Hand-maintaining a copy would mean a curated subset — and a curated subset is
+   a silent decision that some countries are not real trips.
+
+   WHAT HAPPENS WITHOUT Intl.DisplayNames. The code itself is shown ("ES"), the picker
+   still lists every country and still works, and matching accepts codes only. Degraded,
+   never broken, and never silently: the UI shows what it has.
+
+   MATCHING IS ACROSS ALL FIVE LOCALES AT ONCE, not just the current one. A Spanish user
+   who types "Spain" or "France" means the same thing a French one does, and refusing
+   them would be a puzzle with no clue in it. The two-letter ISO code is always accepted.
+   Anything that matches nothing is REJECTED and named — never dropped, because a scope
+   quietly narrowed by a typo is a search the user did not ask for. */
+
+const COUNTRY_LOCALES = ['es', 'en', 'ca', 'fr', 'zh'];
+const COUNTRY_DISPLAY = {};       /* lang -> Intl.DisplayNames | null */
+let COUNTRY_INDEX = null;         /* normalised name -> [code, ...] */
+let COUNTRY_INDEX_KEY = '';
+
+function countryDisplayNames(lang) {
+    if (Object.prototype.hasOwnProperty.call(COUNTRY_DISPLAY, lang)) return COUNTRY_DISPLAY[lang];
+    let d = null;
+    try {
+        if (typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function') {
+            d = new Intl.DisplayNames([lang], { type: 'region' });
+        }
+    } catch (e) { d = null; }
+    COUNTRY_DISPLAY[lang] = d;
+    return d;
+}
+
+/* The authoritative code list lives in the geo provider, so the form can never offer a
+   country the request would reject. Read lazily: i18n.js loads before geo-provider.js. */
+function countryCodeList(codes) {
+    if (Array.isArray(codes) && codes.length) return codes;
+    const g = (typeof window !== 'undefined' && window.TravioGeo) ? window.TravioGeo : null;
+    return (g && Array.isArray(g.COUNTRY_CODES)) ? g.COUNTRY_CODES : [];
+}
+
+/** Localised country name, or the upper-case code when nothing can render it. */
+function countryName(code, lang) {
+    const c = String(code || '').trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(c)) return String(code || '');
+    const d = countryDisplayNames(lang || currentLang);
+    if (!d) return c;
+    try {
+        const n = d.of(c);
+        return (typeof n === 'string' && n) ? n : c;
+    } catch (e) { return c; }
+}
+
+/** ['es','fr'] -> 'Espana, Francia' — for every message that names the scope. */
+function countryNames(codes, lang) {
+    const list = Array.isArray(codes) ? codes : [];
+    const out = [];
+    for (let i = 0; i < list.length; i++) out.push(countryName(list[i], lang));
+    return out.join(', ');
+}
+
+/** [{ code, name }] sorted by the localised name — the picker's option list. */
+function countryOptions(lang, codes) {
+    const list = countryCodeList(codes);
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+        out.push({ code: String(list[i]).toLowerCase(), name: countryName(list[i], lang) });
+    }
+    out.sort(function (a, b) {
+        try { return a.name.localeCompare(b.name, lang || currentLang); }
+        catch (e) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); }
+    });
+    return out;
+}
+
+/* Fold to something a typist can hit: lower case, no accents, and LETTERS AND DIGITS
+   ONLY — no spaces, no punctuation. CLDR writes "Côte d’Ivoire" with a typographic
+   apostrophe nobody has on a keyboard, and "Guinea-Bissau" and "Timor-Leste" with a
+   hyphen half the world omits; folding those away is the difference between a picker
+   that finds the country and one that says it does not exist.
+   \p{L} keeps Chinese, Greek and Cyrillic names intact; the ASCII fallback exists only
+   for an engine without Unicode property escapes, where the range keeps CJK too. */
+const COUNTRY_STRIP = (function () {
+    try { return new RegExp('[^\\p{L}\\p{N}]', 'gu'); }
+    catch (e) { return /[^a-z0-9Ѐ-퟿豈-﫿]/g; }
+})();
+
+function normaliseCountryText(text) {
+    let s = (text === null || text === undefined) ? '' : String(text);
+    s = s.trim().toLowerCase();
+    if (typeof s.normalize === 'function') s = s.normalize('NFD').replace(/[̀-ͯ]/g, '');
+    return s.replace(COUNTRY_STRIP, '');
+}
+
+function countryIndex(codes) {
+    const list = countryCodeList(codes);
+    const key = list.length + ':' + (list[0] || '') + ':' + (list[list.length - 1] || '');
+    if (COUNTRY_INDEX && COUNTRY_INDEX_KEY === key) return COUNTRY_INDEX;
+    const idx = Object.create(null);
+    for (let i = 0; i < list.length; i++) {
+        const code = String(list[i]).toLowerCase();
+        for (let l = 0; l < COUNTRY_LOCALES.length; l++) {
+            const n = normaliseCountryText(countryName(code, COUNTRY_LOCALES[l]));
+            if (!n) continue;
+            if (!idx[n]) idx[n] = [];
+            if (idx[n].indexOf(code) === -1) idx[n].push(code);
+        }
+    }
+    COUNTRY_INDEX = idx;
+    COUNTRY_INDEX_KEY = key;
+    return idx;
+}
+
+/**
+ * Typed text -> ISO 3166-1 alpha-2 code, or null when it is not a country.
+ * null is an ANSWER, not a failure to be smoothed over: the caller shows it and adds
+ * nothing. Two names that fold to the same string (across locales) are resolved in
+ * favour of the current language, and otherwise by code order, so the result never
+ * depends on which locale happened to be indexed first.
+ */
+function countryLookup(text, codes, lang) {
+    const raw = (text === null || text === undefined) ? '' : String(text).trim();
+    if (!raw) return null;
+    const list = countryCodeList(codes);
+    if (/^[a-zA-Z]{2}$/.test(raw)) {
+        const c = raw.toLowerCase();
+        for (let i = 0; i < list.length; i++) {
+            if (String(list[i]).toLowerCase() === c) return c;
+        }
+    }
+    const hits = countryIndex(codes)[normaliseCountryText(raw)];
+    if (!hits || !hits.length) return null;
+    if (hits.length === 1) return hits[0];
+    const want = normaliseCountryText(raw);
+    for (let i = 0; i < hits.length; i++) {
+        if (normaliseCountryText(countryName(hits[i], lang || currentLang)) === want) return hits[i];
+    }
+    return hits.slice().sort()[0];
+}
 
 /** Dot-notation key lookup: t('form.startPoint') */
 function t(key) {

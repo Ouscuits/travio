@@ -17,12 +17,15 @@
  *   distanceMatrix(places, opts)-> Promise<Matrix>      OSRM table, haversine fallback
  *   routeGeometry(places, opts) -> Promise<[lat,lon][]> OSRM route polyline, straight fallback
  *   decodePolyline, haversineKm, normalisePlaceName, clearGeoCache
+ *   normaliseCountries(list) -> ['es','fr']   valid ISO 3166-1 alpha-2, sorted, deduped
+ *   countryScope(list) -> { codes, rejected } the same, with what was NOT a country
+ *   COUNTRY_CODES                             the 249 assigned codes, for the UI's list
  *   (`resetGeoRateLimit` is a Node-only test seam — see RATE LIMITING below)
  *
  * Injection seam — every network/time/storage dependency can be stubbed:
  *   opts = { fetchImpl, sleepImpl, now, storage, minIntervalMs, cacheTtlMs,
  *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, maxSnapKm,
- *            roadFactor, speedKmh, userAgent, language, geocodeLimit,
+ *            roadFactor, speedKmh, userAgent, language, geocodeLimit, countries,
  *            clusterMinAnchors, clusterMoveKm, clusterLinkKm,
  *            outlierMultiple, outlierMinKm, outlierMinPlaces }
  *
@@ -126,6 +129,52 @@
  *   majority, the anchor moves onto them. That is why every relocation is flagged, and
  *   why `displayName` is mandatory rather than a nicety — it is the ONE signal in this
  *   file that does not depend on the errors being outnumbered.
+ *
+ * COUNTRY SCOPE — opts.countries, OPTIONAL, EMPTY BY DEFAULT.
+ *   The app still cannot know the user meant Spain. It can ASK, and when the user answers
+ *   the answer is passed to Nominatim as `countrycodes=`, which is the only signal in this
+ *   file that is not a guess about geometry. Measured live against Nominatim, 2026-08:
+ *       'Leon'              no filter -> Leon County, Texas       +es -> Leon, Castilla y Leon   FIXED
+ *       'Santillana de Mar' no filter -> San Luis Potosi, Mexico  +es -> Santillana del Mar      FIXED
+ *       'Finisterre'        no filter -> Finistere, Brittany      +es -> Finisterre, Toledo      STILL WRONG
+ *       'Fisterra'          correct in both
+ *   Both of the user's real trips resolve correctly with the scope set to Spain.
+ *
+ *   PROXIMITY BIAS WAS MEASURED AND REJECTED. Nominatim's `viewbox`+`bounded=0` biased
+ *   around the start point — the Google/Waze-shaped alternative — was tried live on the
+ *   same names: Santillana stayed in Mexico, Finisterre stayed in Brittany, and 'Leon'
+ *   moved from Texas to Landes, FRANCE. It is a ranking hint, not a constraint, and it
+ *   did not fix a single one of the three. Do not reintroduce it.
+ *
+ *   THE FILTER CONVERTS LOUD ERRORS INTO QUIET ONES, and that is the cost. Without it,
+ *   "Finistere, Bretagne, France" produces 24,179 km and 268 h — a number nobody can miss,
+ *   and geocodeOutliers names the Mexican one outright. With it, "Finisterre, Mora,
+ *   Toledo" is a perfectly plausible Spanish village 600 km from where the user meant,
+ *   inside an itinerary whose totals look ordinary. NO detector in this file will ever
+ *   flag it: the outlier floor is 5,000 km and the multiple 15x, both derived from
+ *   measurement and both deliberately blind to sub-thousand-km errors (see OUTLIERS).
+ *   The filter is still clearly net-positive — it fixes two of the three real failures
+ *   and it fails within one country instead of across an ocean — but it makes
+ *   `displayName` MORE important, not less: with a scope set, the label is the ONLY thing
+ *   left that can catch the remaining class of error. The UI must keep it prominent.
+ *
+ *   NO WORLDWIDE FALLBACK, EVER. When the geocoder answers "nothing here" inside the
+ *   chosen countries, this module reports `resolved: false` with `error: 'not-in-scope'`
+ *   and the scope that was in force, and stops. Retrying without the filter would
+ *   reintroduce the entire Mexico bug through the back door while looking like a
+ *   kindness, and it would do it silently. The user corrects the name or widens the
+ *   scope; the module does not choose for them.
+ *   `error` distinguishes the three ways a lookup can come back empty, because they call
+ *   for different things from the user:
+ *       'lookup-failed'  no usable answer arrived (network, HTTP, garbage body) — the
+ *                        scope proves nothing about the place, so the UI must not blame it
+ *       'not-found'      the geocoder returned an EMPTY result set, no scope in force
+ *       'not-in-scope'   the geocoder returned an EMPTY result set WITH a scope in force
+ *
+ *   THE CACHE IS KEYED BY THE SCOPE AS WELL AS THE NAME. A worldwide entry for 'Leon'
+ *   holding Texas must never be served to a Spain-scoped lookup: that is the same silent
+ *   fallback, arriving from localStorage instead of from the network. Unscoped keys keep
+ *   their old shape, so nothing already cached is orphaned.
  *
  * OUTLIERS — geocodeOutliers(places, opts) -> [{ name, displayName, km }]
  *   PURE and SYNCHRONOUS: no network, no clock, no storage, no globals. Places whose
@@ -528,6 +577,30 @@
     const GEO_OUTLIER_MIN_PLACES  = 3;      // two places are always equidistant from
                                             // their own median: nothing to compare
 
+    /* ISO 3166-1 alpha-2, the 249 officially assigned codes — the ONLY values that may
+       reach `countrycodes=`. A code the standard does not assign is not a country the
+       user could have meant, and forwarding it would send a filter that quietly matches
+       nothing: every place would come back 'not-in-scope' and the reason would be a typo
+       the app never mentioned. Rejected loudly at the edge instead (see normaliseCountries).
+       This list is also what the UI enumerates, so the app and the request agree on what
+       a country is by construction rather than by two lists staying in step. */
+    const GEO_COUNTRY_CODES = ('ad ae af ag ai al am ao aq ar as at au aw ax az ' +
+        'ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz ' +
+        'ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz ' +
+        'de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr ' +
+        'ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu ' +
+        'id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz ' +
+        'la lb lc li lk lr ls lt lu lv ly ' +
+        'ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz ' +
+        'na nc ne nf ng ni nl no np nr nu nz om ' +
+        'pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw ' +
+        'sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz ' +
+        'tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug um us uy uz ' +
+        'va vc ve vg vi vn vu wf ws ye yt za zm zw').split(' ');
+
+    const GEO_COUNTRY_SET = Object.create(null);
+    for (let i = 0; i < GEO_COUNTRY_CODES.length; i++) GEO_COUNTRY_SET[GEO_COUNTRY_CODES[i]] = true;
+
     /* ── Environment seams (all lazy, all guarded) ── */
     function geoGlobalObject() {
         if (typeof globalThis !== 'undefined') return globalThis;
@@ -576,6 +649,9 @@
             speedKmh:       typeof o.speedKmh === 'number' && o.speedKmh > 0 ? o.speedKmh : GEO_SPEED_KMH,
             userAgent:      o.userAgent || '',
             language:       o.language || '',
+            /* Always an array. Absent, null, '' and [] are the same thing: no filter,
+               worldwide search, today's behaviour for every caller that never sets it. */
+            countries:      normaliseCountries(o.countries),
             geocodeLimit:   typeof o.geocodeLimit === 'number' && o.geocodeLimit >= 1
                                 ? Math.floor(o.geocodeLimit) : GEO_GEOCODE_LIMIT,
             clusterMinAnchors: typeof o.clusterMinAnchors === 'number' && o.clusterMinAnchors >= 1
@@ -645,6 +721,50 @@
             s = s.normalize('NFD').replace(/[̀-ͯ]/g, '');
         }
         return s.replace(/\s+/g, ' ');
+    }
+
+    /*
+     * The country scope, normalised: lowercase, deduplicated, sorted, and containing only
+     * assigned ISO 3166-1 alpha-2 codes. ALWAYS an array, never null — "no scope" is the
+     * empty array and behaves exactly as an absent option does, which is what every
+     * document written before this field existed will present.
+     *
+     * SORTED because the array is part of the cache key, and ['es','fr'] and ['fr','es']
+     * are the same scope; an unsorted key would fetch the same answer twice and store it
+     * under two names. Nominatim does not rank by the order of `countrycodes`.
+     *
+     * SILENTLY DROPPING AN UNRECOGNISED CODE IS THE ONE THING THIS MUST NOT DO — a scope
+     * of ['es','xx'] narrowed to ['es'] is a search the user did not ask for, and a scope
+     * of ['xx'] alone would collapse to no filter at all, i.e. the worldwide fallback this
+     * whole feature exists to refuse. So the caller is told: `rejected` lists every entry
+     * that is not a country, and a scope containing one is not usable until it is fixed.
+     * `normaliseCountries` returns just the codes for the common path; `countryScope`
+     * returns both halves for the UI, which is the one place that can ask the user.
+     */
+    function countryScope(input) {
+        const raw = Array.isArray(input) ? input : (input === null || input === undefined || input === '' ? [] : [input]);
+        const codes = [];
+        const rejected = [];
+        const seen = Object.create(null);
+        for (let i = 0; i < raw.length; i++) {
+            const v = raw[i];
+            if (typeof v !== 'string' && typeof v !== 'number') {
+                if (v !== null && v !== undefined) rejected.push(String(v));
+                continue;
+            }
+            const s = String(v).trim().toLowerCase();
+            if (!s) continue;
+            if (!GEO_COUNTRY_SET[s]) { rejected.push(String(v).trim()); continue; }
+            if (seen[s]) continue;
+            seen[s] = true;
+            codes.push(s);
+        }
+        codes.sort();
+        return { codes: codes, rejected: rejected };
+    }
+
+    function normaliseCountries(input) {
+        return countryScope(input).codes;
     }
 
     /* A label is a string or it is nothing. Capped, so a hostile or broken body cannot
@@ -899,13 +1019,26 @@
     }
 
     /* ── localStorage cache (no-ops safely when storage is unavailable) ── */
-    function geoCacheKey(name) {
-        return GEO_CACHE_PREFIX + normalisePlaceName(name);
+    /*
+     * THE SCOPE IS PART OF THE KEY. 'Leon' looked up worldwide is Leon County, Texas;
+     * 'Leon' looked up inside Spain is Leon, Castilla y Leon. They are answers to two
+     * different questions and must not share a slot — serving the cached worldwide entry
+     * to a Spain-scoped lookup is the silent worldwide fallback again, arriving from
+     * localStorage instead of from the network, and it would be invisible.
+     * An UNSCOPED key keeps exactly its old shape (prefix + normalised name), so every
+     * entry already in a user's browser stays readable and clearGeoCache still finds
+     * both kinds by prefix. The scope segment ends in '#', which normalisePlaceName can
+     * never produce at that position, so the two namespaces cannot collide.
+     */
+    function geoCacheKey(name, cfg) {
+        const codes = cfg && Array.isArray(cfg.countries) ? cfg.countries : [];
+        const scope = codes.length ? codes.join(',') + '#' : '';
+        return GEO_CACHE_PREFIX + scope + normalisePlaceName(name);
     }
 
     function geoCacheDrop(name, cfg) {
         if (!cfg.storage || typeof cfg.storage.removeItem !== 'function') return;
-        try { cfg.storage.removeItem(geoCacheKey(name)); } catch (e) { /* ignore */ }
+        try { cfg.storage.removeItem(geoCacheKey(name, cfg)); } catch (e) { /* ignore */ }
     }
 
     /*
@@ -947,7 +1080,7 @@
     function geoCacheRead(name, cfg) {
         if (!cfg.storage) return null;
         let raw = null;
-        try { raw = cfg.storage.getItem(geoCacheKey(name)); } catch (e) { return null; }
+        try { raw = cfg.storage.getItem(geoCacheKey(name, cfg)); } catch (e) { return null; }
         if (!raw) return null;
 
         let entry = null;
@@ -987,7 +1120,7 @@
             cands.push([list[i].lat, list[i].lon, list[i].displayName]);
         }
         try {
-            cfg.storage.setItem(geoCacheKey(name), JSON.stringify({
+            cfg.storage.setItem(geoCacheKey(name, cfg), JSON.stringify({
                 lat: list[0].lat, lon: list[0].lon,
                 displayName: list[0].displayName || '',
                 ts: cfg.now(), cands: cands
@@ -1022,8 +1155,16 @@
      * because it never asked. It is the SAME request either way — no extra round trip,
      * no extra spacing, nothing the OSM usage policy notices.
      */
+    /*
+     * `countrycodes` is appended only when the user set a scope. It is a HARD filter at
+     * the geocoder, not a ranking hint: Nominatim returns an empty set rather than a
+     * result from elsewhere, which is exactly the property this feature needs and exactly
+     * what `viewbox` proximity bias could not provide (see COUNTRY SCOPE in the header).
+     */
     function geoNominatimUrl(name, cfg) {
-        return cfg.nominatimUrl + '?format=jsonv2&limit=' + cfg.geocodeLimit +
+        const scope = (cfg.countries && cfg.countries.length)
+            ? '&countrycodes=' + encodeURIComponent(cfg.countries.join(',')) : '';
+        return cfg.nominatimUrl + '?format=jsonv2&limit=' + cfg.geocodeLimit + scope +
                '&q=' + encodeURIComponent(name);
     }
 
@@ -1250,7 +1391,8 @@
             }
 
             /* Network path — serialised and throttled through the shared queue. */
-            const hit = geoParseNominatim(await geoRequest(geoNominatimUrl(name, cfg), cfg), cfg);
+            const body = await geoRequest(geoNominatimUrl(name, cfg), cfg);
+            const hit = geoParseNominatim(body, cfg);
 
             if (hit) {
                 localCache.set(key, hit);
@@ -1258,8 +1400,26 @@
                 candidateLists[i] = hit;
                 out[i] = geoPlaceFromCandidates(name, hit, 'osm');
             } else {
+                /*
+                 * NOT REACHING THE GEOCODER IS NOT EVIDENCE ABOUT THE PLACE. Only an
+                 * explicitly EMPTY result set says "there is no such place here"; a null
+                 * body (network down, HTTP error, timeout) or a body that parsed to
+                 * nothing usable says only that the question was not answered. Blaming
+                 * the country scope for an outage would send the user off editing a
+                 * perfectly good trip — and, worse, tempt them to widen a scope that was
+                 * never the problem. So the two are reported separately, and only the
+                 * empty set is attributed to the scope.
+                 * NOTHING IS RETRIED WITHOUT THE FILTER. See COUNTRY SCOPE in the header:
+                 * a worldwide second attempt is the original bug wearing a helpful face.
+                 */
+                const emptyAnswer = Array.isArray(body) && body.length === 0;
+                const extra = {
+                    error: !emptyAnswer ? 'lookup-failed'
+                        : (cfg.countries.length ? 'not-in-scope' : 'not-found')
+                };
+                if (cfg.countries.length) extra.countries = cfg.countries.slice();
                 /* Failures are NOT cached — a transient outage must not poison the cache. */
-                out[i] = geoMakePlace(name, null, null, 'osm', { error: 'not-found' });
+                out[i] = geoMakePlace(name, null, null, 'osm', extra);
             }
         }
 
@@ -1864,6 +2024,12 @@
         normalisePlaceName: normalisePlaceName,
         clearGeoCache: clearGeoCache,
         resetGeoRateLimit: resetGeoRateLimit,
+        /* The country scope, published so the UI validates against the SAME list the
+           request is built from — two lists of countries would drift, and the drift
+           would show up as a place mysteriously "not in scope". */
+        normaliseCountries: normaliseCountries,
+        countryScope: countryScope,
+        COUNTRY_CODES: GEO_COUNTRY_CODES.slice(),
         GEO_MIN_INTERVAL_MS: GEO_MIN_INTERVAL_MS,
         GEO_ROAD_FACTOR: GEO_ROAD_FACTOR,
         GEO_SPEED_KMH: GEO_SPEED_KMH,
@@ -1894,6 +2060,7 @@
         window.haversineKm        = haversineKm;
         window.normalisePlaceName = normalisePlaceName;
         window.clearGeoCache      = clearGeoCache;
+        window.normaliseCountries = normaliseCountries;
     }
 
     if (typeof module !== 'undefined' && module.exports) {

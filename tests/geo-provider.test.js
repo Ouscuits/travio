@@ -1307,7 +1307,11 @@ test('geometry: unresolved places are skipped and thin input needs no request', 
    a way to break the OSM usage policy from the page. See the D5b test below. */
 const DOCUMENTED_GLOBALS = [
     'TravioGeo', 'geocodePlaces', 'geocodeOutliers', 'distanceMatrix', 'routeGeometry',
-    'decodePolyline', 'haversineKm', 'normalisePlaceName', 'clearGeoCache'
+    'decodePolyline', 'haversineKm', 'normalisePlaceName', 'clearGeoCache',
+    /* The country scope validator: the form has to reject a name that is not a country
+       BEFORE a request is built, and it must do so against the same list the request is
+       built from — see COUNTRY SCOPE in the provider header. */
+    'normaliseCountries'
 ];
 
 function loadInFakeBrowser(times) {
@@ -3454,4 +3458,406 @@ test('G6: swapping one wrong continent for another is not an improvement', async
     assert.strictEqual(moved.chosenByCluster, true, 'without the rule it is relocated...');
     assert.ok(moved.displayName.indexOf('Dominicana') !== -1,
         '...to the Dominican Republic, which helps nobody: ' + moved.displayName);
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   S1-S9: COUNTRY SCOPE — the optional `countrycodes=` filter
+
+   The user whose trip produced 24,179 km asked for exactly this: let me say which
+   countries I am visiting. Measured live against nominatim.openstreetmap.org on
+   2026-08-07, with a User-Agent and >=1100 ms spacing:
+
+       'Leon'              no filter -> Leon County, Texas       +es -> Leon, Castilla y Leon
+       'Santillana de Mar' no filter -> San Luis Potosi, Mexico  +es -> Santillana del Mar, Cantabria
+       'Finisterre'        no filter -> Finistere, Brittany      +es -> Finisterre, Mora, Toledo
+       'Fisterra'          correct in both
+
+   Every candidate list in LIVE_ES below is that measurement, verbatim. Nothing here
+   touches the network.
+
+   THE THIRD LINE IS THE COST OF THE FEATURE and S4 pins it: the filter turns a
+   LOUD error (a 268-hour itinerary) into a QUIET one (a plausible Spanish village
+   600 km from the intended one) that no check in this module can detect. That is
+   why the header says the scope makes `displayName` MORE important, not less.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const { normaliseCountries, countryScope, COUNTRY_CODES } = geo;
+
+/* Live replies WITH `countrycodes=es`, measured 2026-08-07. */
+const LIVE_ES = {
+    'Santillana de Mar': [
+        [43.3922891, -4.106163, 'Colegiata de Santillana del Mar, Plaza de las Arenas, Santillana del Mar, Cantabria, 39330, Espana'],
+        [43.3806637, -4.1031598, 'Zoologico de Santillana del Mar, 2, Avenida del Zoo, Vispieres, Santillana del Mar, Cantabria, 39330, Espana'],
+        [43.3967148, -4.1145215, 'Cementerio de Santillana del Mar, Arroyo, Santillana del Mar, Cantabria, 39360, Espana'],
+        [40.4043235, -3.8801532, 'Calle de Santillana del Mar, Residencial Siglo XXI, Boadilla del Monte, Comunidad de Madrid, 28660, Espana'],
+        [40.4022186, -3.8817398, 'Calle de Santillana del Mar, Residencial Siglo XXI, Boadilla del Monte, Comunidad de Madrid, 28660, Espana']],
+    'Leon': [
+        [42.6341451, -5.9714151, 'Leon, Castilla y Leon, Espana'],
+        [42.5934528, -5.5616416, 'Leon, Castilla y Leon, Espana']],
+    'Fisterra': [
+        [42.9286659, -9.2626624, 'Fisterra, A Coruna, Galicia, Espana'],
+        [42.8825, -9.2722222, 'Cabo Fisterra, Fisterra, A Coruna, Galicia, 15155, Espana'],
+        [43.0046737, -9.1318361, 'Fisterra, A Coruna, Galicia, Espana']],
+    'Lugo': [
+        [43.0395266, -7.4567985, 'Lugo, Galicia, Espana'],
+        [42.9913123, -7.5908294, 'Lugo, Galicia, Espana'],
+        [42.961254, -7.5243782, 'Lugo, Galicia, Espana']],
+    'Finisterre': [
+        [39.6161354, -3.7435585, 'Finisterre, Mora, Toledo, Castilla-La Mancha, 45460, Espana'],
+        [42.9064771, -9.263789, 'Fisterra, A Coruna, Galicia, 15155, Espana'],
+        [42.4957227, -8.8650254, 'Finisterre, Rua Escura, As Laxes, A Vilavella, O Grove, O Salnes, Pontevedra, Galicia, 36980, Espana'],
+        [42.8825, -9.2722222, 'Cabo Fisterra, Fisterra, A Coruna, Galicia, 15155, Espana'],
+        [39.6285556, -3.6792789, 'Embalse Finisterre, Turleque, Toledo, Castilla-La Mancha, Espana']],
+    'Barcelona': [
+        [41.3825802, 2.177073, 'Barcelona, Barcelones, Barcelona, Catalunya, Espana'],
+        [41.75787, 2.031182, 'Barcelona, Catalunya, Espana']],
+    'Castellar del Valles': [
+        [41.6138122, 2.0875963, 'Castellar del Valles, Valles Occidental, Barcelona, Catalunya, 08211, Espana']],
+    /* Measured: NO result at all inside Spain. This is the case the UI must be able
+       to explain, and the case a worldwide retry would paper over. */
+    'Ulaanbaatar': [],
+    'Trondheim': []
+};
+
+/* Live reply with `countrycodes=es,fr` — a place that exists in BOTH chosen countries. */
+const LIVE_ES_FR = {
+    'Leon': [
+        [45.7578137, 4.8320114, 'Lyon, Metropole de Lyon, Rhone, Auvergne-Rhone-Alpes, France metropolitaine, France'],
+        [42.6341451, -5.9714151, 'Leon, Castilla y Leon, Espana'],
+        [42.5934528, -5.5616416, 'Leon, Castilla y Leon, Espana'],
+        [43.8751359, -1.302587, 'Leon, Dax, Landes, Nouvelle-Aquitaine, France metropolitaine, 40550, France']]
+};
+
+function rowsToBody(rows) {
+    return rows.map(function (r) {
+        return { lat: String(r[0]), lon: String(r[1]), display_name: r[2] };
+    });
+}
+
+/* Serves the reply that matches BOTH the name and the scope in the URL, so a test
+   cannot accidentally pass by being answered about the wrong question. */
+function scopedLookup(url) {
+    const q = decodeURIComponent(String(url));
+    const m = q.match(/countrycodes=([^&]*)/);
+    const scope = m ? m[1] : '';
+    const table = scope === 'es' ? LIVE_ES : (scope === 'es,fr' ? LIVE_ES_FR : LIVE);
+    const names = Object.keys(table).sort(function (a, b) { return b.length - a.length; });
+    for (let i = 0; i < names.length; i++) {
+        if (q.indexOf('q=' + names[i]) !== -1) return rowsToBody(table[names[i]]);
+    }
+    return [];
+}
+
+function scopedFetch() {
+    return makeFetch(function (url) { return scopedLookup(url); });
+}
+
+/* ── S1: absent by default — a trip that crosses borders must stay possible ── */
+
+test('S1: with no scope the request is exactly what it always was', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function () { return nominatimHit(40.4168, -3.7038, 'Madrid'); });
+    const out = await geocodePlaces(['Madrid'], geoOpts({ fetchImpl: fetchImpl }));
+    assert.strictEqual(out[0].resolved, true);
+    assert.strictEqual(fetchImpl.calls[0].indexOf('countrycodes'), -1,
+        'no filter is sent unless the user asked for one: ' + fetchImpl.calls[0]);
+    /* Empty, null and an absent option are all the same thing. */
+    const empties = [[], null, undefined, '', ['   ']];
+    for (let i = 0; i < empties.length; i++) {
+        resetGeoRateLimit();
+        const f = makeFetch(function () { return nominatimHit(1, 2, 'x'); });
+        await geocodePlaces(['Somewhere'], geoOpts({ fetchImpl: f, countries: empties[i] }));
+        assert.strictEqual(f.calls[0].indexOf('countrycodes'), -1,
+            'an empty scope is no scope: ' + JSON.stringify(empties[i]));
+    }
+});
+
+/* ── S2: what actually goes on the wire ── */
+
+test('S2: the scope reaches Nominatim as countrycodes, normalised and deduped', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = makeFetch(function () { return nominatimHit(42.6, -5.9, 'Leon'); });
+    await geocodePlaces(['Leon'], geoOpts({ fetchImpl: fetchImpl, countries: ['FR', 'es', ' fr ', 'ES'] }));
+    assert.ok(fetchImpl.calls[0].indexOf('countrycodes=es%2Cfr') !== -1 ||
+              fetchImpl.calls[0].indexOf('countrycodes=es,fr') !== -1,
+        'lower-cased, deduplicated and sorted: ' + fetchImpl.calls[0]);
+    assert.ok(fetchImpl.calls[0].indexOf('limit=5') !== -1, 'still asks for candidates');
+    assert.ok(fetchImpl.calls[0].indexOf('format=jsonv2') !== -1, 'still jsonv2');
+});
+
+test('S2: normaliseCountries is total, and countryScope names what it refused', function () {
+    assert.deepStrictEqual(normaliseCountries(['ES', 'es', ' fr ', 'FR']), ['es', 'fr']);
+    assert.deepStrictEqual(normaliseCountries('es'), ['es'], 'a bare string is a scope of one');
+    assert.deepStrictEqual(normaliseCountries([]), []);
+    assert.deepStrictEqual(normaliseCountries(null), []);
+    assert.deepStrictEqual(normaliseCountries(undefined), []);
+    assert.deepStrictEqual(normaliseCountries(42), []);
+    assert.deepStrictEqual(normaliseCountries([null, undefined, '', '   ']), []);
+    assert.deepStrictEqual(normaliseCountries({ es: true }), []);
+    /* Not a country: dropped from the codes AND named, so the caller can say so.
+       Silently narrowing 'es,Narnia' to 'es' would be a search nobody asked for. */
+    const s = countryScope(['es', 'Narnia', 'zz', 'e', 'esp', ['es']]);
+    assert.deepStrictEqual(s.codes, ['es']);
+    assert.deepStrictEqual(s.rejected, ['Narnia', 'zz', 'e', 'esp', 'es'],
+        'every unusable entry is reported, in the order given');
+    assert.deepStrictEqual(countryScope(null), { codes: [], rejected: [] });
+    /* The published list is the one the validator uses — the UI cannot offer a
+       country the request would refuse. */
+    assert.strictEqual(COUNTRY_CODES.length, 249, 'the assigned ISO 3166-1 alpha-2 set');
+    assert.strictEqual(normaliseCountries(COUNTRY_CODES).length, 249,
+        'a scope of every country is legal and unchanged');
+    assert.ok(COUNTRY_CODES.indexOf('es') !== -1 && COUNTRY_CODES.indexOf('zz') === -1);
+});
+
+/* ── S3: the two failures the user actually hit ── */
+
+test('S3: the scope fixes both of the real failures (live data)', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = scopedFetch();
+    const trip = ['Santillana de Mar', 'Leon', 'Fisterra', 'Lugo'];
+    const out = await geocodePlaces(trip, geoOpts({ fetchImpl: fetchImpl, countries: ['es'] }));
+
+    const santillana = byName(out, 'Santillana de Mar');
+    assert.strictEqual(santillana.resolved, true);
+    assert.ok(santillana.displayName.indexOf('Cantabria') !== -1,
+        'Cantabria, not San Luis Potosi: ' + santillana.displayName);
+    assert.ok(haversineKm(santillana.lat, santillana.lon, 43.391, -4.108) < 5,
+        'within 5 km of the real Santillana del Mar');
+
+    const leon = byName(out, 'Leon');
+    assert.ok(leon.displayName.indexOf('Castilla') !== -1,
+        'Castilla y Leon, not Leon County, Texas: ' + leon.displayName);
+    assert.ok(haversineKm(leon.lat, leon.lon, 42.599, -5.567) < 40, 'the right Leon');
+
+    /* And the whole trip is coherent, so nothing is flagged — correctly. */
+    assert.deepStrictEqual(geocodeOutliers(out), []);
+    assert.strictEqual(fetchImpl.calls.length, 4, 'one request per name, as before');
+    for (let i = 0; i < fetchImpl.calls.length; i++) {
+        assert.ok(fetchImpl.calls[i].indexOf('countrycodes=es') !== -1, 'every one scoped');
+    }
+});
+
+/* ── S4: THE COST — the error the filter leaves behind, and cannot catch ── */
+
+test('S4: inside one country a wrong place is plausible, and nothing here can flag it', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = scopedFetch();
+    /* The user means Fisterra in Galicia and types the Castilian spelling. */
+    const out = await geocodePlaces(['Lugo', 'Finisterre', 'Barcelona', 'Castellar del Valles'],
+        geoOpts({ fetchImpl: fetchImpl, countries: ['es'] }));
+
+    const fin = byName(out, 'Finisterre');
+    assert.strictEqual(fin.resolved, true);
+    assert.ok(fin.displayName.indexOf('Toledo') !== -1,
+        'a real Spanish place, and the wrong one: ' + fin.displayName);
+    const kmFromGalicia = haversineKm(fin.lat, fin.lon, 42.9286659, -9.2626624);
+    assert.ok(kmFromGalicia > 450 && kmFromGalicia < 700,
+        'about 600 km from the Fisterra he meant: ' + Math.round(kmFromGalicia));
+
+    /* THE POINT: no geometric check fires. 5,000 km / x15 are measured thresholds
+       and this is 600 km inside a normal-looking Spanish trip. The ONLY signal left
+       is the label above, which is why the UI must keep showing it. */
+    assert.deepStrictEqual(geocodeOutliers(out), [],
+        'the outlier check is silent here, by design and by measurement');
+    assert.strictEqual(fin.chosenByCluster, false, 'and nothing was relocated either');
+});
+
+/* ── S5: NO WORLDWIDE FALLBACK. The single most important rule in the feature ── */
+
+test('S5: a place not found in the scope is reported, never retried worldwide', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = scopedFetch();
+    const out = await geocodePlaces(['Lugo', 'Ulaanbaatar'],
+        geoOpts({ fetchImpl: fetchImpl, countries: ['es'] }));
+
+    assert.strictEqual(out.length, 2, 'nothing is dropped');
+    assert.strictEqual(out[0].resolved, true);
+
+    const missing = out[1];
+    assert.strictEqual(missing.name, 'Ulaanbaatar', 'index alignment survives');
+    assert.strictEqual(missing.resolved, false);
+    assert.strictEqual(missing.lat, null);
+    assert.strictEqual(missing.lon, null);
+    assert.strictEqual(missing.error, 'not-in-scope', 'the UI can say WHY');
+    assert.deepStrictEqual(missing.countries, ['es'], 'and in which countries it looked');
+
+    /* Exactly one request for it, and it carried the filter. A second, unfiltered
+       attempt is the original bug wearing a helpful face. */
+    assert.strictEqual(fetchImpl.calls.length, 2, 'no retry');
+    for (let i = 0; i < fetchImpl.calls.length; i++) {
+        assert.ok(fetchImpl.calls[i].indexOf('countrycodes=es') !== -1,
+            'no request ever left without the scope: ' + fetchImpl.calls[i]);
+    }
+});
+
+/* ── S6: three different silences, three different meanings ── */
+
+test('S6: not-in-scope, not-found and lookup-failed are told apart', async function () {
+    /* An EMPTY answer with a scope: the scope is the reason. */
+    resetGeoRateLimit();
+    let f = makeFetch(function () { return []; });
+    let out = await geocodePlaces(['Nowhere'], geoOpts({ fetchImpl: f, countries: ['es'] }));
+    assert.strictEqual(out[0].error, 'not-in-scope');
+
+    /* The same empty answer with NO scope: nothing to blame the countries for. */
+    resetGeoRateLimit();
+    f = makeFetch(function () { return []; });
+    out = await geocodePlaces(['Nowhere'], geoOpts({ fetchImpl: f }));
+    assert.strictEqual(out[0].error, 'not-found');
+    assert.strictEqual(out[0].countries, undefined, 'no scope, nothing to report');
+
+    /* NOT REACHING THE GEOCODER IS NOT EVIDENCE ABOUT THE PLACE. Blaming the scope
+       for an outage sends the user editing a trip that was never wrong — or worse,
+       widening a scope that was never the problem. */
+    const failures = [
+        ['network', new Error('socket hang up')],
+        ['http 500', jsonResponse([], 500)],
+        ['garbage body', { garbage: true }],
+        ['null body', null],
+        ['unusable coordinates', [{ lat: 'abc', lon: 'def', display_name: 'x' }]]
+    ];
+    for (let i = 0; i < failures.length; i++) {
+        resetGeoRateLimit();
+        const body = failures[i][1];
+        const g = makeFetch(function () { return body; });
+        const r = await geocodePlaces(['Somewhere'], geoOpts({ fetchImpl: g, countries: ['es'] }));
+        assert.strictEqual(r[0].resolved, false, failures[i][0]);
+        assert.strictEqual(r[0].error, 'lookup-failed',
+            failures[i][0] + ' is not the scope\'s fault');
+    }
+});
+
+/* ── S7: the cache is part of the scope, or the fallback returns through it ── */
+
+test('S7: a worldwide cache entry is never served to a scoped lookup', async function () {
+    resetGeoRateLimit();
+    const storage = makeStorage();
+    const fetchImpl = scopedFetch();
+
+    /* Worldwide first: Leon County, Texas, cached under the old key shape. */
+    const world = await geocodePlaces(['Leon'], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+    assert.ok(world[0].displayName.indexOf('Texas') !== -1, 'the shipped behaviour: ' + world[0].displayName);
+    assert.ok(storage._data.has(cacheKeyFor('Leon')), 'unscoped keys keep their old shape');
+
+    /* Now with a scope: the cached Texas entry must NOT satisfy it. */
+    const scoped = await geocodePlaces(['Leon'], geoOpts({
+        fetchImpl: fetchImpl, storage: storage, countries: ['es']
+    }));
+    assert.strictEqual(fetchImpl.calls.length, 2, 'the scoped question was actually asked');
+    assert.ok(scoped[0].displayName.indexOf('Castilla') !== -1,
+        'and answered in Spain: ' + scoped[0].displayName);
+    assert.ok(storage._data.has('travio.geo.v1.es#leon'), 'stored under a scoped key');
+
+    /* ...and the reverse: the Spanish entry must not satisfy a worldwide lookup. */
+    const world2 = await geocodePlaces(['Leon'], geoOpts({ fetchImpl: fetchImpl, storage: storage }));
+    assert.strictEqual(fetchImpl.calls.length, 2, 'the unscoped entry is still valid and reused');
+    assert.strictEqual(world2[0].source, 'cache');
+    assert.ok(world2[0].displayName.indexOf('Texas') !== -1, 'each scope keeps its own answer');
+
+    /* A second scoped call is a cache hit, so the scoping costs no extra request. */
+    const scoped2 = await geocodePlaces(['Leon'], geoOpts({
+        fetchImpl: fetchImpl, storage: storage, countries: ['es']
+    }));
+    assert.strictEqual(fetchImpl.calls.length, 2);
+    assert.strictEqual(scoped2[0].source, 'cache');
+
+    /* Different scopes are different slots, and clearGeoCache still finds them all. */
+    assert.strictEqual(clearGeoCache({ storage: storage }), 2);
+    assert.strictEqual(storage._data.size, 0);
+});
+
+/* ── S8: several chosen countries, and the cluster rule on top of the filter ── */
+
+test('S8: a name that exists in several chosen countries still gets the cluster rule', async function () {
+    resetGeoRateLimit();
+    const fetchImpl = scopedFetch();
+    /* Barcelona -> Lyon -> Brittany is a real trip, so es+fr is a real scope. Live,
+       'Leon' inside es+fr offers Lyon FIRST and Leon (Spain) second. */
+    const out = await geocodePlaces(['Leon'], geoOpts({ fetchImpl: fetchImpl, countries: ['es', 'fr'] }));
+    assert.strictEqual(out[0].resolved, true);
+    assert.strictEqual(out[0].candidates, 4, 'the ambiguity is visible, not hidden');
+    assert.ok(out[0].displayName.indexOf('Lyon') !== -1,
+        'alone, the geocoder\'s own ranking stands: ' + out[0].displayName);
+
+    /* With northern-Spanish company, the same list resolves the other way — and says
+       so. The two mechanisms compose: the filter decides which countries are on
+       offer, the cluster rule decides which of THOSE the trip is nearest, and any
+       override is flagged exactly as it was before the scope existed. */
+    resetGeoRateLimit();
+    const f2 = makeFetch(function (url) {
+        const q = decodeURIComponent(String(url));
+        if (q.indexOf('q=Leon') !== -1) return rowsToBody(LIVE_ES_FR.Leon);
+        if (q.indexOf('q=Lugo') !== -1) return rowsToBody(LIVE_ES.Lugo);
+        if (q.indexOf('q=Fisterra') !== -1) return rowsToBody(LIVE_ES.Fisterra);
+        return rowsToBody(LIVE_ES['Santillana de Mar']);
+    });
+    const trip = await geocodePlaces(['Lugo', 'Fisterra', 'Santillana de Mar', 'Leon'],
+        geoOpts({ fetchImpl: f2, countries: ['es', 'fr'] }));
+    const leon = byName(trip, 'Leon');
+    assert.ok(leon.displayName.indexOf('Castilla') !== -1,
+        'the Spanish candidate is nearer the trip: ' + leon.displayName);
+    assert.strictEqual(leon.chosenByCluster, true,
+        'and the override is FLAGGED — allowed, never silent');
+
+    /* MEASURED LIMIT, recorded rather than asserted away: swap Santillana for
+       Castellar del Valles (Barcelona) and the median centre moves east far enough
+       that Leon, Landes (France) is the nearest candidate, so THAT is what gets
+       taken — flagged, and with its label on screen. The scope narrows what is on
+       offer; it does not give the module a way to know which one the user meant. */
+    resetGeoRateLimit();
+    const f3 = makeFetch(function (url) {
+        const q = decodeURIComponent(String(url));
+        if (q.indexOf('q=Leon') !== -1) return rowsToBody(LIVE_ES_FR.Leon);
+        if (q.indexOf('q=Lugo') !== -1) return rowsToBody(LIVE_ES.Lugo);
+        if (q.indexOf('q=Fisterra') !== -1) return rowsToBody(LIVE_ES.Fisterra);
+        return rowsToBody(LIVE_ES['Castellar del Valles']);
+    });
+    const wide = await geocodePlaces(['Lugo', 'Fisterra', 'Castellar del Valles', 'Leon'],
+        geoOpts({ fetchImpl: f3, countries: ['es', 'fr'] }));
+    const leonWide = byName(wide, 'Leon');
+    assert.ok(leonWide.displayName.indexOf('Landes') !== -1,
+        'the geometry, not the country, decides: ' + leonWide.displayName);
+    assert.strictEqual(leonWide.chosenByCluster, true, 'still flagged');
+});
+
+/* ── S9: degenerate scopes must not throw ── */
+
+test('S9: degenerate scopes are survivable, including one that excludes the start', async function () {
+    /* A scope of EVERY country: legal, and effectively no filter. */
+    resetGeoRateLimit();
+    const all = makeFetch(function () { return nominatimHit(40.4, -3.7, 'Madrid'); });
+    const everywhere = await geocodePlaces(['Madrid'], geoOpts({ fetchImpl: all, countries: COUNTRY_CODES }));
+    assert.strictEqual(everywhere[0].resolved, true);
+    assert.ok(all.calls[0].indexOf('countrycodes=') !== -1);
+    assert.ok(all.calls[0].length < 4000, 'the URL stays sane with 249 codes: ' + all.calls[0].length);
+
+    /* A scope of nothing but rubbish is an EMPTY scope — worldwide, and the caller
+       is the one that must have told the user (countryScope().rejected). */
+    resetGeoRateLimit();
+    const junk = makeFetch(function () { return nominatimHit(1, 2, 'x'); });
+    await geocodePlaces(['Madrid'], geoOpts({ fetchImpl: junk, countries: ['Narnia', 'zz', 7, null, {}] }));
+    assert.strictEqual(junk.calls[0].indexOf('countrycodes'), -1);
+
+    /* A scope that excludes the START's own country: France-only, on a Spanish trip.
+       Nothing throws, the entry keeps its index, and the reason is specific. */
+    resetGeoRateLimit();
+    const fr = makeFetch(function (url) {
+        return decodeURIComponent(String(url)).indexOf('q=Lyon') !== -1
+            ? nominatimHit(45.75, 4.83, 'Lyon, France') : [];
+    });
+    const out = await geocodePlaces(['Madrid', 'Lyon', 'Toledo'], geoOpts({ fetchImpl: fr, countries: ['fr'] }));
+    assert.strictEqual(out.length, 3);
+    assert.deepStrictEqual(out.map(function (p) { return p.name; }), ['Madrid', 'Lyon', 'Toledo']);
+    assert.strictEqual(out[0].error, 'not-in-scope', 'the start point itself, named');
+    assert.deepStrictEqual(out[0].countries, ['fr']);
+    assert.strictEqual(out[1].resolved, true);
+    assert.strictEqual(out[2].error, 'not-in-scope');
+
+    /* And with no places at all, or blank names, nothing is requested and nothing throws. */
+    resetGeoRateLimit();
+    const none = makeFetch(function () { return nominatimHit(1, 1, 'q'); });
+    assert.deepStrictEqual(await geocodePlaces([], geoOpts({ fetchImpl: none, countries: ['es'] })), []);
+    const blanks = await geocodePlaces(['', null], geoOpts({ fetchImpl: none, countries: ['es'] }));
+    assert.strictEqual(blanks.length, 2);
+    assert.strictEqual(none.calls.length, 0);
 });

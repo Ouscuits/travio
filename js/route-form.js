@@ -124,6 +124,236 @@ function setVal(id, value) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
+   COUNTRY SCOPE — the optional "which countries will you visit" filter
+   ══════════════════════════════════════════════════════════════════════════════
+   WHY IT EXISTS. A user planned a motorbike trip round northern Spain and got
+   24,179 km and 268 h, because "Santillana de Mar" geocoded to Mexico and "Leon"
+   to Texas. Measured live against Nominatim, `countrycodes=es` fixes both. The
+   full measurement, and the alternative (viewbox proximity bias) that does NOT
+   work, are recorded in COUNTRY SCOPE at the top of js/geo-provider.js.
+
+   THE INPUT SHAPE, AND WHY. Free text typed straight into `countrycodes=` cannot
+   work — the parameter takes ISO codes, not "Espana" — so something must map
+   names to codes, and that mapping is where a feature like this dies quietly: an
+   unrecognised name becomes a scope that is silently narrower (or silently
+   absent) than the one the user described. So the field is a LIST OF RESOLVED
+   COUNTRIES, not a string:
+     - the user types a name in ANY of the five app languages, or the two-letter
+       code, with a native datalist offering all 249 of them in their own
+       language (Intl.DisplayNames — see the note in js/i18n.js);
+     - it is resolved to a code AT THAT MOMENT and shown as a chip, so what will
+       be sent is on screen before anything is generated, in words the user chose;
+     - a name that resolves to nothing is REFUSED, named, and not added. Never
+       dropped, because a scope quietly missing one country is a search nobody
+       asked for.
+   Multiple countries are the normal case, and the empty list is the default:
+   Barcelona -> Lyon -> Brittany is a real trip and must stay possible.
+
+   THE COST, STATED WHERE THE UI CAN SEE IT. The filter converts LOUD errors into
+   QUIET ones: "Finistere, Bretagne, France" produces a 268-hour itinerary nobody
+   can miss, while "Finisterre, Mora, Toledo" is a plausible Spanish village
+   600 km from the one meant, and NO check in this app will flag it (the outlier
+   floor is 5,000 km and the multiple 15x, both measured). That makes the
+   displayName label more important, not less — hence scope.quietErrors, shown on
+   every itinerary planned with a scope, pointing at the "where each place landed"
+   panel that is the only remaining defence. */
+
+let countryScope = [];              /* ISO alpha-2, normalised; [] = worldwide */
+let countryScopeUid = null;         /* WHOSE scope the form is showing */
+let countryScopeTouched = false;    /* set by the user, or by a loaded route */
+let countryDatalistLang = null;     /* which language the datalist was built in */
+
+function currentUid() {
+    return (typeof currentUser !== 'undefined' && currentUser && currentUser.uid) ? currentUser.uid : '';
+}
+
+/* Always through the provider: the form must never be able to offer, store or send
+   a code the request builder would refuse. Without the provider (a partial load)
+   the scope is empty, which is the behaviour the app had before this existed. */
+function normalisedScope(list) {
+    const G = (typeof window !== 'undefined' && window.TravioGeo) ? window.TravioGeo : null;
+    if (G && typeof G.normaliseCountries === 'function') return G.normaliseCountries(list);
+    return [];
+}
+
+function scopeNames(codes) {
+    return (typeof countryNames === 'function') ? countryNames(codes, currentLang)
+        : (Array.isArray(codes) ? codes.join(', ') : '');
+}
+
+function showScopeMsg(text, type) {
+    const node = el('rfCountryMsg');
+    if (!node) return;
+    node.textContent = text || '';
+    node.className = 'scope-msg ' + (type || '');
+    /* 'block', not '': the stylesheet hides .scope-msg by default, and an empty
+       inline value falls back to that rule — the message would be set and invisible. */
+    node.style.display = text ? 'block' : 'none';
+}
+
+/* The datalist is the whole country list in the current language. Rebuilt only when
+   the language changes — 249 <option>s is cheap but not free, and the language is
+   the only thing that changes their text. */
+function renderCountryDatalist() {
+    const host = el('rfCountryOptions');
+    if (!host || typeof countryOptions !== 'function') return;
+    if (countryDatalistLang === currentLang && host.childElementCount > 0) return;
+    const options = countryOptions(currentLang);
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < options.length; i++) {
+        const o = document.createElement('option');
+        /* The VALUE is the localised name: that is what the user picks and what
+           countryLookup() takes back to a code. */
+        o.value = options[i].name;
+        o.label = options[i].code.toUpperCase();
+        frag.appendChild(o);
+    }
+    host.innerHTML = '';
+    host.appendChild(frag);
+    countryDatalistLang = currentLang;
+}
+
+/* Chips + the one line that says what will actually happen. Built with
+   createElement/textContent — country names come from the browser, but nothing
+   here reaches innerHTML with a value. */
+function renderCountryScope() {
+    renderCountryDatalist();
+    const chips = el('rfCountryChips');
+    if (chips) {
+        chips.innerHTML = '';
+        for (let i = 0; i < countryScope.length; i++) {
+            const code = countryScope[i];
+            const name = (typeof countryName === 'function') ? countryName(code, currentLang) : code.toUpperCase();
+            const chip = document.createElement('span');
+            chip.className = 'scope-chip';
+            const label = document.createElement('span');
+            label.textContent = name;
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.textContent = '×';
+            rm.title = tf('form.countryScopeRemove', { country: name });
+            rm.setAttribute('aria-label', rm.title);
+            rm.onclick = function () { removeCountryFromScope(code); };
+            chip.appendChild(label);
+            chip.appendChild(rm);
+            chips.appendChild(chip);
+        }
+    }
+    const state = el('rfCountryState');
+    if (state) {
+        state.textContent = countryScope.length
+            ? tf('scope.active', { countries: scopeNames(countryScope) })
+            : t('form.countryScopeAny');
+    }
+}
+
+function addCountryToScope(text) {
+    const raw = String(text || '').trim();
+    if (!raw) { showScopeMsg('', ''); return false; }
+    const code = (typeof countryLookup === 'function') ? countryLookup(raw) : null;
+    /* NOT A COUNTRY: say so and add nothing. The alternative — ignoring it — would
+       leave the user believing they had scoped a search they had not. */
+    if (!code) { showScopeMsg(tf('form.countryScopeUnknown', { name: raw }), 'err'); return false; }
+    const name = (typeof countryName === 'function') ? countryName(code, currentLang) : code.toUpperCase();
+    if (countryScope.indexOf(code) !== -1) {
+        showScopeMsg(tf('form.countryScopeDuplicate', { country: name }), '');
+        return false;
+    }
+    countryScope = normalisedScope(countryScope.concat([code]));
+    showScopeMsg('', '');
+    renderCountryScope();
+    persistCountryScope();
+    return true;
+}
+
+function removeCountryFromScope(code) {
+    countryScope = normalisedScope(countryScope.filter(function (c) { return c !== code; }));
+    showScopeMsg('', '');
+    renderCountryScope();
+    persistCountryScope();
+}
+
+/* Used when a saved route is loaded: the form must describe THAT route's scope, not
+   the user's standing preference — otherwise regenerating it would silently re-plan
+   under assumptions the route was never built with. Does not persist: loading a route
+   is not the user changing their preference. */
+function setCountryScope(list) {
+    countryScope = normalisedScope(list);
+    countryScopeUid = currentUid();
+    countryScopeTouched = true;
+    showScopeMsg('', '');
+    renderCountryScope();
+}
+
+/*
+ * Per-user persistence, exactly like `language` (js/firestore.js).
+ *
+ * KEYED ON THE UID, not on a "have I loaded yet" flag. This module outlives a logout:
+ * sign out, sign in as someone else, and a boolean would leave the previous person's
+ * countries in the form — shown as if they were this user's, and written to THEIR
+ * document the moment anything is added. So the scope belongs to a uid, and a
+ * different uid starts from empty (the pre-existing behaviour) before the read.
+ *
+ * A read that fails leaves the scope EMPTY and says nothing: the form always shows
+ * what will actually be sent, and an unavailable preference is not a guess.
+ */
+async function restoreCountryScope() {
+    const uid = currentUid();
+    if (!uid || countryScopeUid === uid) return;
+
+    /* Whoever was here before is not this user. */
+    countryScopeUid = uid;
+    countryScopeTouched = false;
+    countryScope = [];
+    renderCountryScope();
+    if (typeof fsGetUserScope !== 'function') return;
+
+    try {
+        const codes = await fsGetUserScope(uid);
+        /* The user may have typed a country, loaded a route, or signed out while the
+           read was in flight. Any of those beats a stale preference. */
+        if (currentUid() !== uid || countryScopeTouched) return;
+        countryScope = normalisedScope(codes);
+        renderCountryScope();
+    } catch (e) {
+        console.warn('Country scope preference unavailable:', e);
+    }
+}
+
+function persistCountryScope() {
+    const uid = currentUid();
+    countryScopeUid = uid;
+    countryScopeTouched = true;
+    if (!uid || typeof fsSetUserScope !== 'function') return;
+    fsSetUserScope(uid, countryScope).catch(function (e) {
+        console.warn('Country scope not saved:', e);
+    });
+}
+
+function initCountryScope() {
+    const input = el('rfCountryInput');
+    const addBtn = el('rfCountryAdd');
+    if (addBtn) {
+        addBtn.onclick = function () {
+            if (input && addCountryToScope(input.value)) input.value = '';
+        };
+    }
+    if (input) {
+        input.onkeydown = function (e) {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();            /* Enter here must not submit / generate */
+            if (addCountryToScope(input.value)) input.value = '';
+        };
+        /* Picking from the native datalist fires `change`, not a click. */
+        input.onchange = function () {
+            if (input.value && addCountryToScope(input.value)) input.value = '';
+        };
+    }
+    renderCountryScope();
+    restoreCountryScope();
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
    GEOMETRY — persistence, provenance, and the view model behind the map
    ══════════════════════════════════════════════════════════════════════════════
    PERSISTENCE DECISION: the SIMPLIFIED line is saved with the route, and its
@@ -264,6 +494,33 @@ function renderRouteMap(route) {
     if (!nothing && !real) {
         addItineraryNotice(t(route.savedRoute ? 'map.savedNoGeometry' : 'map.straightNotice'), 'warn');
     }
+}
+
+/*
+ * The scope this itinerary was planned with, on the itinerary itself.
+ *
+ * FOR A FRESH ROUTE the notice is a WARNING, not a reassurance, and that is the whole
+ * point: the filter removes the wrong-continent failures that were impossible to miss
+ * and leaves the wrong-village-same-country ones that nothing here can detect. The one
+ * defence left is the "where each place landed" panel below it, so the notice points
+ * straight at it. It is shown whenever a scope was used — including on a trip that came
+ * out perfectly, because the user cannot tell those apart by looking at the total.
+ *
+ * FOR A SAVED ROUTE it says which assumption the route was built under. A document from
+ * an earlier build has no field at all, and absent is EMPTY, never a guess: it says the
+ * route was planned without a country limit, which is exactly what happened.
+ */
+function renderScopeNotice(route) {
+    const fd = (route && route.formData) || {};
+    const codes = normalisedScope(fd.countryScope);
+    if (route && route.savedRoute) {
+        addItineraryNotice(codes.length
+            ? tf('scope.savedWith', { countries: scopeNames(codes) })
+            : t('scope.savedWithout'), 'info');
+        return;
+    }
+    if (!codes.length) return;
+    addItineraryNotice(tf('scope.quietErrors', { countries: scopeNames(codes) }), 'warn');
 }
 
 /* Colour is never the only carrier: each entry names its day and its endpoints. */
@@ -525,11 +782,18 @@ function initRouteForm() {
     if (customChk) customChk.addEventListener('change', renderBudgetPerDay);
 
     initExportControls();
+    initCountryScope();
 
     /* The itinerary is built in JS, so applyTranslations() cannot reach it: without
        this hook a language switch leaves every label, notice and budget verdict in
        the result pane frozen in the previous language. */
-    if (typeof onLanguageChange === 'function') onLanguageChange(rerenderCurrentRoute);
+    if (typeof onLanguageChange === 'function') {
+        onLanguageChange(rerenderCurrentRoute);
+        /* The chips, the datalist and the "searching only in..." line are built in JS
+           too, and country names are localised: without this a Spanish user switching
+           to Chinese keeps a chip reading "Espana" beside a Chinese form. */
+        onLanguageChange(renderCountryScope);
+    }
 }
 
 /* Re-render the result pane in the current language. Cheap and idempotent: the view
@@ -619,6 +883,9 @@ function collectFormData() {
         fuelPrice:       numVal('rfFuelPrice', D.fuelPrice),
         lodgingPerNight: numVal('rfLodging', D.lodgingPerNight),
         mealsPerDay:     numVal('rfMeals', D.mealsPerDay),
+        /* A copy, normalised again at the boundary: the route records the scope it was
+           planned with, and nothing downstream can mutate the live picker. */
+        countryScope:    normalisedScope(countryScope),
         language:        currentLang
     };
 }
@@ -750,8 +1017,10 @@ async function generateRoute() {
         const names = [fd.startPoint].concat(stopNames, [fd.endPoint]);
 
         /* 2 — geocoding, one name at a time so the progress bar is honest.
-               geo-provider serialises and rate-limits every request globally. */
-        const geoOpts = { language: currentLang };
+               geo-provider serialises and rate-limits every request globally.
+               `countries` is the optional scope: a HARD filter at the geocoder, with
+               no worldwide retry behind it. Empty means worldwide, as before. */
+        const geoOpts = { language: currentLang, countries: fd.countryScope };
         const places = [];
         for (let i = 0; i < names.length; i++) {
             setProgress((i / (names.length + 2)) * 100, t('progress.geocoding'),
@@ -766,6 +1035,22 @@ async function generateRoute() {
                 setProgress(((i + 1) / (names.length + 2)) * 100, t('progress.geocoding'),
                     tf('progress.geocodedAs', { name: names[i], label: got.displayName }));
             }
+        }
+
+        /* 2b — A NAME THAT IS NOT IN THE CHOSEN COUNTRIES STOPS THE GENERATION.
+           The alternative — carry on and plan around it — means placing that stop at
+           the centroid of the others (see UNRESOLVED PLACES in js/geo-provider.js) and
+           handing back an itinerary built on a place the app never located. That is a
+           guess made on the user's behalf, and it is the same class of defect as the
+           silent worldwide fallback this feature exists to refuse. So: say which name,
+           say which countries, and let the user fix the name or widen the scope.
+           Only 'not-in-scope' blocks. A lookup that never got an answer ('lookup-failed')
+           proves nothing about the country and keeps the pre-existing behaviour. */
+        if (!isCurrentGeneration(myGen)) return;
+        const outOfScope = places.filter(function (p) { return p && p.error === 'not-in-scope'; });
+        if (outOfScope.length) {
+            showScopeFailure(outOfScope, fd.countryScope);
+            return;
         }
 
         /* Which of those, if any, sits far from the rest of the trip. Pure and
@@ -953,6 +1238,7 @@ function displayRoute(route) {
     /* After the itinerary HTML is in place: the map notice is appended to the
        notice list that renderItineraryHtml just wrote. */
     renderRouteMap(route);
+    renderScopeNotice(route);
     updateExportControls();
 
     if (saveBtn) saveBtn.style.display = '';
@@ -968,7 +1254,14 @@ function showLoadingState() {
     if (loading) loading.style.display = '';
     setProgress(0, t('progress.geocoding'), '');
     const note = el('progressNote');
-    if (note) note.textContent = t('progress.ratePolicy');
+    /* The scope is stated while the lookups are running, not only afterwards: this is
+       the moment a user who scoped the wrong country can recognise the mistake. */
+    if (note) {
+        const codes = normalisedScope(countryScope);
+        note.textContent = (codes.length
+            ? tf('scope.progress', { countries: scopeNames(codes) }) + ' — ' : '') +
+            t('progress.ratePolicy');
+    }
 }
 
 function hideLoadingState() {
@@ -1002,9 +1295,54 @@ function showRouteError(msg) {
 
     const errDiv = el('resultError');
     if (errDiv) {
-        errDiv.style.display = '';
+        /* See showScopeFailure: '' would restore the stylesheet's display:none. */
+        errDiv.style.display = 'block';
         errDiv.textContent = msg;
     }
+}
+
+/*
+ * The one screen this feature adds: N names that do not exist inside the chosen
+ * countries, and what to do about it. Deliberately NOT a route with a warning on it —
+ * there is no route, because the app declined to guess where those places are.
+ * Built with createElement/textContent; place names are user input.
+ */
+function showScopeFailure(places, codes) {
+    const content = el('resultContent');
+    const empty   = el('resultEmpty');
+    const loading = el('resultLoading');
+    if (content) content.style.display = 'none';
+    if (empty)   empty.style.display = 'none';
+    if (loading) loading.style.display = 'none';
+
+    const errDiv = el('resultError');
+    if (!errDiv) return;
+    errDiv.textContent = '';
+    /* 'block', NOT '': `.result-error` is display:none in the stylesheet, so clearing
+       the inline value hands the element straight back to that rule — the message is
+       set, the pane stays blank, and the app looks like it did nothing. Found in the
+       browser on this screen; the same defect is fixed in showRouteError and
+       showFormMsg below (and still exists in showLoginError, in js/auth.js). */
+    errDiv.style.display = 'block';
+
+    const countries = scopeNames(codes);
+    const head = document.createElement('p');
+    head.style.fontWeight = '700';
+    head.textContent = t('scope.blocked');
+    errDiv.appendChild(head);
+
+    for (let i = 0; i < places.length; i++) {
+        const line = document.createElement('p');
+        line.textContent = tf('scope.notFound', {
+            name: (places[i] && places[i].name) || '',
+            countries: countries
+        });
+        errDiv.appendChild(line);
+    }
+
+    const help = document.createElement('p');
+    help.textContent = t('scope.notFoundHelp');
+    errDiv.appendChild(help);
 }
 
 function showFormMsg(msg, type) {
@@ -1012,7 +1350,7 @@ function showFormMsg(msg, type) {
     if (!node) return;
     node.textContent = msg;
     node.className = 'form-msg ' + type;
-    node.style.display = '';
+    node.style.display = 'block';       /* '' would restore .form-msg's display:none */
     setTimeout(function () { node.style.display = 'none'; }, 4000);
 }
 
@@ -1033,6 +1371,13 @@ async function saveCurrentRoute() {
             dailyBudget:    fd.dailyBudget || 0,
             tollPreference: fd.tollPreference || 'with-tolls',
             departureTime:  fd.departureTime || '09:00',
+            /* The scope the places were geocoded under. Saved with the route, not only
+               on the user, because it is an assumption THIS itinerary was built on: a
+               route planned inside Spain and reloaded next month must not quietly
+               re-plan against whatever preference the user holds by then. An empty
+               array is stored explicitly — Firestore rejects undefined, and "planned
+               worldwide" is a fact worth recording. */
+            countryScope:   normalisedScope(fd.countryScope),
             /* Cost assumptions and per-day budgets are part of the answer: without them
                a reloaded route silently regenerates against the defaults. */
             consumption:     numOrNull(fd.consumption),
@@ -1158,6 +1503,12 @@ async function viewSavedRoute(routeId) {
         el('rfDailyBudget').value  = r.dailyBudget || 100;
         if (el('rfTolls') && r.tollPreference) el('rfTolls').value = r.tollPreference;
         if (el('rfDepartureTime') && r.departureTime) el('rfDepartureTime').value = r.departureTime;
+
+        /* The form now describes THIS route, including the scope it was planned with.
+           A document written before the field existed has none, and absent is treated
+           exactly as empty — never as the user's current preference, which would make
+           "Generate" silently re-plan the route under a filter it never had. */
+        setCountryScope(r.countryScope);
 
         /* Restore the assumptions the route was costed with, so regenerating it does
            not silently swap in the defaults. */

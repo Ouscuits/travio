@@ -83,6 +83,23 @@ input,select,textarea{font-size:16px!important}
     font-family:'DM Sans',sans-serif;transition:border .15s;background:var(--surface);
 }
 .form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:var(--primary)}
+/* ── Country scope (optional): chips + one add row ── */
+.scope-row{display:flex;gap:8px;align-items:stretch}
+.scope-row input{flex:1;min-width:0}
+.scope-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.scope-chips:empty{display:none}
+.scope-chip{
+    display:inline-flex;align-items:center;gap:6px;background:var(--green-light);
+    color:var(--green);border-radius:999px;padding:4px 6px 4px 10px;font-size:13px;font-weight:600;
+}
+.scope-chip button{
+    border:none;background:transparent;color:inherit;cursor:pointer;
+    font-size:15px;line-height:1;padding:0 4px;border-radius:999px;
+}
+.scope-chip button:hover{background:rgba(0,0,0,.08)}
+.scope-state{font-size:12px;color:var(--mid);margin-top:6px}
+.scope-msg{font-size:13px;margin-top:6px;display:none}
+.scope-msg.err{color:var(--red)}
 .form-msg{font-size:13px;padding:8px 12px;border-radius:var(--radius);display:none;margin-top:8px}
 .form-msg.ok{background:var(--green-light);color:var(--green)}
 .form-msg.err{background:var(--red-light);color:var(--red)}
@@ -418,6 +435,22 @@ input,select,textarea{font-size:16px!important}
                     <div class="form-group">
                         <label><span data-i18n="form.destinations">Destinations</span> * <small data-i18n="form.destinationsHint">(comma separated)</small></label>
                         <textarea id="rfDestinations" rows="3" data-i18n="form.destinationsPh"></textarea>
+                    </div>
+
+                    <!-- Optional country scope. EMPTY BY DEFAULT: a Barcelona -> Lyon ->
+                         Brittany trip is legitimate and must stay possible. When set, it
+                         is passed to the geocoder as countrycodes= — a hard filter, never
+                         a fallback. See COUNTRY SCOPE in js/geo-provider.js. -->
+                    <div class="form-group">
+                        <label>&#x1F30D; <span data-i18n="form.countryScope">Countries on this trip</span> <small data-i18n="form.countryScopeHint">(optional)</small></label>
+                        <div class="scope-row">
+                            <input type="text" id="rfCountryInput" list="rfCountryOptions" autocomplete="off" data-i18n="form.countryScopePh">
+                            <datalist id="rfCountryOptions"></datalist>
+                            <button type="button" class="btn btn-outline btn-sm" id="rfCountryAdd" data-i18n="form.countryScopeAdd">Add</button>
+                        </div>
+                        <div class="scope-chips" id="rfCountryChips"></div>
+                        <p class="scope-state mono" id="rfCountryState"></p>
+                        <p class="scope-msg" id="rfCountryMsg"></p>
                     </div>
 
                     <div class="form-group">

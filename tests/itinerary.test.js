@@ -579,10 +579,16 @@ function loadI18n() {
         setItem: function (k, v) { store[k] = String(v); }
     };
     const document = { querySelectorAll: function () { return []; }, getElementById: function () { return null; } };
-    const fn = new Function('localStorage', 'document', 'console',
+    /* `window` is a parameter, not a global: js/i18n.js reads window.TravioGeo lazily to
+       get the country list (the provider owns it), and the browser load order puts
+       i18n.js first. Handing it the real provider is what the page does. */
+    const win = { TravioGeo: require(path.join(__dirname, '..', 'js', 'geo-provider.js')) };
+    const fn = new Function('localStorage', 'document', 'console', 'window',
         src + '\nreturn { TRANSLATIONS: TRANSLATIONS, t: t, tf: tf, setLanguage: setLanguage, ' +
-        'onLanguageChange: onLanguageChange, lang: function () { return currentLang; } };');
-    return fn(localStorage, document, console);
+        'onLanguageChange: onLanguageChange, lang: function () { return currentLang; }, ' +
+        'countryName: countryName, countryNames: countryNames, countryOptions: countryOptions, ' +
+        'countryLookup: countryLookup, normaliseCountryText: normaliseCountryText };');
+    return fn(localStorage, document, console, win);
 }
 const LOCALES = ['es', 'en', 'ca', 'fr', 'zh'];
 
@@ -2870,4 +2876,148 @@ test('G7: a language switch re-renders the labels without re-geocoding anything'
             before, 'nothing was looked up again');
         app.i18n.setLanguage('es');
     });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   COUNTRY SCOPE — the strings and the country names behind the optional filter
+   (the request side lives in tests/geo-provider.test.js, S1-S9)
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+const SCOPE_KEYS = [
+    'form.countryScope', 'form.countryScopeHint', 'form.countryScopePh',
+    'form.countryScopeAdd', 'form.countryScopeAny', 'form.countryScopeUnknown',
+    'form.countryScopeDuplicate', 'form.countryScopeRemove',
+    'scope.active', 'scope.progress', 'scope.quietErrors', 'scope.blocked',
+    'scope.notFound', 'scope.notFoundHelp', 'scope.savedWith', 'scope.savedWithout'
+];
+
+/* Every string the scope UI interpolates into, and what it MUST leave a slot for.
+   A message that promises the country and then does not name it is the same defect
+   as a silent narrowing: the user cannot see what was actually searched. */
+const SCOPE_PLACEHOLDERS = {
+    'form.countryScopeUnknown': ['{name}'],
+    'form.countryScopeDuplicate': ['{country}'],
+    'form.countryScopeRemove': ['{country}'],
+    'scope.active': ['{countries}'],
+    'scope.progress': ['{countries}'],
+    'scope.quietErrors': ['{countries}'],
+    'scope.notFound': ['{name}', '{countries}'],
+    'scope.savedWith': ['{countries}']
+};
+
+test('SCOPE i18n: every scope string exists in all five locales, with its placeholders', function () {
+    const i18n = loadI18n();
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        for (let k = 0; k < SCOPE_KEYS.length; k++) {
+            const key = SCOPE_KEYS[k];
+            const v = i18n.t(key);
+            assert.strictEqual(typeof v, 'string', LOCALES[i] + ' / ' + key);
+            assert.notStrictEqual(v, key, key + ' is not translated in ' + LOCALES[i]);
+            assert.ok(v.trim().length > 0, key + ' is empty in ' + LOCALES[i]);
+            const needed = SCOPE_PLACEHOLDERS[key] || [];
+            for (let p = 0; p < needed.length; p++) {
+                assert.ok(v.indexOf(needed[p]) !== -1,
+                    LOCALES[i] + ' / ' + key + ' must carry ' + needed[p] + ': "' + v + '"');
+            }
+            /* And tf() really fills them: a leftover {countries} on screen is a bug
+               the parity test alone would never see. */
+            const filled = i18n.tf(key, { name: 'X', country: 'Y', countries: 'Z' });
+            assert.strictEqual(filled.indexOf('{'), -1, LOCALES[i] + ' / ' + key + ' left a slot unfilled');
+        }
+    }
+});
+
+test('SCOPE i18n: the no-scope state and the trade-off warning say the right thing', function () {
+    const i18n = loadI18n();
+    /* The DEFAULT state must say the search is worldwide — the user has to be able to
+       tell "no filter" from "filter I forgot I set", and the two look identical
+       otherwise. */
+    const worldwide = { es: 'mundo', en: 'worldwide', ca: 'mon', fr: 'monde', zh: '全球' };
+    /* The warning must point at the label panel rather than reassure: the whole cost
+       of this feature is that it makes errors quieter (see S4 in the provider tests). */
+    for (let i = 0; i < LOCALES.length; i++) {
+        const loc = LOCALES[i];
+        i18n.setLanguage(loc);
+        assert.ok(i18n.t('form.countryScopeAny').toLowerCase().indexOf(worldwide[loc].toLowerCase()) !== -1,
+            loc + ' does not say the default is worldwide: ' + i18n.t('form.countryScopeAny'));
+        const warn = i18n.tf('scope.quietErrors', { countries: 'X' });
+        assert.ok(warn.length > 80, loc + ' warning is too short to explain the trade-off');
+        assert.ok(warn.indexOf('Finisterre') !== -1,
+            loc + ' warning must carry the measured example that shows the residual risk');
+    }
+});
+
+test('SCOPE i18n: country names render in every locale, and a code always has a name', function () {
+    const i18n = loadI18n();
+    const geoMod = require(path.join(__dirname, '..', 'js', 'geo-provider.js'));
+    const expected = { es: 'Espa', en: 'Spain', ca: 'Espanya', fr: 'Espagne', zh: '西班牙' };
+    for (let i = 0; i < LOCALES.length; i++) {
+        const loc = LOCALES[i];
+        i18n.setLanguage(loc);
+        assert.ok(i18n.countryName('es', loc).indexOf(expected[loc]) === 0,
+            loc + ' renders ES as "' + i18n.countryName('es', loc) + '"');
+        /* The picker offers every country the provider will accept — no curated
+           subset, which would be a silent decision that some trips are not real. */
+        const options = i18n.countryOptions(loc);
+        assert.strictEqual(options.length, geoMod.COUNTRY_CODES.length, loc + ' option count');
+        for (let k = 0; k < options.length; k++) {
+            assert.ok(options[k].name && options[k].name.length > 0,
+                loc + ' has no name for ' + options[k].code);
+            assert.ok(geoMod.normaliseCountries([options[k].code]).length === 1,
+                'the picker never offers a code the request builder would refuse: ' + options[k].code);
+        }
+        /* Sorted in the user's own language, so the list is usable at all. */
+        const names = options.map(function (o) { return o.name; });
+        const sorted = names.slice().sort(function (a, b) { return a.localeCompare(b, loc); });
+        assert.deepStrictEqual(names, sorted, loc + ' options are not in name order');
+    }
+    assert.strictEqual(i18n.countryNames(['es', 'fr'], 'en'), 'Spain, France');
+    assert.strictEqual(i18n.countryNames([], 'en'), '');
+});
+
+test('SCOPE i18n: a country typed in ANY of the five languages resolves to its code', function () {
+    const i18n = loadI18n();
+    i18n.setLanguage('es');            /* a Spanish user, typing whatever they know */
+    const spellings = ['Espana', 'España', 'espana', '  ESPAÑA  ', 'Spain', 'Espanya',
+                       'Espagne', '西班牙', 'es', 'ES'];
+    for (let i = 0; i < spellings.length; i++) {
+        assert.strictEqual(i18n.countryLookup(spellings[i]), 'es',
+            JSON.stringify(spellings[i]) + ' should be Spain');
+    }
+    /* Punctuation and spacing the user cannot be expected to reproduce. CLDR writes
+       Cote d'Ivoire with a typographic apostrophe nobody has on a keyboard. */
+    assert.strictEqual(i18n.countryLookup('Cote d Ivoire'), 'ci');
+    assert.strictEqual(i18n.countryLookup('Guinea Bissau'), 'gw');
+    assert.strictEqual(i18n.countryLookup('Reino Unido'), 'gb');
+    assert.strictEqual(i18n.countryLookup('中国'), 'cn');
+    assert.strictEqual(i18n.countryLookup('Etats-Unis'), 'us');
+
+    /* NOT A COUNTRY IS AN ANSWER, not something to smooth over: the caller shows it
+       and adds nothing, because a scope quietly missing an entry is a search the
+       user never asked for. */
+    const notCountries = ['Narnia', 'Cantabria', 'Galicia', 'zz', 'e', 'esp', '',
+                          '   ', null, undefined, 42, {}, []];
+    for (let i = 0; i < notCountries.length; i++) {
+        assert.strictEqual(i18n.countryLookup(notCountries[i]), null,
+            JSON.stringify(notCountries[i]) + ' is not a country');
+    }
+});
+
+test('SCOPE i18n: every published code round-trips through its own localised name', function () {
+    const i18n = loadI18n();
+    const geoMod = require(path.join(__dirname, '..', 'js', 'geo-provider.js'));
+    const codes = geoMod.COUNTRY_CODES;
+    const failures = [];
+    for (let i = 0; i < codes.length; i++) {
+        for (let l = 0; l < LOCALES.length; l++) {
+            const name = i18n.countryName(codes[i], LOCALES[l]);
+            if (i18n.countryLookup(name, null, LOCALES[l]) !== codes[i]) {
+                failures.push(LOCALES[l] + ':' + codes[i] + ' (' + name + ')');
+            }
+        }
+    }
+    /* What the picker shows must be what the picker accepts, in all five languages —
+       otherwise a user selects a country from the list and is told it is not one. */
+    assert.deepStrictEqual(failures, [], 'names that do not resolve back to their code');
 });
