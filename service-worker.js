@@ -1,5 +1,5 @@
 // Service Worker for Travio PWA
-const CACHE_NAME = 'travio-v3';
+const CACHE_NAME = 'travio-v4';
 const urlsToCache = [
     './',
     'index.html',
