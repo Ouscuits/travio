@@ -267,6 +267,21 @@
         const tollsTotal = round2(totalTolls);
         const over = cost > budgetTotal + 0.005;
 
+        /* "Over budget ONLY because of the estimate" is a claim about the whole trip, and
+           it is false the moment any single day is over budget on its computed costs
+           alone — a reader scanning the summary and then a day card would otherwise see
+           "only because of the AI-estimated toll" sitting above a day that is over by
+           EUR 8.69 with no toll at all. Both were arithmetically true at their own
+           aggregate, which is exactly what makes the pair misleading. When a day owns its
+           overrun, the trip falls back to the weaker, still-true "includes X of
+           AI-estimated tolls". */
+        let dayOverWithoutEstimate = false;
+        for (let i = 0; i < days.length; i++) {
+            if (days[i].over && !days[i].overDependsOnEstimate) { dayOverWithoutEstimate = true; break; }
+        }
+        const tripOverFromEstimate = over && tollsEstimated && tollsTotal > 0 &&
+            round2(cost - tollsTotal) <= budgetTotal + 0.005 && !dayOverWithoutEstimate;
+
         return {
             days: days,
             totalFuel: round2(totalFuel),
@@ -287,10 +302,9 @@
             /* The trip total is a floor whenever any day's is. */
             incomplete: incompleteDays.length > 0,
             incompleteDays: incompleteDays,
-            overDependsOnEstimate: over && tollsEstimated && tollsTotal > 0 &&
-                round2(cost - tollsTotal) <= budgetTotal + 0.005,
+            overDependsOnEstimate: tripOverFromEstimate,
             overIncludesEstimate: over && tollsEstimated && tollsTotal > 0 &&
-                round2(cost - tollsTotal) > budgetTotal + 0.005 &&
+                !tripOverFromEstimate &&
                 cost > 0 && tollsTotal >= MATERIAL_ESTIMATE_SHARE * cost,
             rates: {
                 consumption: consumption, fuelPrice: fuelPrice,
@@ -1308,11 +1322,64 @@
         const totalTolls = num(out.totalTolls, 0), totalCost = num(out.totalCost, 0),
             totalBudget = num(out.totalBudget, 0);
         out.tollsEstimated = totalTolls > 0 || costs.tollsEstimated === true;
+        let dayOverWithoutEstimate = false;
+        for (let i = 0; i < days.length; i++) {
+            if (days[i].over && !days[i].overDependsOnEstimate) { dayOverWithoutEstimate = true; break; }
+        }
         out.overDependsOnEstimate = !!out.over && out.tollsEstimated && totalTolls > 0 &&
-            round2(totalCost - totalTolls) <= totalBudget + 0.005;
+            round2(totalCost - totalTolls) <= totalBudget + 0.005 && !dayOverWithoutEstimate;
         out.overIncludesEstimate = !!out.over && out.tollsEstimated && totalTolls > 0 &&
             !out.overDependsOnEstimate && totalCost > 0 &&
             totalTolls >= MATERIAL_ESTIMATE_SHARE * totalCost;
+        return out;
+    }
+
+    /* ── The other trip-level input to viewFlags: the notice list ──
+       Migrating `costs` alone is not enough. Whether the budget verdict may be given at
+       all is decided by the notices, and a document written by an older build recorded
+       the "numbers are not real" class the way that build understood it: round 1 had no
+       `zeroDistance` code, so it stored the engine's English sentence as an untranslated
+       {code:'other', level:'info'}, and it had `unknown-distance` in COVERED_WARNINGS
+       with nothing rendering it, so it stored nothing at all. Trusting that array
+       reproduces the exact screen this whole piece was opened to eliminate — reached by
+       loading a saved route instead of generating one.
+
+       The evidence is in the document: plan.warnings holds both strings verbatim. Derive
+       the class from there, drop the stale untranslated duplicate, and let the normal
+       machinery translate, rank and sort it. */
+    function reconcileSavedNotices(plan, stored) {
+        const warnings = (plan && Array.isArray(plan.warnings)) ? plan.warnings : [];
+        const list = Array.isArray(stored) ? stored : [];
+
+        /* What the plan itself reports. Derived first, so a stale untranslated duplicate
+           is only dropped when there is a real alert to replace it — a document with the
+           prose but no warnings keeps the prose rather than losing the information. */
+        const derived = {};
+        for (let i = 0; i < warnings.length; i++) {
+            const w = String(warnings[i] || '');
+            const code = w.indexOf(':') > 0 ? w.slice(0, w.indexOf(':')) : w;
+            const mapped = UNRELIABLE_WARNINGS[code];
+            if (mapped) derived[mapped] = true;
+        }
+
+        const present = {};
+        const out = [];
+        for (let i = 0; i < list.length; i++) {
+            const n = list[i];
+            if (!n || !n.code) continue;
+            if (UNRELIABLE_NOTICES[n.code]) { present[n.code] = true; out.push(n); continue; }
+            if (n.code === 'other') {
+                const text = String((n.params && n.params.text) || '');
+                const code = text.indexOf(':') > 0 ? text.slice(0, text.indexOf(':')) : text;
+                const mapped = UNRELIABLE_WARNINGS[code];
+                if (mapped && derived[mapped]) continue;   // replaced by the derived alert
+            }
+            out.push(n);
+        }
+        for (const code in derived) {
+            if (!Object.prototype.hasOwnProperty.call(derived, code) || present[code]) continue;
+            out.push({ code: code, level: 'alert', params: {} });
+        }
         return out;
     }
 
@@ -1320,7 +1387,7 @@
         if (!isStructuredRoute(saved)) return null;
         const s = saved.structured;
         const costs = migrateSavedCosts(s.costs || computeCosts(s.plan, {}));
-        const notices = Array.isArray(s.notices) ? s.notices.slice() : [];
+        const notices = reconcileSavedNotices(s.plan, s.notices);
         /* If the migration discovered a gap the document never recorded, say so — the
            day rows now withhold their verdicts and the reader is owed the reason. */
         if (costs && costs.tollsUnknown) {
@@ -1335,12 +1402,19 @@
                 });
             }
         }
+        const sorted = sortNoticesBySeverity(notices);
+        /* Copy, never mutate: the caller still holds the stored document and a re-save
+           must not write our derivations back over it. */
+        const meta = {};
+        const savedMeta = s.meta || {};
+        for (const k in savedMeta) if (Object.prototype.hasOwnProperty.call(savedMeta, k)) meta[k] = savedMeta[k];
+        meta.numbersUnreliable = hasUnreliableNumbers(sorted);
         return {
             plan: s.plan,
             costs: costs,
             enrichment: s.enrichment || null,
-            notices: sortNoticesBySeverity(notices),
-            meta: s.meta || {}
+            notices: sorted,
+            meta: meta
         };
     }
 

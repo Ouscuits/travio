@@ -873,6 +873,226 @@ test('D1c: round-2/3 documents and legacy plain text are untouched by the migrat
     assert.strictEqual(I.viewFromSaved(legacy), null);
 });
 
+/* ══════════════ ROUND 5 ══════════════ */
+
+/* ── DEFECT 1d — migrating the money is not enough: migrate the RELIABILITY too ──
+   viewFlags has two trip-level inputs. Round 4 rebuilt `costs`; the other is the notice
+   list, and viewFromSaved took that verbatim from the stored document. Round 1 had no
+   `zeroDistance` code (it stored the engine's English sentence as an untranslated
+   {code:'other', level:'info'}) and had `unknown-distance` in COVERED_WARNINGS with
+   nothing rendering it (it stored nothing at all). So a saved route reproduced the exact
+   screen this piece was opened to eliminate. ── */
+
+/* A round-1 document whose plan carries the given engine warnings. Everything else is
+   the shape round 1 wrote: notices as that build understood them, no meta flag. */
+function round1DocWithWarnings(warnings, storedNotices, opts) {
+    const o = opts || {};
+    const dayCount = o.days || 3;
+    const days = [], costDays = [];
+    for (let i = 0; i < dayCount; i++) {
+        const km = o.km === undefined ? 0 : o.km;
+        const fuel = Math.round((km / 100) * 7 * 1.5 * 100) / 100;
+        const lodging = i < dayCount - 1 ? 60 : 0;
+        const total = Math.round((fuel + lodging + 35) * 100) / 100;
+        const budget = o.budget === undefined ? 120 : o.budget;
+        days.push({ day: i + 1, km: km, driveMin: km, legs: km ? [{}] : [], stops: [],
+            startPlace: { name: 'A' }, endPlace: { name: 'B' } });
+        costDays.push({ day: i + 1, km: km, fuel: fuel, tolls: 0, lodging: lodging, meals: 35,
+            total: total, budget: budget, over: total > budget + 0.005,
+            overBy: total > budget + 0.005 ? Math.round((total - budget) * 100) / 100 : 0 });
+    }
+    const costs = { days: costDays, totalFuel: 0, totalTolls: 0, totalLodging: 0, totalMeals: 0,
+        totalCost: 0, totalBudget: 0, overBudgetDays: [], over: false, overBy: 0,
+        tollsEstimated: false, rates: { consumption: 7, fuelPrice: 1.5, lodgingPerNight: 60, mealsPerDay: 35 } };
+    for (let i = 0; i < costDays.length; i++) {
+        costs.totalFuel += costDays[i].fuel; costs.totalLodging += costDays[i].lodging;
+        costs.totalMeals += costDays[i].meals; costs.totalCost += costDays[i].total;
+        costs.totalBudget += costDays[i].budget;
+        if (costDays[i].over) costs.overBudgetDays.push(costDays[i].day);
+    }
+    costs.over = costs.totalCost > costs.totalBudget + 0.005;
+    costs.overBy = costs.over ? Math.round((costs.totalCost - costs.totalBudget) * 100) / 100 : 0;
+    return { startPoint: 'A', endPoint: 'B', result: 'DIA 1: ...', structured: {
+        version: 2,
+        plan: { days: days, order: [], totalKm: (o.km || 0) * dayCount,
+            totalMin: (o.km || 0) * dayCount, roundTrip: false, warnings: warnings },
+        costs: costs, enrichment: null,
+        notices: storedNotices || [],
+        meta: { matrixSource: 'haversine', startName: 'A', endName: 'B' }   // no numbersUnreliable
+    } };
+}
+
+const ZERO_DISTANCE_WARNING = 'zero-distance: the whole itinerary computes to 0 km — the ' +
+    'coordinates or the distance matrix are unusable, so the numbers below are not real.';
+const UNKNOWN_DISTANCE_WARNING = 'unknown-distance: at least one leg has no usable distance ' +
+    'data (place not resolved and no coordinates); it is counted as 0 km.';
+
+test('D1d: a round-1 zero-distance route no longer loads under a reassuring green verdict', function () {
+    /* Exactly what round 1 stored: the sentence as untranslated 'other' prose. */
+    const doc = round1DocWithWarnings(
+        ['distance-source: no road data at all — every distance is a straight-line estimate.',
+         UNKNOWN_DISTANCE_WARNING, ZERO_DISTANCE_WARNING],
+        [{ code: 'restDay', level: 'info', params: { day: 3, place: 'B' } },
+         { code: 'unresolved', level: 'warn', params: { name: 'A' } },
+         { code: 'haversine', level: 'warn', params: {} },
+         { code: 'other', level: 'info', params: { text: ZERO_DISTANCE_WARNING } }],
+        { km: 0, budget: 120 });
+
+    const view = I.viewFromSaved(doc);
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('zeroDistance') >= 0,
+        'the evidence was in plan.warnings and the loader never looked at it');
+    assert.ok(codes.indexOf('unknownDistance') >= 0,
+        'round 1 stored no notice for this at all — the commonest under-migration');
+    assert.strictEqual(codes.indexOf('other'), -1,
+        'the untranslated English duplicate must be replaced, not printed alongside');
+    assert.strictEqual(I.hasUnreliableNumbers(view.notices), true);
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+    assert.strictEqual(view.notices[0].level, 'alert', 'and sorted above the yellows');
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /summary-card summary-unreliable/, 'the card must not be green');
+    assert.match(html, /The budget cannot be assessed/);
+    assert.strictEqual(html.indexOf('left in budget'), -1,
+        'no "EUR 110.00 left in budget" over 0 km / 0 min');
+    assert.strictEqual(html.indexOf('>Within budget<'), -1);
+    assert.strictEqual(html.indexOf('zero-distance:'), -1,
+        'the raw engine string must not reach the screen');
+    assert.match(html, /notice-alert/);
+    assert.ok(html.indexOf('notice-alert') < html.indexOf('summary-card'));
+});
+
+test('D1d: one unresolvable place — round 1 stored NO notice, so nothing was swallowed silently', function () {
+    /* The common case: real distances elsewhere, so no zero-distance, but one leg has
+       no usable data. Round 1 had unknown-distance in COVERED_WARNINGS and rendered
+       nothing for it, so the stored array is simply missing it. */
+    const doc = round1DocWithWarnings(
+        ['unresolved-place: "Nowheresville" could not be geocoded; its distances are approximate.',
+         UNKNOWN_DISTANCE_WARNING],
+        [{ code: 'unresolved', level: 'warn', params: { name: 'Nowheresville' } }],
+        { km: 300, budget: 400 });
+
+    const view = I.viewFromSaved(doc);
+    const codes = view.notices.map(function (n) { return n.code; });
+    assert.ok(codes.indexOf('unknownDistance') >= 0, 'it was swallowed entirely on the load path');
+    assert.ok(codes.indexOf('zeroDistance') === -1, 'and only what the plan actually reported');
+    assert.ok(codes.indexOf('unresolved') >= 0, 'the notices the document DID carry survive');
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.match(html, /The budget cannot be assessed/,
+        'a leg counted as 0 km makes the cost figures incomplete, so the verdict is withheld');
+    assert.strictEqual(html.indexOf('>Within budget<'), -1);
+});
+
+test('D1d: the derived alerts are translated in all five locales, on the load path', function () {
+    const i18n = loadI18n();
+    const doc = round1DocWithWarnings(
+        [UNKNOWN_DISTANCE_WARNING, ZERO_DISTANCE_WARNING],
+        [{ code: 'other', level: 'info', params: { text: ZERO_DISTANCE_WARNING } }],
+        { km: 0, budget: 120 });
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        const view = I.viewFromSaved(doc);
+        const ctx = { t: i18n.t };
+        const zero = view.notices.filter(function (n) { return n.code === 'zeroDistance'; })[0];
+        const text = I.noticeText(zero, ctx);
+        assert.notStrictEqual(text, 'notice.zeroDistance', LOCALES[i] + ' has no translation');
+        assert.strictEqual(text.indexOf('zero-distance:'), -1,
+            LOCALES[i] + ' shows the raw English engine string: ' + text);
+        assert.strictEqual(text.indexOf('{'), -1);
+        const html = I.renderItineraryHtml(view, ctx);
+        assert.match(html, /summary-flag flag-unknown/, LOCALES[i] + ' still gives a budget verdict');
+        assert.match(html, /summary-card summary-unreliable/, LOCALES[i] + ' still shows a green card');
+    }
+});
+
+test('D1d: a HEALTHY round-1 document gains no spurious alert', function () {
+    const doc = round1DocWithWarnings(
+        ['rest-day: day 3 has no driving — rest / explore B (fewer destinations than days).'],
+        [{ code: 'restDay', level: 'info', params: { day: 3, place: 'B' } }],
+        { km: 300, budget: 400 });
+    const view = I.viewFromSaved(doc);
+    assert.strictEqual(view.notices.filter(function (n) { return n.level === 'alert'; }).length, 0);
+    assert.strictEqual(I.hasUnreliableNumbers(view.notices), false);
+    assert.strictEqual(view.meta.numbersUnreliable, false);
+    const html = I.renderItineraryHtml(view, CTX);
+    assert.strictEqual(html.indexOf('notice-alert'), -1);
+    assert.strictEqual(html.indexOf('summary-unreliable'), -1);
+    assert.strictEqual(html.indexOf('The budget cannot be assessed'), -1);
+    /* The round-4 toll migration still applies: the zero it cannot explain is floored. */
+    assert.match(html, /Within budget for what is counted/);
+});
+
+test('D1d: the migration copies — a loaded document must not be written back over', function () {
+    const doc = round1DocWithWarnings(
+        [UNKNOWN_DISTANCE_WARNING, ZERO_DISTANCE_WARNING],
+        [{ code: 'other', level: 'info', params: { text: ZERO_DISTANCE_WARNING } }],
+        { km: 0, budget: 120 });
+    const before = JSON.stringify(doc);
+    const view = I.viewFromSaved(doc);
+    assert.ok(view.notices.length > doc.structured.notices.length,
+        'fixture: the view really did gain notices');
+    assert.strictEqual(view.meta.numbersUnreliable, true);
+    assert.strictEqual(doc.structured.meta.numbersUnreliable, undefined,
+        'the stored meta must not be mutated');
+    assert.strictEqual(JSON.stringify(doc), before, 'the stored document was modified in place');
+});
+
+test('D1d: round-2/3 documents skip the notice migration entirely', function () {
+    /* Including the one shape that exercises it: a live zero-distance view, which
+       already carries the alerts and the meta flag. */
+    const ghost = function (n) { return P(n, null, null, { resolved: false }); };
+    const places = [ghost('A'), ghost('B'), ghost('C')];
+    const zeros = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const plan = engine.planRoute({ start: places[0], end: places[2], stops: [places[1]],
+        matrix: { km: zeros, min: zeros, source: 'haversine', osrmCells: 0, filledCells: 6 },
+        days: 3, departureTime: '09:00', maxDriveMinPerDay: 360 });
+    const live = I.buildItineraryView({ plan: plan, requestedStops: ['B'], startName: 'A', endName: 'C',
+        places: places, matrixSource: 'haversine', matrixFilledCells: 6, matrixOsrmCells: 0,
+        maxDriveMin: 360, dailyBudget: 120, tollsEnabled: true, t: CTX.t });
+    const doc = JSON.parse(JSON.stringify({ structured: I.serialiseView(live) }));
+    const restored = I.viewFromSaved(doc);
+    assert.deepStrictEqual(restored.notices, live.notices, 'the notice list must be untouched');
+    assert.strictEqual(restored.meta.numbersUnreliable, live.meta.numbersUnreliable);
+    assert.strictEqual(I.renderItineraryHtml(restored, CTX), I.renderItineraryHtml(live, CTX));
+});
+
+/* ── D5b — a trip verdict must not contradict the day card below it ── */
+
+test('D5b: "only because of the estimate" is not claimed over a day that owns its overrun', function () {
+    /* Days 1-2 go over only with their toll; day 3 is over by EUR 8.69 with no toll at
+       all. Both statements were true at their own aggregate, which is what made the pair
+       misleading to anyone scanning the summary and then the cards. */
+    const plan = { days: [
+        { day: 1, km: 400, driveMin: 240, legs: [{}] },
+        { day: 2, km: 400, driveMin: 240, legs: [{}] },
+        { day: 3, km: 0, driveMin: 0, legs: [] }
+    ] };
+    const c = I.computeCosts(plan, { dailyBudget: 150, budgets: [150, 150, 26.31],
+        tollsEnabled: true, tolls: [150, 150, null] });
+    assert.strictEqual(c.days[0].overDependsOnEstimate, true, 'fixture: day 1 needs its toll to go over');
+    assert.strictEqual(c.days[2].over, true, 'fixture: day 3 is over');
+    assert.strictEqual(c.days[2].tolls, 0, 'fixture: with no toll at all');
+    assert.strictEqual(c.days[2].overDependsOnEstimate, false, 'fixture: so it owns its overrun');
+
+    assert.strictEqual(c.over, true);
+    assert.strictEqual(c.overDependsOnEstimate, false,
+        'the trip cannot be over ONLY because of the estimate while a day is over without one');
+    assert.strictEqual(c.overIncludesEstimate, true, 'the weaker, still-true sentence takes over');
+
+    const html = I.renderItineraryHtml({ plan: plan, costs: c, notices: [], meta: {} }, CTX);
+    const trip = /class="summary-flag[^"]*">([^<]*)</.exec(html)[1];
+    assert.strictEqual(trip.indexOf('only because of'), -1,
+        'trip verdict still contradicts a day card: ' + trip);
+    assert.match(trip, /a figure that includes EUR 300\.00 of AI-estimated tolls/);
+    /* The day cards keep their own, individually-correct verdicts. */
+    const days = (html.match(/class="cost-flag [^"]*">[^<]*/g) || [])
+        .map(function (s) { return s.replace(/class="cost-flag [^"]*">/, ''); });
+    assert.match(days[0], /but only because of the AI-estimated toll/);
+    assert.strictEqual(days[2], 'Over budget by EUR 8.69');
+});
+
 /* ── DEFECT 2c — five toll states must be five distinguishable labels ── */
 
 function tollStateRow(basisCase, t) {
@@ -1448,10 +1668,15 @@ test('D4: a verdict that only exists because of a model number says so', functio
     assert.match(html, /but only because of the AI-estimated toll/,
         'the verdict must carry the dependency, not only the cost row');
 
-    /* Same at trip level: 151 of computed cost against a 180 budget, over only once
-       the model's 40 EUR of tolls are added. */
-    const trip = I.computeCosts(plan, { dailyBudget: 90, tollsEnabled: true, tolls: [20, 20] });
+    /* Same at trip level: 151 of computed cost against a 190 budget, over only once the
+       model's 40 EUR of tolls are added — AND no day owns its overrun independently
+       (day 1 goes over only with its toll, day 2 stays inside). See D5b: without that
+       second condition the trip sentence contradicts a day card. */
+    const trip = I.computeCosts(plan, { dailyBudget: 95, budgets: [120, 70], tollsEnabled: true, tolls: [20, 20] });
     assert.strictEqual(trip.over, true);
+    assert.strictEqual(trip.days[0].over, true);
+    assert.strictEqual(trip.days[0].overDependsOnEstimate, true);
+    assert.strictEqual(trip.days[1].over, false);
     assert.strictEqual(trip.overDependsOnEstimate, true);
     assert.match(I.renderItineraryHtml({ plan: plan, costs: trip, notices: [], meta: {} }, CTX),
         /summary-flag flag-over">Over budget by[^<]*AI-estimated toll/);
