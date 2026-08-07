@@ -93,12 +93,19 @@
  *       ceiling was proposed and is provably too tight: 5 * 9.25 = 46 km would reject
  *       that 112 km road. The +50 km is headroom for short legs, where a large ratio is
  *       cheap and common (an estuary crossing to the nearest bridge).
- *       CAUTION: every measurement round has found a worse real detour than the last —
- *       x4.45 Helsinki–Stockholm, then x6.51 Athens–Chios, then x7.61 Oban–Craignure
- *       (16 km across the Sound of Mull, 120 km around Loch Linnhe). All 36 still clear
- *       the ceiling, but the ratio margin is x1.31, not the x2.2 it was believed to be.
- *       Do not tighten this without measuring again; the trend says the true worst case
- *       has not been found yet.
+ *       Successive rounds each found a worse real detour — x4.45 Helsinki–Stockholm,
+ *       x6.51 Athens–Chios, x7.73 Oban–Craignure (16 km across the Sound of Mull, 120 km
+ *       around Loch Linnhe) — but every one still cleared, so the ceiling has held.
+ *
+ *   CAUTION, AND IT BELONGS ON THE DURATION CAP, NOT HERE. A caution against tightening
+ *   was written against this ceiling because that was where the trend had shown itself.
+ *   It then expressed itself through the DURATION CAP instead: the ceiling has never
+ *   rejected a real route, while the cap has now destroyed real routes twice — once by
+ *   saturating too high (a 30 km/h floor killed Athens–Iraklio) and once by scaling too
+ *   low (crow/3 killed the Woolwich Ferry). The generalisable rule is not "be careful
+ *   with the detour ceiling", it is: BEFORE narrowing any bound here, check whether the
+ *   fixture contains the case the new bound would exclude. Both duration failures came
+ *   from a fixture with no example of the excluded class, not from a mis-chosen constant.
  *     - speed ceiling 200 km/h, flat: OSRM's car profile tops out near 140 km/h on
  *       motorways, so 200 leaves 43% headroom and no real route averages above it.
  *
@@ -126,7 +133,7 @@
  *   km grows without bound. Average speed alone fails because it conflates a wait
  *   (which does not scale with distance) with progress (which does); stated as a
  *   duration ceiling those two separate cleanly:
- *       maxDuration = min(48 h, crow / 3) + km / 30 km/h
+ *       maxDuration = min(48 h, max(2 h, crow / 3)) + km / 30 km/h
  *   These constants are an EMPIRICAL ENVELOPE over measured OSRM output, not a model of
  *   ferry timetables — OSRM routes on way weights and does not know a schedule, and the
  *   long durations above come from its own low weighting of ferry ways. The envelope is
@@ -135,13 +142,29 @@
  *   The distance-independent term is capped by the great-circle separation because it is
  *   only earned where a water crossing could exist at all: granting it flat let a 10 km
  *   city hop claim 48 hours and ship LABELLED AS MEASURED, which stripped the slow-side
- *   protection from exactly the legs a city itinerary is made of. Every slow route in the
- *   36 has a crow line of at least 74 km; the shortest measured crossing is
- *   Messina–Villa San Giovanni at 7.7 km and it clears the cap by x3.63.
- *   Against all 36 the tightest headroom is x1.28 (Palermo–Lampedusa, 46.9 h against a
- *   59.8 h cap) and not one is rejected. OSRM's /table response carries no ferry flag —
- *   only distances and durations — so detecting the ferry directly, the other option
- *   considered, is not possible from what this module receives.
+ *   protection from exactly the legs a city itinerary is made of. It is FLOORED at 2 h
+ *   because scaling alone drove it to nothing across a narrow channel — see the retracted
+ *   premise below. Against all 51 measured routes the tightest headroom is x1.28
+ *   (Palermo–Lampedusa, 46.9 h against a 59.8 h cap), the tightest among narrow crossings
+ *   is x1.79 (Oanes–Lauvvik), and not one is rejected. OSRM's /table response carries no
+ *   ferry flag — only distances and durations — so detecting the ferry directly, the
+ *   other option considered, is not possible from what this module receives.
+ *
+ *   RETRACTED — this file previously asserted, as the justification for scaling the
+ *   allowance by separation: "every slow route in the 36 has a crow line of at least
+ *   74 km". FALSE, and false because the fixture behind it contained no narrow slow
+ *   crossing — 14 short hops had been measured, but all across wide water (Messina
+ *   7.7 km, Dover–Calais, Helsinki–Tallinn), none under 3 km with a slow sailing. The
+ *   sentence generalised from a hole in the data and was then used as a premise. Fifteen
+ *   narrow crossings measured since falsify it outright:
+ *       Woolwich Ferry (Thames)   crow 0.34 km, road 2.67 km, 16.2 min
+ *       Oanes–Lauvvik (Lysefjord) crow 1.28 km, road 12.0 km, 80.4 min
+ *       Lavik–Oppedal (Sognefjord) crow 2.6–3.0 km, road ~9-10 km, ~74 min
+ *   Under the unfloored rule the first two were condemned outright and the third sat on
+ *   the cliff edge, surviving by 5% or dying depending on which quay coordinate you
+ *   resolve. A measured duration was being replaced by an estimate 35x smaller — the
+ *   same failure, in the same direction, that this file already treated as disqualifying
+ *   at long range, reintroduced at short range and worse in degree.
  *
  *   WHICH DIRECTION IS "SAFE" — this file makes two calls that look opposed:
  *   FALLBACK CALIBRATION says a pessimistic speed is bad because it over-splits days,
@@ -209,9 +232,9 @@
     /* Plausibility floor for values claimed to come from the road graph.
        Every threshold below is derived from measurement — see PLAUSIBILITY FLOOR. */
     const GEO_MAX_SPEED_KMH      = 200;             // faster than this is not driving, at any length
-    const GEO_STOPPAGE_ALLOWANCE_MIN = 48 * 60;     // waiting for a scheduled sailing/service
-    const GEO_ALLOWANCE_PER_CROW_MIN = 20;          // ...but only where a crossing is plausible:
-                                                    // 20 min per crow km == crow / 3 in hours
+    const GEO_STOPPAGE_ALLOWANCE_MIN = 48 * 60;     // upper bound on the distance-free term
+    const GEO_ALLOWANCE_PER_CROW_MIN = 20;          // scaled by separation: crow / 3 in hours
+    const GEO_MIN_CROSSING_ALLOWANCE_MIN = 120;     // floor: a narrow crossing is still a crossing
     const GEO_MIN_SUSTAINED_KMH  = 30;              // slowest sustained progress once moving
     const GEO_MAX_DETOUR         = 10;              // road / great circle ceiling
     const GEO_DETOUR_SLACK_KM    = 50;              // absolute headroom for short legs
@@ -690,17 +713,21 @@
      * apart. There is deliberately no floor on average SPEED (see SLOW SIDE in the
      * header); the bound separates the two things average speed conflates — a wait that
      * does not scale with distance, and progress that does.
-     * The wait is granted only where a scheduled crossing could plausibly be involved.
-     * A flat 48 h was handed to every leg regardless, so a 10 km city hop could claim
-     * 48 hours and ship LABELLED AS MEASURED — which removed the slow-side protection
-     * from exactly the legs a city itinerary is made of. Every slow route in the 36
-     * measured live has a crow line of at least 74 km, so the allowance is scaled by the
-     * great-circle distance and saturates at 48 h once a real crossing is on the table.
+     * The distance-free term is bounded at BOTH ends:
+     *  - a flat 48 h for every leg let a 10 km city hop claim 48 hours and ship LABELLED
+     *    AS MEASURED, stripping the slow-side protection from the legs a city itinerary
+     *    is made of — hence scaling it by the great-circle separation;
+     *  - but scaling alone drove it to nothing across a narrow channel, and a narrow
+     *    crossing is still a crossing. Measured live: the Woolwich Ferry over the Thames
+     *    is 0.34 km of separation, 2.67 km of road and 16.2 min (cap was 12.2 — dead),
+     *    and Oanes–Lauvvik across the Lysefjord is 1.28 km / 12.0 km / 80.4 min (cap was
+     *    49.5 — dead). Hence the 2 h floor, which is what a slow short sailing costs.
      */
     function geoMaxDurationMin(roadKm, straightKm) {
         const road = isFinite(roadKm) && roadKm > 0 ? roadKm : 0;
         const crow = isFinite(straightKm) && straightKm > 0 ? straightKm : 0;
-        const allowance = Math.min(GEO_STOPPAGE_ALLOWANCE_MIN, crow * GEO_ALLOWANCE_PER_CROW_MIN);
+        const allowance = Math.min(GEO_STOPPAGE_ALLOWANCE_MIN,
+            Math.max(GEO_MIN_CROSSING_ALLOWANCE_MIN, crow * GEO_ALLOWANCE_PER_CROW_MIN));
         return allowance + (road / GEO_MIN_SUSTAINED_KMH) * 60;
     }
 

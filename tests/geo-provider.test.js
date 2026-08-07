@@ -1553,7 +1553,24 @@ const FERRY_ROUTES = [
     ['Dover-Calais',         51.1279, 1.3134,   50.9513, 1.8587,     87,   66],
     ['Helsinki-Tallinn',     60.1699, 24.9384,  59.4370, 24.7536,    87,  132],
     ['Palermo-Lampedusa',    38.1157, 13.3615,  35.4999, 12.6068,   355, 2814],
-    ['Cagliari-Palermo',     39.2238, 9.1217,   38.1157, 13.3615,  2323, 2028]
+    ['Cagliari-Palermo',     39.2238, 9.1217,   38.1157, 13.3615,  2323, 2028],
+    /* Round 7: NARROW slow crossings. The fixture had none — 14 short hops had been
+       measured but all across wide water — and the crow-scaled allowance was therefore
+       fitted to a hole in the data. Fjord and estuary ferries are the missing class. */
+    ['Lavik-Oppedal',        61.1030, 5.5330,   61.0770, 5.5220,   9.08, 73.2],
+    ['Oanes-Lauvvik',        58.9200, 6.0300,   58.9250, 6.0100,     12, 80.4],
+    ['Woolwich-Ferry',       51.4990, 0.0680,   51.4960, 0.0690,   2.67, 16.2],
+    ['Helsingor-Helsingborg', 56.0320, 12.6150, 56.0450, 12.6930,  8.37,   66],
+    ['Hella-Dragsvik',       61.2050, 6.5940,   61.2350, 6.5560,   4.76,   13],
+    ['Vangsnes-Hella',       61.1750, 6.6350,   61.2050, 6.5940,   4.74, 20.1],
+    ['Anda-Lote',            61.8830, 6.1200,   61.8930, 6.1180,    0.6,  1.4],
+    ['Halhjem-Sandvikvag',   60.1430, 5.4230,   59.9330, 5.4930,  101.87, 126.4],
+    ['Corran-Ardgour',       56.7245, -5.2360,  56.7260, -5.2450,   1.3,    6],
+    ['Cromarty-Nigg',        57.6810, -4.0370,  57.7000, -4.0230,  2.77, 18.8],
+    ['Sandbanks-Studland',   50.6845, -1.9450,  50.6790, -1.9500,  0.79,  4.7],
+    ['KingHarry-Fal',        50.2205, -5.0290,  50.2210, -5.0240,  0.09,  0.2],
+    ['Dartmouth-Kingswear',  50.3510, -3.5800,  50.3505, -3.5720,  1.38,  6.6],
+    ['Torpoint-Devonport',   50.3745, -4.1940,  50.3720, -4.1830,  2.19, 11.5]
 ];
 
 test('matrix D12: every live-measured ferry route survives as clean road data', async function () {
@@ -1634,6 +1651,47 @@ test('matrix D12: no average-speed threshold could have separated these from jun
     assert.strictEqual(bogus.source, 'haversine', '7.4 km/h over 620 km is not a road journey');
 });
 
+test('matrix D14: a narrow crossing is still a crossing', async function () {
+    /* Reported repro: scaling the allowance by separation drove it to nothing across a
+       narrow channel, so a slow short sailing was condemned and its measured duration
+       replaced by an estimate up to 35x smaller — the same failure, same direction, that
+       this suite already treats as disqualifying at long range (D12), reintroduced at
+       short range and worse in degree. The cliff sat at about 2.9 km of separation. */
+    const cases = [
+        /* name, crow km, road km, minutes, cap under the unfloored rule */
+        ['Woolwich Ferry (Thames)',   0.34,  2.67, 16.2, 12.2],
+        ['Oanes-Lauvvik (Lysefjord)', 1.28, 12.00, 80.4, 49.5],
+        ['Lavik-Oppedal at 2.00 km',  2.00,  9.91, 73.8, 59.8],
+        ['Lavik-Oppedal at 2.56 km',  2.56,  9.91, 73.8, 71.0]
+    ];
+    for (const [label, crowKm, roadKm, minutes, oldCap] of cases) {
+        assert.ok(minutes > oldCap, label + ': fixture must be one the old rule killed');
+        const b = place('B', 40.4168 + crowKm / 111.195, -3.7038);
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, Math.round(roadKm * 1000)], [Math.round(roadKm * 1000), 0]],
+                durations: [[0, Math.round(minutes * 60)], [Math.round(minutes * 60), 0]]
+            };
+        });
+        const m = await distanceMatrix([place('A', 40.4168, -3.7038), b],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D14 ' + label);
+        assert.strictEqual(m.source, 'osrm', label + ' is a real ferry and must survive');
+        assert.ok(Math.abs(m.min[0][1] - minutes) < 0.1,
+            label + ': the measured duration is kept, got ' + m.min[0][1] + ' not ' + minutes);
+    }
+
+    /* The floor must not become a new hole: a 2 km leg claiming 3 h is still refused. */
+    const probe = makeFetch(function () {
+        return { code: 'Ok', distances: [[0, 2000], [2000, 0]], durations: [[0, 3 * 3600], [3 * 3600, 0]] };
+    });
+    const junk = await distanceMatrix(
+        [place('A', 40.4168, -3.7038), place('B', 40.4168 + 1.9 / 111.195, -3.7038)],
+        { fetchImpl: probe, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(junk.source, 'haversine', '3 h for a 2 km leg is still not credible');
+});
+
 test('matrix D13: the stoppage allowance is earned by separation, not granted flat', async function () {
     /* Reported repro: the 48 h allowance was unconditional, so below ~100 km the cap was
        ~48 h regardless of distance — which removed the slow-side protection from exactly
@@ -1681,6 +1739,26 @@ test('matrix D13: the stoppage allowance is earned by separation, not granted fl
     assert.strictEqual(kept.min[0][1], 1734);
 });
 
+test('matrix D12: a second, independent mis-snap is refused the same way', async function () {
+    /* Mannheller -> Fodnes is a real 2.7 km Sognefjord ferry, but OSRM answered
+       1.33 km / 1.2 min at 64 km/h. /route shows why: waypoint 0 snapped 2038 m away and
+       BOTH waypoints landed on the same road, "Erdalsvegen", on the same shore. It is a
+       land route along one bank, not the crossing. Same mechanism as Algeciras-Ceuta,
+       found independently while measuring the narrow crossings for D14 — which is why a
+       road shorter than the great circle condemns the whole cell rather than the
+       distance alone. */
+    const fetchImpl = makeFetch(function () {
+        return { code: 'Ok', distances: [[0, 1330], [1330, 0]], durations: [[0, 72], [72, 0]] };
+    });
+    const m = await distanceMatrix(
+        [place('Mannheller', 61.0870, 7.3480), place('Fodnes', 61.0730, 7.3900)],
+        { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(m, 2, 'D12 Mannheller-Fodnes');
+    assert.strictEqual(m.source, 'haversine', 'a 1.33 km road under a 2.74 km crow line is one shore');
+    assert.strictEqual(m.osrmCells, 0, 'the duration goes with the distance');
+    assert.ok(m.km[0][1] > 2.7, 'the estimate at least spans the fjord, got ' + m.km[0][1]);
+});
+
 test('matrix D12: the 22nd measured route is correctly refused — OSRM answered elsewhere', async function () {
     /* Algeciras -> Ceuta was the one measured pair that must NOT be trusted, and it is
        the evidence behind the whole-cell rule in D6. Live: the crow line is 30 km across
@@ -1705,12 +1783,14 @@ test('matrix D12: the 22nd measured route is correctly refused — OSRM answered
 });
 
 test('matrix D12: the x10 detour ceiling still clears every measured route', async function () {
-    /* Successive measurement rounds keep finding worse real detours than the last:
-       x4.45 Helsinki-Stockholm (reviewer), x6.51 Athens-Chios (round 5), and now
-       x7.61 Oban-Craignure — 16 km across the Sound of Mull, 120 km around Loch Linnhe.
-       The x10 + 50 km ceiling still clears all 36, but the ratio margin is now x1.31,
-       not the x2.2 anyone believed. This test records where the real edge is so that
-       nobody tightens the ceiling without re-measuring. */
+    /* Successive measurement rounds keep finding worse real detour RATIOS: x4.45
+       Helsinki-Stockholm, x6.51 Athens-Chios, x7.50 Oban-Craignure, and now x9.38
+       Oanes-Lauvvik (1.28 km across the Lysefjord, 12 km by road). Every one still
+       clears, and the reason is worth stating: on short legs it is the +50 km ABSOLUTE
+       slack that carries them, not the x10 ratio — Oanes-Lauvvik is x9.38 of ratio but
+       x5.23 of actual headroom against a 62.8 km ceiling. The binding constraint is the
+       ratio only on long legs, where measured detours are far smaller. So the operative
+       assertion is headroom, and the ratio is recorded to keep the trend visible. */
     let worstRatio = 0, worstName = '';
     let tightest = Infinity, tightestName = '';
     for (const [name, aLat, aLon, bLat, bLon, roadKm] of FERRY_ROUTES) {
@@ -1722,19 +1802,24 @@ test('matrix D12: the x10 detour ceiling still clears every measured route', asy
         assert.ok(roadKm <= crow * 10 + 50,
             name + ' detour x' + ratio.toFixed(2) + ' must clear the ceiling');
     }
-    assert.ok(worstRatio > 7 && worstRatio < 8,
-        'worst measured detour is ' + worstName + ' at x' + worstRatio.toFixed(2));
-    assert.ok(tightest > 1.2,
-        'tightest ceiling headroom is ' + tightestName + ' at x' + tightest.toFixed(2));
+    assert.ok(tightest > 1.2, 'tightest ceiling headroom is ' + tightestName +
+        ' at x' + tightest.toFixed(2) + ' (worst ratio: ' + worstName + ' x' + worstRatio.toFixed(2) + ')');
+    assert.ok(worstRatio > 6, 'the worst measured ratio has only ever grown, now ' +
+        worstName + ' x' + worstRatio.toFixed(2));
 });
 
 test('matrix D12: every measured route clears the duration ceiling too', async function () {
-    /* The other half of the same guarantee: not one of the 36 is rejected on time, and
-       the tightest margin is Palermo-Lampedusa — 46.9 h against a 59.8 h cap. */
+    /* The other half of the same guarantee: not one of the 51 is rejected on time, and
+       the tightest margin is still Palermo-Lampedusa — 46.9 h against a 59.8 h cap,
+       unchanged by the 2 h floor, which only ever raises a cap. */
     let tightest = Infinity, tightestName = '';
+    let tightestNarrow = Infinity, narrowName = '';
     for (const [name, aLat, aLon, bLat, bLon, roadKm, minutes] of FERRY_ROUTES) {
         const crow = haversineKm(aLat, aLon, bLat, bLon);
-        const cap = Math.min(48 * 60, crow * 20) + (roadKm / 30) * 60;
+        const cap = Math.min(48 * 60, Math.max(120, crow * 20)) + (roadKm / 30) * 60;
+        if (crow < 10 && cap / minutes < tightestNarrow) {
+            tightestNarrow = cap / minutes; narrowName = name;
+        }
         const headroom = cap / minutes;
         if (headroom < tightest) { tightest = headroom; tightestName = name; }
         assert.ok(minutes <= cap, name + ' (' + (minutes / 60).toFixed(1) + ' h) must clear its ' +
@@ -1742,7 +1827,12 @@ test('matrix D12: every measured route clears the duration ceiling too', async f
     }
     assert.ok(tightest > 1.25 && tightest < 1.35,
         'tightest duration headroom is ' + tightestName + ' at x' + tightest.toFixed(2));
-    assert.strictEqual(tightestName, 'Palermo-Lampedusa');
+    assert.strictEqual(tightestName, 'Palermo-Lampedusa',
+        'the 2 h floor must not have moved the binding case');
+    /* The narrow crossings are the class the fixture used to lack, so pin their margin
+       separately — it is the one the floor exists to protect. */
+    assert.ok(tightestNarrow > 1.5,
+        'tightest narrow-crossing headroom is ' + narrowName + ' at x' + tightestNarrow.toFixed(2));
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
