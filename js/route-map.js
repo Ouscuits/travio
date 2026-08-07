@@ -29,18 +29,21 @@
  *       tol 0.50 km -> 252 pts, max error 0.49 km   <- default
  *       tol 1.00 km -> 131 pts, max error 0.99 km
  *   0.5 km of error is roughly one screen pixel at national zoom: invisible on a
- *   phone, 36x smaller on the wire. `view.geometry` hands back the SIMPLIFIED
- *   line precisely so that the thing a caller persists is the small one.
+ *   phone, 36x smaller on the wire. Both `view.geometry` and `view.geometryDoc`
+ *   hand back the SIMPLIFIED line, precisely so that the thing a caller persists
+ *   is the small one.
  *
  *   TWO different payloads come out of one simplification, and they are not the
  *   same size — quoting one for the other is how a 5 KB line gets budgeted at
  *   2.8 KB:
  *     · what the SVG DRAWS — 2-decimal viewBox units, ~14.5 bytes a point, so the
  *       default tolerance ships ~4.1 KB of <path d="...">;
- *     · what Firestore STORES — `view.geometry`, 5-decimal lat/lon (the precision
- *       decodePolyline gives), ~19 bytes a point, so ~5.4 KB.
+ *     · what Firestore STORES — `view.geometryDoc`, 5-decimal lat/lon (the
+ *       precision decodePolyline gives), ~19 bytes a point, so ~5.4 KB plus about
+ *       60 bytes of provenance.
  *   Both are reported: `view.geometryBytes` is the stored one, because that is
- *   the one with a 1 MB limit attached to it.
+ *   the one with a 1 MB limit attached to it, and a `persist-oversize:N` warning
+ *   fires above 64 KB whatever the cause.
  *
  * WHY THE SIMPLIFIER IS ITERATIVE
  *   Douglas-Peucker is textbook-recursive and blows the stack on an 11k-point
@@ -55,10 +58,101 @@
  *   surface it too. This project's rule: an estimate is never presented as a
  *   measurement.
  *
+ * PROVENANCE IS AN ALLOWLIST, AND IT TRAVELS WITH THE LINE
+ *   `geometryReal` is true for EXACTLY ONE label, `'osrm'`, matched literally.
+ *   Absence is not consent: an unlabelled line is `'unknown'` and renders as an
+ *   estimate. This was a real defect, found across the module's own documented
+ *   save/reload cycle — round 2 of review:
+ *     1. OSRM down -> straight-line geometry, correctly dashed and captioned;
+ *     2. the caller persists the points, and a bare `[[lat,lon],...]` array
+ *        cannot carry a label — `JSON.stringify` drops every non-index property,
+ *        so geo-provider's NON-ENUMERABLE `source` marker cannot reach Firestore;
+ *     3. the route is reopened, the label is gone, and the old denylist read
+ *        "not 'straight' and not 'none'" as road data. The estimate came back a
+ *        measurement: solid line, caption gone.
+ *   The same hole trusted every unrecognised label — including `'haversine'`,
+ *   which is this project's own word for a straight-line estimate.
+ *   So: **persist `view.geometryDoc`, not `view.geometry`.** The doc is a plain
+ *   JSON object carrying the points AND their provenance, and feeding it back
+ *   into `buildMapView({ geometry: doc })` reproduces the original verdict
+ *   exactly. `view.geometry` stays a bare point array for drawing and GPX, where
+ *   a wrapper would be in the way.
+ *   A stored `real` flag is never trusted on the way back in: the label is the
+ *   evidence, the boolean is only its conclusion, and re-deriving it costs
+ *   nothing.
+ *
+ * ONE BAD VERTEX MUST NOT SHRINK THE WHOLE MAP
+ *   The fit is computed over every drawn point, so a single corrupt vertex in an
+ *   otherwise correct polyline used to collapse the scale by 24x — a Madrid-
+ *   Barcelona route rendered as a 25-unit smudge, still solid, still captioned as
+ *   road data. The geo layer verifies polyline ENDPOINTS, not middles, partly on
+ *   the assumption that this module would not magnify a bad middle. So a dense
+ *   line gets an outlier-resistant fit (median absolute deviation), under three
+ *   guards that make a false positive on real geography essentially impossible —
+ *   see robustLineBounds(). Excluded points are still DRAWN (clipped by the SVG
+ *   viewport, so the anomaly stays visible as a line running off the edge) and
+ *   counted in `view.warnings` as `geometry-outliers:N`. Nothing is deleted and
+ *   nothing is hidden.
+ *
+ * TIME IS BOUNDED BY DECIMATION, BECAUSE DOUGLAS-PEUCKER IS O(n^2) IN THE WORST
+ * CASE
+ *   Typical road geometry is O(n log n) — 10k real points simplify in ~4 ms, and
+ *   200k in 36 ms. But the cost is quadratic on a shape where the deepest
+ *   deviation always sits next to the end of the range, so every split peels off
+ *   one point. Reproduced here with decaying alternating spikes (independently
+ *   measured by review at 176 ms / 693 ms / 11.8 s / 197 s):
+ *        5k ->    39 ms       20k ->    642 ms
+ *       10k ->   132 ms       40k ->  9,131 ms   <- on the main thread
+ *   That input can arrive from a corrupt or hostile routing server, so it has to
+ *   be bounded rather than hoped away. Above MAX_SIMPLIFY_POINTS the line is
+ *   first decimated UNIFORMLY to the cap — 40k then costs 891 ms instead of 9.1 s
+ *   — which is safe in practice, because real overview geometry is ~88 m per
+ *   point, so even a 3,000 km trip decimates to ~235 m per point, still far below
+ *   a 500 m tolerance. It is never silent: `simplification.decimatedFrom` plus a
+ *   `geometry-decimated:N` warning, and the stated error bound then applies to
+ *   the decimated line, which is the honest claim. `maxPoints: 0` opts out.
+ *
+ *   KNOWN LIMITATION, accepted on severity: the cap bounds the worst case to the
+ *   cost at 15,000 points, which is ~0.9 s of main thread on the same adversarial
+ *   shape, not to something imperceptible. Lowering the cap further would start
+ *   decimating REAL routes (a live 4-stop Spanish route is 11,344 points), and
+ *   trading a certain loss of fidelity on every honest route against a rarer
+ *   stall on a hostile one is the wrong trade. Moving the simplifier off the main
+ *   thread is the actual fix and needs a Worker, which this no-build-step PWA
+ *   does not have.
+ *
+ * WHAT THE TOLERANCE ACTUALLY BOUNDS (recorded, not fixed)
+ *   The error is measured in the projection the map DRAWS in, so a kept segment
+ *   is a straight line on the map — a rhumb line, not a great circle. On short
+ *   segments the two coincide; on very long ones they diverge quadratically.
+ *   Measured worst case: a 154 km simplified segment reported 0.497 km of
+ *   deviation while the true great-circle offset was 0.809 km. This is invisible
+ *   on any map at this scale and irrelevant to the SVG, which is drawn in exactly
+ *   that projection. It matters only to a consumer that re-interpolates the
+ *   points along great circles — js/route-export.js does consume the per-day
+ *   points — where a segment can sit up to ~0.3 km further from the road than
+ *   this module's number suggests.
+ *
  * TRANSLATION KEYS read through `ctx.t` (all fall back to the key itself, so the
  * module is usable before i18n.js carries them):
- *   map.title  map.noRoute  map.sourceRoad  map.sourceStraight
- *   map.straightLineNote  map.dayLabel {day}{from}{to}  map.legend {day}
+ *   map.title  map.noRoute  map.sourceRoad  map.sourceStraight  map.sourceUnknown
+ *   map.straightLineNote  map.unknownSourceNote  map.dayLabel {day}{from}{to}
+ *   map.legend {day}
+ * `map.sourceUnknown` and `map.unknownSourceNote` are new in round 2: an
+ * unlabelled line must not borrow the straight-line wording, because it is not
+ * known to be straight either — only its provenance is known to be missing.
+ *
+ * `view.warnings` — codes for the caller to surface, in the engine's
+ * `code:detail` style. Nothing here is rendered by this module beyond the
+ * caption, so a caller that ignores them shows a map that is still honest, but
+ * less specific:
+ *   geometry-straight          no road geometry; straight lines between stops
+ *   geometry-source-unknown:X  provenance absent or unrecognised; drawn dashed
+ *   geometry-outliers:N        N points excluded from the fit as corrupt spikes
+ *   geometry-decimated:N       input was N points, decimated to the time cap
+ *   geometry-unsimplified      toleranceKm <= 0, so every vertex was kept
+ *   persist-oversize:N         geometryDoc is N bytes, over the 64 KB budget
+ *   markers-without-day        the plan has no days, so markers name none
  *
  * KNOWN LIMITATION: a route crossing the antimeridian (Fiji, Chukotka) projects
  * into a bounding box that spans the whole world and the line runs the wrong way
@@ -78,6 +172,44 @@
     const DEFAULT_PADDING  = 28;
     const COORD_DECIMALS   = 2;              /* SVG path precision (~0.01 unit)    */
 
+    /* Douglas-Peucker is quadratic in the worst case; above this the line is
+       decimated uniformly first, so the render time is bounded by ~400 ms even on
+       an adversarial input. Chosen to sit above the 11,344 points a real 4-stop
+       Spanish route produces, so no real trip is ever decimated. */
+    const MAX_SIMPLIFY_POINTS = 15000;
+
+    /* Outlier-resistant fit. FOUR guards, because a wrong exclusion pushes real
+       geography off the map, which is a worse bug than the one being fixed:
+         · only points of the drawn LINE are ever excluded — a stop marker is
+           never dropped from the fit, so a legitimately distant destination is
+           safe by construction;
+         · the point must be far from the route's median — OUTLIER_MAD_FACTOR
+           times the median absolute deviation;
+         · it must be a SPIKE, not part of a run: its distance from the chord
+           between its own two neighbours must be at least half of how far it sits
+           from the median. This is the guard that tells a corrupt vertex (goes
+           there and comes straight back) from a legitimate distant arm (the route
+           travels along it, so every point is near its neighbours' chord). Only
+           interior points can be tested, which is the right split of labour: the
+           geo layer verifies polyline ENDPOINTS, this one covers the middles;
+         · excluding must actually rescue the map — if the scale barely moves, the
+           point was not distorting anything and the flag would be noise. */
+    const MIN_POINTS_FOR_ROBUST_FIT = 5;
+    const OUTLIER_MAD_FACTOR        = 12;
+    const OUTLIER_SPIKE_SHARE       = 0.5;
+    const MAX_OUTLIER_SHARE         = 0.01;
+    const MIN_SCALE_GAIN            = 2;
+
+    /* A persisted map line past this is a Firestore risk worth naming out loud.
+       64 KB is 6% of the 1 MB document limit; the default tolerance produces ~5 KB. */
+    const PERSIST_BUDGET_BYTES = 64 * 1024;
+
+    /* The ONLY label that means road data. Matched literally: 'OSRM', ' osrm ' and
+       '' are all unknown, which fails towards captioning a real route as an
+       estimate rather than the reverse. */
+    const REAL_GEOMETRY_SOURCE = 'osrm';
+    const KNOWN_SOURCES = { osrm: 1, straight: 1, none: 1, unknown: 1 };
+
     /* Day colours. The palette cycles, so day 9 reuses day 1's colour — but no
        information is carried by colour ALONE: every path has a <title> naming its
        day and its endpoints, and every marker is labelled. */
@@ -85,9 +217,12 @@
         '#10B981', '#0EA5E9', '#F59E0B', '#8B5CF6',
         '#EF4444', '#14B8A6', '#EC4899', '#84CC16'
     ];
-    const BG_COLOR     = '#ECFDF5';
-    const STROKE_DARK  = '#1A1A1A';
-    const MUTED_COLOR  = '#6B7280';
+    const BG_COLOR         = '#ECFDF5';
+    const STROKE_DARK      = '#1A1A1A';
+    const MUTED_COLOR      = '#6B7280';
+    /* A marker belonging to no day of the plan is grey, not day-1 emerald: it is
+       not a day-1 stop and must not be coloured as one. */
+    const UNASSIGNED_COLOR = '#9CA3AF';
 
     /* ── Tiny pure helpers (same discipline as itinerary-render.js) ── */
     function num(v, def) {
@@ -98,9 +233,36 @@
     function pos(v, def) { const n = num(v, NaN); return isFinite(n) && n > 0 ? n : def; }
     function nonNeg(v, def) { const n = num(v, NaN); return isFinite(n) && n >= 0 ? n : def; }
 
+    /* Escaping markup is only half the job. XML 1.0 forbids most C0 control
+       characters OUTRIGHT — there is no entity for them — so a place name
+       containing U+000B renders happily in an HTML page and then makes the same
+       SVG fail a standalone XML parse ("PCDATA invalid Char value 11"). That
+       breaks save, print and export: precisely the artefacts the fallback caption
+       exists in order to survive inside. Unpaired surrogates and the two
+       permanently-unassigned code points fail the same way.
+       They become a space rather than being deleted, so "A<VT>B" stays two words
+       instead of silently becoming "AB". */
+    /* XML 1.0 Char production, inverted: #x0-#x8, #xB, #xC, #xE-#x1F, plus DEL
+       and the two noncharacters. Written with \u escapes on purpose — a literal
+       U+000B in this source file would be invisible to every reviewer of it. */
+    const XML_INVALID_CHARS   = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFE\uFFFF]/g;
+    const LONE_HIGH_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g;
+    const LONE_LOW_SURROGATE  = /(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g;
+
+    function sanitiseXmlText(str) {
+        /* Tab / LF / CR are legal XML but meaningless in an SVG label, and an
+           attribute parser rewrites them to spaces anyway — do it here, so that
+           what is measured is what is drawn. */
+        return str
+            .replace(/[\t\n\r]/g, ' ')
+            .replace(XML_INVALID_CHARS, ' ')
+            .replace(LONE_HIGH_SURROGATE, ' ')
+            .replace(LONE_LOW_SURROGATE, '$1 ');
+    }
+
     function esc(s) {
         if (s === null || s === undefined) return '';
-        return String(s)
+        return sanitiseXmlText(String(s))
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
@@ -246,19 +408,47 @@
         return keep;
     }
 
+    /* Uniform decimation, keeping the first and last point. The bound on
+       Douglas-Peucker's quadratic worst case: see the header. Index-based, so the
+       output is still a SUBSET of the input — nothing is invented or moved. */
+    function decimateTo(pts, cap) {
+        if (cap < 2 || pts.length <= cap) return pts;
+        const out = [];
+        let last = -1;
+        for (let i = 0; i < cap; i++) {
+            const idx = Math.round(i * (pts.length - 1) / (cap - 1));
+            if (idx === last) continue;
+            out.push(pts[idx]);
+            last = idx;
+        }
+        if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+        return out;
+    }
+
+    function pointCap(opts) {
+        const o = opts || {};
+        if (o.maxPoints === 0 || o.maxPoints === Infinity || o.maxPoints === false) return 0;
+        const n = Math.floor(num(o.maxPoints, MAX_SIMPLIFY_POINTS));
+        return isFinite(n) && n >= 2 ? n : MAX_SIMPLIFY_POINTS;
+    }
+
     /* Public simplifier. Takes and returns lat/lon points — the shape
-       geo-provider produces and the shape a caller should PERSIST. */
-    function simplify(points, toleranceKm) {
-        const src = [];
+       geo-provider produces. NOTE: the thing to PERSIST is `view.geometryDoc`,
+       which carries these points together with their provenance; a bare array
+       cannot, and losing the label used to turn an estimate into a measurement. */
+    function simplify(points, toleranceKm, opts) {
+        let src = [];
         const list = Array.isArray(points) ? points : [];
         for (let i = 0; i < list.length; i++) {
             const c = coordOf(list[i]);
             if (c) src.push(c);
         }
+        const cap = pointCap(opts);
+        if (cap && src.length > cap) src = decimateTo(src, cap);
         if (src.length <= 2) return src;
 
         const tolKm = num(toleranceKm, DEFAULT_TOL_KM);
-        if (!(tolKm > 0)) return src;          /* 0 / negative / NaN => no thinning */
+        if (!(tolKm > 0)) return src;          /* 0 / negative => explicit no-thinning */
 
         const perUnit = kmPerUnit(referenceLat(src));
         if (!(perUnit > 0)) return src;
@@ -304,10 +494,65 @@
         return Math.sqrt(worst) * perUnit;
     }
 
-    /* Byte cost of persisting a line, as JSON. Requirement: what goes into
+    /* Byte cost of persisting something, as JSON. Requirement: what goes into
        Firestore is the simplified line, and the caller can prove it here. */
-    function estimatePayloadBytes(points) {
-        try { return JSON.stringify(points || []).length; } catch (e) { return 0; }
+    function estimatePayloadBytes(value) {
+        try { return JSON.stringify(value === undefined ? null : value).length; }
+        catch (e) { return 0; }
+    }
+
+    /* ── Outlier-resistant bounding box ──
+       `pts` are projected {x, y} entries. Returns null — meaning "use the plain
+       bounding box" — unless all three guards in the constants above are
+       satisfied. Median absolute deviation rather than a percentile trim: a route
+       is a LINE, so its outermost 1% of vertices are its start and its end, and
+       trimming by percentile would crop real geography off every map. */
+    function medianOf(sorted) {
+        const n = sorted.length;
+        if (n === 0) return 0;
+        const mid = n >> 1;
+        return (n % 2) ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    function robustLineBounds(pts) {
+        const n = pts.length;
+        if (n < MIN_POINTS_FOR_ROBUST_FIT) return null;
+
+        const xs = [], ys = [];
+        for (let i = 0; i < n; i++) { xs.push(pts[i].x); ys.push(pts[i].y); }
+        xs.sort(function (a, b) { return a - b; });
+        ys.sort(function (a, b) { return a - b; });
+        const medX = medianOf(xs), medY = medianOf(ys);
+
+        const devs = [];
+        for (let i = 0; i < n; i++) {
+            devs.push(Math.abs(pts[i].x - medX) + Math.abs(pts[i].y - medY));
+        }
+        const sortedDevs = devs.slice().sort(function (a, b) { return a - b; });
+        const medDev = medianOf(sortedDevs);
+        if (!(medDev > 0)) return null;         /* every point on one spot */
+
+        const threshold = medDev * OUTLIER_MAD_FACTOR;
+        const drop = {};
+        let outliers = 0;
+        for (let i = 1; i < n - 1; i++) {
+            if (devs[i] <= threshold) continue;
+            /* Spike test — the guard that separates "corrupt vertex" from
+               "legitimate distant arm". A point the route genuinely travels
+               through sits on the chord between its neighbours; a spike does not. */
+            const chord = Math.sqrt(segDistSq(
+                [pts[i].x, pts[i].y],
+                [pts[i - 1].x, pts[i - 1].y],
+                [pts[i + 1].x, pts[i + 1].y]
+            ));
+            if (chord >= OUTLIER_SPIKE_SHARE * devs[i]) { drop[i] = 1; outliers++; }
+        }
+        if (outliers === 0) return null;
+        if (outliers > Math.max(3, Math.floor(n * MAX_OUTLIER_SHARE))) return null;
+
+        const kept = [];
+        for (let i = 0; i < n; i++) if (!drop[i]) kept.push(pts[i]);
+        return { points: kept, outliers: outliers };
     }
 
     /* ── Waypoints from the plan ──
@@ -326,13 +571,19 @@
         }
 
         /* No legs anywhere (all-rest plan, or a 1-place trip): the ordered places
-           are still the only geography there is, and they all belong to day 1. */
+           are still the only geography there is, and they belong to day 1 — unless
+           the plan has NO days, in which case there is no day to belong to and
+           `day: null` says so. Claiming day 1 of a zero-day plan was a real defect:
+           a malformed `{ days: [], order: [A, B] }` produced two markers both
+           labelled "day 1", inventing the very structure the invariant
+           `view.days.length === plan.days.length` exists to protect. */
         if (legTotal === 0) {
             const src = order.length ? order : (days.length && days[0] && days[0].startPlace ? [days[0].startPlace] : []);
+            const day = days.length ? 0 : null;
             for (let i = 0; i < src.length; i++) {
                 const c = coordOf(src[i]);
                 if (!c) continue;
-                out.push({ name: nameOf(src[i]), lat: c[0], lon: c[1], day: 0, dayEnd: i === src.length - 1 });
+                out.push({ name: nameOf(src[i]), lat: c[0], lon: c[1], day: day, dayEnd: i === src.length - 1 });
             }
             return dedupeAdjacent(out);
         }
@@ -437,37 +688,70 @@
         const tolKm = nonNeg(a.toleranceKm, DEFAULT_TOL_KM);
 
         const ways = waypointsFromPlan(plan);
+        const warnings = [];
 
-        /* Provenance. An explicit argument wins; otherwise the non-enumerable
-           `source` marker geo-provider attaches to its array; otherwise, if we
-           were handed a usable line with no label at all, it is road geometry
-           (the only thing that produces one). */
-        const rawGeom = Array.isArray(a.geometry) ? a.geometry : [];
+        /* ── Geometry in ──
+           Three accepted shapes, because the round trip has to close:
+             · a bare [[lat,lon],...] array (what geo-provider returns);
+             · that same array carrying geo-provider's non-enumerable `source`;
+             · a persisted `geometryDoc` — { points, source } — which is the ONLY
+               one of the three that survives JSON.stringify with its label
+               intact, and therefore the only one that survives Firestore. */
+        let rawGeom = [], envelopeSource = null;
+        if (Array.isArray(a.geometry)) {
+            rawGeom = a.geometry;
+        } else if (a.geometry && typeof a.geometry === 'object' && Array.isArray(a.geometry.points)) {
+            rawGeom = a.geometry.points;
+            if (typeof a.geometry.source === 'string') envelopeSource = a.geometry.source;
+            /* a.geometry.real is deliberately ignored: the label is the evidence,
+               a stored boolean is only somebody's old conclusion about it. */
+        }
         const geomPts = [];
         for (let i = 0; i < rawGeom.length; i++) {
             const c = coordOf(rawGeom[i]);
             if (c) geomPts.push(c);
         }
+
+        /* ── Provenance: an ALLOWLIST ──
+           Explicit argument, then the persisted envelope, then the in-memory
+           marker. Absence is NOT road data — it is 'unknown', and unknown renders
+           as an estimate. Matched literally, so 'OSRM', 'haversine', 'guess' and
+           '' all land on 'unknown': the failure direction is captioning a real
+           route as an estimate, never the reverse. */
         let declared = typeof a.geometrySource === 'string' ? a.geometrySource : null;
-        if (!declared && rawGeom && typeof rawGeom.source === 'string') declared = rawGeom.source;
+        if (declared === null) declared = envelopeSource;
+        if (declared === null && rawGeom && typeof rawGeom.source === 'string') declared = rawGeom.source;
 
         const usable = geomPts.length >= 2;
         let source, real;
-        if (usable && declared !== 'straight' && declared !== 'none') {
-            source = declared || 'osrm';
-            real = true;
-        } else if (usable) {
-            source = declared;                 /* caller says these ARE straight lines */
-            real = false;
+        if (usable) {
+            real = declared === REAL_GEOMETRY_SOURCE;
+            source = (declared !== null && KNOWN_SOURCES[declared]) ? declared : 'unknown';
+            if (!real) {
+                warnings.push(source === 'straight'
+                    ? 'geometry-straight'
+                    : 'geometry-source-unknown:' + (declared === null ? '(absent)' : declared));
+            }
         } else {
-            source = ways.length >= 2 ? 'straight' : 'none';
             real = false;
+            source = ways.length >= 2 ? 'straight' : 'none';
+            if (source === 'straight') warnings.push('geometry-straight');
         }
 
         /* The line to draw: real geometry, or the straight fallback through the
            stops. Both go through the same pipeline from here on. */
         let line = usable ? geomPts : ways.map(function (w) { return [w.lat, w.lon]; });
         if (line.length === 1 && ways.length === 0) line = [];
+
+        /* Bound the quadratic worst case BEFORE any per-day work, so every slice
+           is drawn from the same decimated line and the seams still meet. */
+        const cap = pointCap(a);
+        let decimatedFrom = 0;
+        if (cap && line.length > cap) {
+            decimatedFrom = line.length;
+            line = decimateTo(line, cap);
+            warnings.push('geometry-decimated:' + decimatedFrom);
+        }
 
         const projLine = [];
         for (let i = 0; i < line.length; i++) projLine.push(project(line[i][0], line[i][1]) || [0, 0]);
@@ -520,45 +804,91 @@
         }
 
         /* ── Bounding box over everything that will be drawn ── */
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        let minLat = Infinity, minLon = Infinity, maxLat = -Infinity, maxLon = -Infinity;
-        const seePoint = function (lat, lon) {
+        const availW = Math.max(1, width - 2 * padding);
+        const availH = Math.max(1, height - 2 * padding);
+
+        const entryOf = function (lat, lon) {
             const xy = project(lat, lon);
-            if (!xy) return;
-            if (xy[0] < minX) minX = xy[0];
-            if (xy[0] > maxX) maxX = xy[0];
-            if (xy[1] < minY) minY = xy[1];
-            if (xy[1] > maxY) maxY = xy[1];
-            if (lat < minLat) minLat = lat;
-            if (lat > maxLat) maxLat = lat;
-            if (lon < minLon) minLon = lon;
-            if (lon > maxLon) maxLon = lon;
+            return xy ? { x: xy[0], y: xy[1], lat: lat, lon: lon } : null;
         };
+        const linePoints = [], markerPoints = [];
         for (let d = 0; d < days.length; d++) {
             for (let i = 0; i < days[d].points.length; i++) {
-                seePoint(days[d].points[i][0], days[d].points[i][1]);
+                const e = entryOf(days[d].points[i][0], days[d].points[i][1]);
+                if (e) linePoints.push(e);
             }
         }
-        for (let w = 0; w < ways.length; w++) seePoint(ways[w].lat, ways[w].lon);
-
-        const hasContent = isFinite(minX) && isFinite(minY);
-        if (!hasContent) {
-            minX = minY = 0; maxX = maxY = 0;
-            minLat = maxLat = minLon = maxLon = 0;
+        for (let w = 0; w < ways.length; w++) {
+            const e = entryOf(ways[w].lat, ways[w].lon);
+            if (e) markerPoints.push(e);
         }
 
+        const boxOf = function (lists) {
+            const b = {
+                minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity,
+                minLat: Infinity, maxLat: -Infinity, minLon: Infinity, maxLon: -Infinity, n: 0
+            };
+            for (let l = 0; l < lists.length; l++) {
+                const list = lists[l];
+                for (let i = 0; i < list.length; i++) {
+                    const e = list[i];
+                    if (e.x < b.minX) b.minX = e.x;
+                    if (e.x > b.maxX) b.maxX = e.x;
+                    if (e.y < b.minY) b.minY = e.y;
+                    if (e.y > b.maxY) b.maxY = e.y;
+                    if (e.lat < b.minLat) b.minLat = e.lat;
+                    if (e.lat > b.maxLat) b.maxLat = e.lat;
+                    if (e.lon < b.minLon) b.minLon = e.lon;
+                    if (e.lon > b.maxLon) b.maxLon = e.lon;
+                    b.n++;
+                }
+            }
+            return b;
+        };
         /* Fit, preserving the aspect ratio. A degenerate box (one stop, or two
            stops at identical coordinates) has zero extent in one or both axes:
            scale from the other axis, or fall back to 1 and centre the point. */
+        const scaleOf = function (b) {
+            const dx = b.maxX - b.minX, dy = b.maxY - b.minY;
+            let s;
+            if (dx > 0 && dy > 0) s = Math.min(availW / dx, availH / dy);
+            else if (dx > 0) s = availW / dx;
+            else if (dy > 0) s = availH / dy;
+            else s = 1;
+            return (isFinite(s) && s > 0) ? s : 1;
+        };
+
+        let box = boxOf([linePoints, markerPoints]);
+        let outlierPoints = 0;
+
+        /* One corrupt vertex in an otherwise correct polyline used to collapse the
+           scale 24x and render a whole country as a smudge — still solid, still
+           captioned as road data. Refit without the far outliers when, and only
+           when, doing so actually rescues the map. The excluded points are still
+           drawn: they run off the edge of the viewBox and are clipped there, so
+           the anomaly stays visible instead of being quietly deleted. */
+        const robust = robustLineBounds(linePoints);
+        if (robust) {
+            const candidate = boxOf([robust.points, markerPoints]);
+            if (scaleOf(candidate) >= MIN_SCALE_GAIN * scaleOf(box)) {
+                box = candidate;
+                outlierPoints = robust.outliers;
+                warnings.push('geometry-outliers:' + outlierPoints);
+            }
+        }
+
+        const hasContent = box.n > 0 && isFinite(box.minX) && isFinite(box.minY);
+        let minX, maxX, minY, maxY, minLat, maxLat, minLon, maxLon;
+        if (hasContent) {
+            minX = box.minX; maxX = box.maxX; minY = box.minY; maxY = box.maxY;
+            minLat = box.minLat; maxLat = box.maxLat; minLon = box.minLon; maxLon = box.maxLon;
+        } else {
+            minX = maxX = minY = maxY = 0;
+            minLat = maxLat = minLon = maxLon = 0;
+        }
+
         const dx = maxX - minX, dy = maxY - minY;
-        const availW = Math.max(1, width - 2 * padding);
-        const availH = Math.max(1, height - 2 * padding);
-        let scale;
-        if (dx > 0 && dy > 0) scale = Math.min(availW / dx, availH / dy);
-        else if (dx > 0) scale = availW / dx;
-        else if (dy > 0) scale = availH / dy;
-        else scale = 1;
-        if (!isFinite(scale) || scale <= 0) scale = 1;
+        const scale = hasContent ? scaleOf(box) : 1;
         const offX = padding + (availW - dx * scale) / 2;
         const offY = padding + (availH - dy * scale) / 2;
         const toView = function (lat, lon) {
@@ -580,20 +910,30 @@
         for (let w = 0; w < ways.length; w++) {
             const v = toView(ways[w].lat, ways[w].lon);
             if (!v) continue;
+            /* `day` is null when the plan has no days to belong to. A marker must
+               never name a day the itinerary does not have — that is the same
+               class of fabrication as an unlabelled estimate drawn as a road. */
+            const di = ways[w].day;
+            const hasDay = di !== null && di !== undefined && days[di] !== undefined;
             markers.push({
                 name: ways[w].name,
                 lat: ways[w].lat, lon: ways[w].lon,
                 x: v[0], y: v[1],
-                day: ways[w].day,
-                dayNumber: (days[ways[w].day] ? days[ways[w].day].day : ways[w].day + 1),
-                color: DAY_COLORS[ways[w].day % DAY_COLORS.length],
-                overnight: !!ways[w].dayEnd && w !== ways.length - 1,
+                day: hasDay ? di : null,
+                dayNumber: hasDay ? days[di].day : null,
+                color: hasDay ? DAY_COLORS[di % DAY_COLORS.length] : UNASSIGNED_COLOR,
+                overnight: hasDay && !!ways[w].dayEnd && w !== ways.length - 1,
                 kind: w === 0 ? 'start' : (w === ways.length - 1 ? 'end' : 'stop')
             });
         }
+        for (let i = 0; i < markers.length; i++) {
+            if (markers[i].day === null) { warnings.push('markers-without-day'); break; }
+        }
 
-        /* The one line a caller should ever persist: simplified, day-joined,
-           without the duplicated seam point between consecutive days. */
+        /* The simplified, day-joined line, without the duplicated seam point
+           between consecutive days. This is what gets DRAWN and exported — but
+           see geometryDoc below for what gets PERSISTED: a bare array cannot
+           carry its own provenance through JSON.stringify. */
         const geometry = [];
         for (let d = 0; d < days.length; d++) {
             const p = days[d].points;
@@ -603,6 +943,26 @@
                 geometry.push(p[i]);
             }
         }
+
+        /* ── The persistable document ──
+           Points AND provenance in one plain JSON object, so that
+           `buildMapView({ geometry: JSON.parse(saved) })` reaches the same verdict
+           the original render did. Persisting `geometry` alone loses the label,
+           and a lost label used to be read as road data. */
+        const geometryDoc = {
+            points: geometry,
+            source: source,
+            toleranceKm: tolKm,
+            pointCount: geometry.length
+        };
+        if (decimatedFrom) geometryDoc.decimatedFrom = decimatedFrom;
+        const geometryBytes = estimatePayloadBytes(geometryDoc);
+
+        /* A tolerance of 0 is honoured — a print or export view may legitimately
+           want every vertex — but the module exists to stop a 199 KB line reaching
+           a 1 MB document, so the consequence is stated rather than discovered. */
+        if (!(tolKm > 0) && geometry.length > 0) warnings.push('geometry-unsimplified');
+        if (geometryBytes > PERSIST_BUDGET_BYTES) warnings.push('persist-oversize:' + geometryBytes);
 
         let drawn = 0;
         for (let d = 0; d < days.length; d++) if (days[d].path.length >= 2) drawn++;
@@ -618,12 +978,14 @@
             geometryReal: real,
             geometrySource: source,
             geometry: geometry,
-            geometryBytes: estimatePayloadBytes(geometry),
+            geometryDoc: geometryDoc,
+            geometryBytes: geometryBytes,
             simplification: {
                 toleranceKm: tolKm,
                 inputPoints: inputPoints,
                 outputPoints: outputPoints,
-                rawPoints: geomPts.length
+                rawPoints: geomPts.length,
+                decimatedFrom: decimatedFrom
             },
             bounds: {
                 minLat: hasContent ? minLat : 0, maxLat: hasContent ? maxLat : 0,
@@ -631,6 +993,8 @@
                 minX: minX, maxX: maxX, minY: minY, maxY: maxY,
                 scale: scale
             },
+            fit: { robust: outlierPoints > 0, outlierPoints: outlierPoints },
+            warnings: warnings,
             empty: markers.length === 0 && drawn === 0
         };
     }
@@ -679,11 +1043,20 @@
         const real = view.geometryReal === true;
 
         const title = tr(ctx, 'map.title');
-        const desc = tr(ctx, real ? 'map.sourceRoad' : 'map.sourceStraight');
+        /* Three source states, three captions. 'unknown' must NOT borrow the
+           straight-line wording: an unlabelled polyline is not known to be a
+           straight line either, and saying so would be a second invention on top
+           of the first. What is true is that its provenance is unknown. */
+        const srcKey = real ? 'map.sourceRoad'
+            : (view.geometrySource === 'straight' || view.geometrySource === 'none'
+                ? 'map.sourceStraight' : 'map.sourceUnknown');
+        const noteKey = (view.geometrySource === 'straight' || view.geometrySource === 'none')
+            ? 'map.straightLineNote' : 'map.unknownSourceNote';
+        const desc = tr(ctx, srcKey);
 
         let svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' +
             fmt(w) + ' ' + fmt(h) + '" preserveAspectRatio="xMidYMid meet" ' +
-            'role="img" aria-label="' + esc(title + ' — ' + desc) + '" ' +
+            'overflow="hidden" role="img" aria-label="' + esc(title + ' — ' + desc) + '" ' +
             'class="travio-map" style="width:100%;height:auto;display:block">';
         svg += '<title>' + esc(title) + '</title><desc>' + esc(desc) + '</desc>';
         svg += '<rect x="0" y="0" width="' + fmt(w) + '" height="' + fmt(h) +
@@ -747,7 +1120,7 @@
         if (!real) {
             svg += '<text x="' + fmt(w / 2) + '" y="' + fmt(h - 10) +
                 '" text-anchor="middle" font-family="Space Mono, monospace" font-size="11" fill="' +
-                MUTED_COLOR + '">' + esc(tr(ctx, 'map.straightLineNote')) + '</text>';
+                MUTED_COLOR + '">' + esc(tr(ctx, noteKey)) + '</text>';
         }
         return svg + '</svg>';
     }

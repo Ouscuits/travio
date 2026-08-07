@@ -160,6 +160,11 @@ function syntheticGeometry(n) {
 }
 
 const BIG_GEOMETRY = syntheticGeometry(10000);
+/* Labelled exactly the way js/geo-provider.js hands its polyline over: a
+   NON-ENUMERABLE `source` marker on the array. Tests that care about what
+   survives persistence use an unlabelled copy (`BIG_GEOMETRY.slice()`), because
+   that is what a JSON round trip actually leaves you holding. */
+Object.defineProperty(BIG_GEOMETRY, 'source', { value: 'osrm', enumerable: false });
 
 /* Bytes of <path d="..."> a view actually ships inside the SVG. */
 function pathBytes(view) {
@@ -420,9 +425,13 @@ test('M5 view.geometry is the simplified line, not the raw one', function () {
 
 test('M5 the persisted payload is a rounding error against the Firestore 1 MB limit', function () {
     const view = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY });
-    assert.strictEqual(view.geometryBytes, estimatePayloadBytes(view.geometry));
+    /* The byte count is of the DOC — points plus provenance — because the doc is
+       what a caller stores. Persisting the bare array is what lost the label. */
+    assert.strictEqual(view.geometryBytes, estimatePayloadBytes(view.geometryDoc));
     assert.ok(view.geometryBytes < 20 * 1024,
         'persisted geometry is ' + view.geometryBytes + ' bytes');
+    assert.ok(view.geometryBytes - estimatePayloadBytes(view.geometry) < 100,
+        'provenance must cost tens of bytes, not kilobytes');
     /* The raw line is the thing that would have eaten a fifth of the document. */
     assert.ok(estimatePayloadBytes(BIG_GEOMETRY) > 10 * view.geometryBytes);
 });
@@ -601,7 +610,9 @@ test('D a plan whose days hold no legs at all still shows its places', function 
 
 test('D geometry entries in the wrong shape are ignored, not fatal', function () {
     const geom = [[41, 2], 'nonsense', null, { lat: 41.2, lon: 2.2 }, [41.4, 2.4], undefined];
-    const view = buildMapView({ plan: makePlan([[MADRID, BARCELONA]]), geometry: geom });
+    const view = buildMapView({
+        plan: makePlan([[MADRID, BARCELONA]]), geometry: geom, geometrySource: 'osrm'
+    });
     assert.doesNotThrow(function () { renderMapSvg(view, null); });
     assert.strictEqual(view.geometryReal, true);
 });
@@ -701,6 +712,40 @@ test('S the plan owns the day numbers: a non-sequential plan is not renumbered',
     assert.strictEqual(view.days[1].day, 4);
     assert.strictEqual(view.markers[1].dayNumber, 3);
     assert.strictEqual(view.markers[2].dayNumber, 4);
+});
+
+test('S a plan with NO days cannot produce markers that claim day 1 (round 2)', function () {
+    /* `{ days: [], order: [A, B] }` used to yield two markers both labelled
+       "day 1" — inventing the day structure the invariant exists to protect. */
+    const view = buildMapView({ plan: { days: [], order: [MADRID, BARCELONA] } });
+    assert.strictEqual(view.days.length, 0);
+    assert.strictEqual(view.markers.length, 2);
+    for (let i = 0; i < view.markers.length; i++) {
+        assert.strictEqual(view.markers[i].day, null, 'marker invented a day');
+        assert.strictEqual(view.markers[i].dayNumber, null);
+        assert.strictEqual(view.markers[i].overnight, false);
+    }
+    assert.ok(view.warnings.indexOf('markers-without-day') !== -1);
+});
+
+test('S a day-less marker is not coloured as if it were a day-1 stop', function () {
+    const view = buildMapView({ plan: { days: [], order: [MADRID, BARCELONA] } });
+    for (let i = 0; i < view.markers.length; i++) {
+        assert.notStrictEqual(view.markers[i].color, DAY_COLORS[0]);
+    }
+    assert.doesNotThrow(function () { renderMapSvg(view, null); });
+});
+
+test('S a plan WITH days still assigns every marker to a real day', function () {
+    /* The complement of the case above: day 0 exists, so day 0 is legitimate. */
+    const plan = makePlan([[MADRID], [MADRID]]);
+    plan.order = [MADRID, BARCELONA];
+    const view = buildMapView({ plan: plan });
+    for (let i = 0; i < view.markers.length; i++) {
+        assert.strictEqual(view.markers[i].day, 0);
+        assert.strictEqual(view.markers[i].dayNumber, 1);
+    }
+    assert.ok(view.warnings.indexOf('markers-without-day') === -1);
 });
 
 test('S a round trip keeps both the origin and the returning end marker', function () {
@@ -820,6 +865,294 @@ test('F the fallback still draws a usable route rather than nothing', function (
     for (let d = 0; d < view.days.length; d++) if (view.days[d].path.length >= 2) drawn++;
     assert.strictEqual(drawn, 4);
     assert.strictEqual(view.empty, false);
+});
+
+/* ── P  provenance: an estimate must not become a measurement (round 2) ── */
+test('P the save/reload cycle preserves the estimate verdict, step for step', function () {
+    /* The exact defect: OSRM down -> straight lines, correctly flagged; the
+       caller persists; the user reopens; the line comes back SOLID and
+       UNCAPTIONED because the label did not survive the JSON. */
+    const step1 = buildMapView({ plan: FOUR_DAY_PLAN });
+    assert.strictEqual(step1.geometryReal, false);
+    assert.strictEqual(step1.geometrySource, 'straight');
+
+    const stored = JSON.parse(JSON.stringify({ map: step1.geometryDoc }));
+    assert.strictEqual(stored.map.source, 'straight', 'the label must survive JSON');
+
+    const step3 = buildMapView({ plan: FOUR_DAY_PLAN, geometry: stored.map });
+    assert.strictEqual(step3.geometryReal, false, 'an estimate came back as a measurement');
+    assert.strictEqual(step3.geometrySource, 'straight');
+    const svg = renderMapSvg(step3, null);
+    assert.ok(svg.indexOf('stroke-dasharray') !== -1, 'the reloaded line must still be dashed');
+    assert.ok(svg.indexOf('map.straightLineNote') !== -1, 'the caption must still be there');
+});
+
+test('P a bare point array cannot carry provenance, so reloading one is UNKNOWN', function () {
+    const doc = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY });
+    const bare = JSON.parse(JSON.stringify(doc.geometry));
+    assert.ok(!('source' in bare), 'JSON.stringify drops non-index properties — it always did');
+    const back = buildMapView({ plan: FOUR_DAY_PLAN, geometry: bare });
+    assert.strictEqual(back.geometryReal, false);
+    assert.strictEqual(back.geometrySource, 'unknown');
+});
+
+test('P a road-data verdict survives the round trip when the doc is persisted', function () {
+    const first = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY });
+    assert.strictEqual(first.geometryReal, true);
+    const back = buildMapView({
+        plan: FOUR_DAY_PLAN,
+        geometry: JSON.parse(JSON.stringify(first.geometryDoc))
+    });
+    assert.strictEqual(back.geometryReal, true);
+    assert.strictEqual(back.geometrySource, 'osrm');
+    /* And the reloaded map is the same map. */
+    assert.deepStrictEqual(back.geometry, first.geometry);
+});
+
+test('P provenance is an allowlist: only the literal "osrm" is road data', function () {
+    const cases = ['haversine', 'guess', 'STRAIGHT', ' osrm ', 'OSRM', '', 'road', 'true'];
+    for (let i = 0; i < cases.length; i++) {
+        const v = buildMapView({
+            plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice(), geometrySource: cases[i]
+        });
+        assert.strictEqual(v.geometryReal, false, JSON.stringify(cases[i]) + ' must not be road data');
+    }
+    const ok = buildMapView({
+        plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice(), geometrySource: 'osrm'
+    });
+    assert.strictEqual(ok.geometryReal, true);
+});
+
+test('P "haversine" — this project\'s own word for an estimate — is drawn as an estimate', function () {
+    const v = buildMapView({
+        plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice(), geometrySource: 'haversine'
+    });
+    assert.strictEqual(v.geometryReal, false);
+    assert.ok(renderMapSvg(v, null).indexOf('stroke-dasharray') !== -1);
+});
+
+test('P a stored real:true flag cannot override the label it disagrees with', function () {
+    const v = buildMapView({
+        plan: FOUR_DAY_PLAN,
+        geometry: { points: BIG_GEOMETRY.slice(), source: 'straight', real: true }
+    });
+    assert.strictEqual(v.geometryReal, false, 'the label is the evidence, not the boolean');
+});
+
+test('P an unknown source does not borrow the straight-line wording', function () {
+    const unknown = renderMapSvg(buildMapView({
+        plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice()
+    }), null);
+    assert.ok(unknown.indexOf('map.sourceUnknown') !== -1);
+    assert.ok(unknown.indexOf('map.unknownSourceNote') !== -1);
+    assert.ok(unknown.indexOf('map.straightLineNote') === -1,
+        'an unlabelled polyline is not known to be a straight line either');
+
+    const straight = renderMapSvg(buildMapView({ plan: FOUR_DAY_PLAN }), null);
+    assert.ok(straight.indexOf('map.sourceStraight') !== -1);
+    assert.ok(straight.indexOf('map.sourceUnknown') === -1);
+});
+
+test('P every non-road verdict is also carried in view.warnings for the caller', function () {
+    const straight = buildMapView({ plan: FOUR_DAY_PLAN });
+    assert.ok(straight.warnings.indexOf('geometry-straight') !== -1);
+    const unknown = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice() });
+    assert.ok(unknown.warnings.join('|').indexOf('geometry-source-unknown:(absent)') !== -1);
+    const bogus = buildMapView({
+        plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice(), geometrySource: 'guess'
+    });
+    assert.ok(bogus.warnings.join('|').indexOf('geometry-source-unknown:guess') !== -1);
+    const road = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY });
+    assert.strictEqual(road.warnings.length, 0);
+});
+
+/* ── O  one corrupt vertex must not shrink the whole map (round 2) ── */
+function denseLine(n) {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        pts.push([MADRID.lat + (BARCELONA.lat - MADRID.lat) * t + 0.02 * Math.sin(t * 40),
+                  MADRID.lon + (BARCELONA.lon - MADRID.lon) * t]);
+    }
+    return pts;
+}
+const ONE_DAY_PLAN = makePlan([[MADRID, BARCELONA]]);
+function markerSeparation(view) {
+    const a = view.markers[0], b = view.markers[view.markers.length - 1];
+    return Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+}
+
+test('O a single corrupt vertex no longer collapses the fit 24x', function () {
+    const clean = denseLine(1000);
+    const corrupt = clean.slice();
+    corrupt[500] = [-35.0, -25.0];             // South Atlantic
+    const good = buildMapView({ plan: ONE_DAY_PLAN, geometry: clean, geometrySource: 'osrm' });
+    const bad = buildMapView({ plan: ONE_DAY_PLAN, geometry: corrupt, geometrySource: 'osrm' });
+    assert.ok(markerSeparation(good) > 500, 'baseline sanity');
+    assert.ok(markerSeparation(bad) > 0.99 * markerSeparation(good),
+        'Madrid-Barcelona collapsed to ' + markerSeparation(bad).toFixed(1) + ' units');
+    assert.strictEqual(bad.fit.outlierPoints, 1);
+    assert.ok(bad.warnings.indexOf('geometry-outliers:1') !== -1);
+});
+
+test('O the excluded vertex is still DRAWN, off the edge, never deleted', function () {
+    const corrupt = denseLine(1000);
+    corrupt[500] = [-35.0, -25.0];
+    const view = buildMapView({ plan: ONE_DAY_PLAN, geometry: corrupt, geometrySource: 'osrm' });
+    const outside = view.days[0].path.filter(function (p) {
+        return p[0] < 0 || p[0] > view.width || p[1] < 0 || p[1] > view.height;
+    });
+    assert.ok(outside.length > 0, 'the anomaly must stay visible, running off the map');
+    /* The SVG viewport clips it, so the rest of the map is legible. */
+    assert.ok(renderMapSvg(view, null).indexOf('overflow="hidden"') !== -1);
+});
+
+test('O a legitimately distant arm is never mistaken for a corrupt vertex', function () {
+    /* 300 points around Barcelona, then a long straight run to Madrid. Every far
+       point sits ON the chord of its neighbours, so none is a spike. */
+    const line = [];
+    for (let i = 0; i < 300; i++) line.push([41.38 + 0.002 * Math.sin(i), 2.17 + 0.002 * Math.cos(i)]);
+    for (let i = 0; i < 40; i++) {
+        const t = i / 39;
+        line.push([41.38 + (MADRID.lat - 41.38) * t, 2.17 + (MADRID.lon - 2.17) * t]);
+    }
+    const view = buildMapView({ plan: ONE_DAY_PLAN, geometry: line, geometrySource: 'osrm' });
+    assert.strictEqual(view.fit.outlierPoints, 0);
+    assert.strictEqual(view.fit.robust, false);
+});
+
+test('O a genuine out-and-back spur is kept, however sharp', function () {
+    const line = [];
+    for (let i = 0; i < 200; i++) {
+        const t = i / 199;
+        line.push([40.4 + t * 1.0, -3.7 + t * 5.8]);
+    }
+    line.splice(100, 0, [42.5, -0.5], [42.9, -0.4], [42.5, -0.45]);
+    const view = buildMapView({ plan: ONE_DAY_PLAN, geometry: line, geometrySource: 'osrm' });
+    assert.strictEqual(view.fit.outlierPoints, 0);
+});
+
+test('O a distant STOP is never excluded — markers are not candidates at all', function () {
+    /* Nine stops inside 5 km plus Madrid 500 km away: the shape that a plain
+       median-deviation rule would have pushed off the map. */
+    const stops = [];
+    for (let i = 0; i < 9; i++) stops.push(P('S' + i, 41.38 + i * 0.005, 2.17 + i * 0.005));
+    stops.push(MADRID);
+    const view = buildMapView({ plan: makePlan([stops]) });
+    assert.strictEqual(view.fit.outlierPoints, 0);
+    for (let i = 0; i < view.markers.length; i++) {
+        assert.ok(view.markers[i].x >= 0 && view.markers[i].x <= view.width,
+            view.markers[i].name + ' was pushed off the map');
+    }
+});
+
+test('O a clean route is untouched: no refit, no flag, byte-identical output', function () {
+    const clean = denseLine(1000);
+    const view = buildMapView({ plan: ONE_DAY_PLAN, geometry: clean, geometrySource: 'osrm' });
+    assert.strictEqual(view.fit.robust, false);
+    assert.strictEqual(view.fit.outlierPoints, 0);
+    assert.strictEqual(view.warnings.length, 0);
+});
+
+/* ── T  the quadratic worst case is bounded (round 2) ── */
+function decayingSpikes(n) {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        const amp = 0.30 * (1 - t * 0.999);
+        pts.push([40 + (i % 2 ? amp : 0) + 6 * t, -3 + 10 * t]);
+    }
+    return pts;
+}
+
+test('T an oversized line is decimated to the cap, and says so', function () {
+    const huge = decayingSpikes(40000);
+    const view = buildMapView({ plan: ONE_DAY_PLAN, geometry: huge, geometrySource: 'osrm' });
+    assert.strictEqual(view.simplification.decimatedFrom, 40000);
+    assert.ok(view.warnings.indexOf('geometry-decimated:40000') !== -1);
+    assert.ok(view.simplification.outputPoints <= 15001);
+});
+
+test('T decimation keeps the endpoints and stays a subset of the input', function () {
+    const huge = decayingSpikes(40000);
+    const out = simplify(huge, 0.5);
+    assert.deepStrictEqual(out[0], huge[0]);
+    assert.deepStrictEqual(out[out.length - 1], huge[huge.length - 1]);
+    assert.ok(out.length <= 15001);
+});
+
+test('T the cap is a bound on time, not on correctness: it can be switched off', function () {
+    const huge = decayingSpikes(20000);
+    const capped = simplify(huge, 0.5);
+    const uncapped = simplify(huge, 0.5, { maxPoints: 0 });
+    assert.ok(uncapped.length > capped.length);
+    assert.ok(uncapped.length > 15000, 'maxPoints: 0 must really disable the cap');
+});
+
+test('T 200,000 points, cap disabled, still do not overflow the stack', function () {
+    const huge = syntheticGeometry(200000);
+    let out = null;
+    assert.doesNotThrow(function () { out = simplify(huge, 0.5, { maxPoints: 0 }); });
+    assert.ok(out.length >= 2);
+    assert.deepStrictEqual(out[out.length - 1], huge[huge.length - 1]);
+});
+
+/* ── C  control characters break standalone XML, not just HTML (round 2) ── */
+const XML_ILLEGAL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFE\uFFFF]/;
+
+test('C a U+000B in a place name never reaches the SVG', function () {
+    const bad = P('Vall\u000Bs Occidental', 41.5, 2.1);
+    const svg = renderMapSvg(buildMapView({ plan: makePlan([[MADRID, bad]]) }), null);
+    assert.ok(!XML_ILLEGAL.test(svg), 'an XML 1.0 illegal character reached the output');
+    assert.ok(svg.indexOf('Vall s Occidental') !== -1, 'it must become a space, not vanish');
+});
+
+test('C every XML-illegal control character is neutralised, not escaped', function () {
+    const codes = [0, 1, 8, 11, 12, 14, 27, 31, 127];
+    for (let i = 0; i < codes.length; i++) {
+        const bad = P('A' + String.fromCharCode(codes[i]) + 'B', 41.5, 2.1);
+        const svg = renderMapSvg(buildMapView({ plan: makePlan([[MADRID, bad]]) }), null);
+        assert.ok(!XML_ILLEGAL.test(svg), 'char ' + codes[i] + ' survived');
+        assert.ok(svg.indexOf('A B') !== -1, 'char ' + codes[i] + ' joined the words');
+    }
+});
+
+test('C tab, newline and carriage return collapse to spaces', function () {
+    const bad = P('Sant\tJoan\nDespi\r', 41.5, 2.1);
+    const svg = renderMapSvg(buildMapView({ plan: makePlan([[MADRID, bad]]) }), null);
+    assert.ok(svg.indexOf('Sant Joan Despi') !== -1);
+    assert.ok(svg.indexOf('\n') === -1 && svg.indexOf('\t') === -1);
+});
+
+test('C lone surrogates cannot make the output unserialisable', function () {
+    const bad = P('X\uD800Y\uDC00Z', 41.5, 2.1);
+    const svg = renderMapSvg(buildMapView({ plan: makePlan([[MADRID, bad]]) }), null);
+    assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(svg), 'lone high surrogate survived');
+    assert.ok(!/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(svg), 'lone low surrogate survived');
+    assert.ok(svg.indexOf('X Y Z') !== -1);
+});
+
+test('C a valid astral character (emoji) is NOT damaged by the sanitiser', function () {
+    const ok = P('Café 😀 Central', 41.5, 2.1);
+    const svg = renderMapSvg(buildMapView({ plan: makePlan([[MADRID, ok]]) }), null);
+    assert.ok(svg.indexOf('Café 😀 Central') !== -1);
+});
+
+/* ── Tol  toleranceKm: 0 defeats the requirement the module exists for ── */
+test('Tol a tolerance of 0 is honoured but never silent', function () {
+    const view = buildMapView({
+        plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY, toleranceKm: 0
+    });
+    assert.ok(view.geometry.length > 5000, 'the caller really did get every vertex');
+    assert.ok(view.warnings.indexOf('geometry-unsimplified') !== -1);
+    assert.ok(view.warnings.join('|').indexOf('persist-oversize:') !== -1,
+        'a 190 KB line into a 1 MB document must be flagged');
+});
+
+test('Tol the default tolerance produces no size warning at all', function () {
+    const view = buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY });
+    assert.strictEqual(view.warnings.length, 0);
+    assert.ok(view.geometryBytes < 8 * 1024);
 });
 
 /* ── X  determinism ── */
