@@ -1394,9 +1394,13 @@ test('X7 a mixed matrix is never told it has no road data at all', function () {
 test('X7 numbersUnreliable(false) rules out withholding but cannot promise road data', function () {
     const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
     plan.warnings = ['unknown-distance: x'];
-    assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: false }), 'estimated');
+    /* The override rules out WITHHOLDING. It must not swing the claim to either
+       extreme: not to 'road' (it cannot promise road data) and not to 'estimated'
+       (it cannot assert the absence of road data either — that told an OSRM matrix
+       'no road data was available'). 'unconfirmed' claims nothing in either direction. */
+    assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: false }), 'unconfirmed');
     assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: false, matrixSource: 'osrm' }),
-        'estimated', 'an override must not upgrade the claim to road data');
+        'unconfirmed', 'an override must neither upgrade to road data nor assert its absence');
     assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: true }), 'unusable');
 });
 
@@ -1445,9 +1449,14 @@ test('X7 every one of the 20 engine warning codes reaches the file, structurally
         const covered = X.COVERED_WARNINGS;
         const verbatim = [];
         for (let i = 0; i < all.length; i++) if (!covered[all[i]]) verbatim.push(all[i]);
+        /* 'unresolved-place' is verbatim, not structural: its claimed cover was the
+           'N place(s) could not be located' note, which buildGpx emits and buildIcs does
+           not — so an ICS named a place the app never located and said underneath that
+           the figures came from the road graph. It now degrades the provenance AND keeps
+           its prose, which names the place. */
         assert.deepStrictEqual(verbatim, ['cap-default', 'days-clamped', 'duplicate-stop-removed',
             'empty-trip', 'missing-end', 'missing-start', 'no-places', 'optimisation-limited',
-            'stop-ignored']);
+            'stop-ignored', 'unresolved-place']);
 
         /* the verbatim ones really do come out */
         const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
@@ -1472,8 +1481,6 @@ test('X7 a structurally-represented warning is not ALSO dumped as raw prose', fu
     const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
     plan.warnings = ['distance-source: no road data at all — every distance is a straight-line estimate.',
         'rest-day: day 2 has no driving.',
-        'over-drive-cap: day 1 drives 421 min.',
-        'unresolved-place: "X" could not be located.',
         'round-trip: the end point matches the start point.'];
     /* stating the source makes the qualifier say everything the warning says */
     const opts = { matrixSource: 'haversine' };
@@ -1483,6 +1490,25 @@ test('X7 a structurally-represented warning is not ALSO dumped as raw prose', fu
     assert.ok(ics.indexOf('every distance is a straight-line estimate.') < 0);
     /* but their meaning is still in the file */
     assert.ok(decodeIcs(icsProp(ics, 'DESCRIPTION')[0]).indexOf('STRAIGHT-LINE ESTIMATES') > 0);
+});
+
+test('X7 a CONDITIONAL cover suppresses prose only when the cover actually fired', function () {
+    /* over-drive-cap is covered by the long-day line, which is read off the DayPlan
+       flag. A plan carrying the warning WITHOUT the flag — an older saved document —
+       has no cover at all, so suppressing its prose would drop it with nothing in its
+       place. This is the defect a static table asserting a dynamic fact produces. */
+    const noFlag = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    noFlag.days.forEach(function (d) { d.overDriveCap = false; });
+    noFlag.warnings = ['over-drive-cap: day 1 drives 421 min, over the 360 min limit.'];
+    assert.deepStrictEqual(X.residualWarnings(noFlag, { matrixSource: 'osrm' }),
+        ['over-drive-cap: day 1 drives 421 min, over the 360 min limit.'],
+        'no flag means no cover, so the prose must ride');
+
+    const withFlag = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    withFlag.days[0].overDriveCap = true;
+    withFlag.warnings = ['over-drive-cap: day 1 drives 421 min, over the 360 min limit.'];
+    assert.deepStrictEqual(X.residualWarnings(withFlag, { matrixSource: 'osrm' }), [],
+        'the flag fired, so the structural line covers it');
 });
 
 test('X7 the calendar header states the provenance as well', function () {

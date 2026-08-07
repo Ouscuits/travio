@@ -128,7 +128,10 @@
         'distance-fallback':    'partial',      /* gaps filled with estimates   */
         'missing-matrix':       'estimated',    /* nothing to route from at all */
         'matrix-size-mismatch': 'unconfirmed',  /* the matrix was discarded     */
-        'invalid-distance':     'unconfirmed'   /* cells had to be repaired     */
+        'invalid-distance':     'unconfirmed',  /* cells had to be repaired     */
+        'unresolved-place':     'partial'       /* a leg to a place we never located
+                                                   is not a road-graph leg, whatever
+                                                   the matrix label says */
     };
 
     /* ── Which engine warnings reach an exported file, and how ───────────────
@@ -137,12 +140,22 @@
        so repeating their English prose would be duplication, not information.
        Every other code is surfaced VERBATIM in the planner notes, the same
        "never swallowed" rule js/itinerary-render.js applies with its
-       {code:'other'} catch-all. Nothing is dropped. */
+       {code:'other'} catch-all. Nothing is dropped.
+
+       CONDITIONAL entries are listed here but suppressed only when the thing
+       that covers them actually fired — a static table asserting a dynamic fact
+       is how prose gets dropped with nothing in its place. `unresolved-place`
+       used to sit here claiming the "N place(s) could not be located" note as
+       its cover; that note is emitted by buildGpx alone, so an ICS named a
+       destination the app never located and stated underneath that the figures
+       came from the road graph. It now degrades the provenance (BASIS_EVIDENCE)
+       and keeps its prose, which names the place. */
     const COVERED_WARNINGS = {
         'rest-day':             1,   /* the day's own title says "Rest day in X"   */
-        'over-drive-cap':       1,   /* the long-driving-day line (quality bar B6) */
+        'over-drive-cap':       1,   /* CONDITIONAL: the long-day line, which is
+                                        read off DayPlan.overDriveCap — absent on
+                                        an older saved document carrying the prose */
         'round-trip':           1,   /* the route visibly returns to its origin    */
-        'unresolved-place':     1,   /* the "N place(s) could not be located" note */
         'distance-source':      1,   /* the provenance qualifier                   */
         'distance-fallback':    1,   /* the provenance qualifier                   */
         'missing-matrix':       1,   /* the provenance qualifier                   */
@@ -403,9 +416,13 @@
             if (BASIS_EVIDENCE[code]) basis = worse(basis, BASIS_EVIDENCE[code]);
         }
         /* The caller's explicit verdict wins in both directions, but `false`
-           only rules out withholding — it cannot promise road data. */
+           only rules out withholding — it can neither promise road data NOR
+           assert its absence. Landing on 'estimated' told an OSRM matrix "no
+           road data was available", which is the same inverse bug 'unconfirmed'
+           was invented for. 'unconfirmed' is the neutral landing: it claims
+           nothing in either direction. */
         if (o.numbersUnreliable === true) basis = 'unusable';
-        else if (o.numbersUnreliable === false && basis === 'unusable') basis = 'estimated';
+        else if (o.numbersUnreliable === false && basis === 'unusable') basis = 'unconfirmed';
         return basis;
     }
 
@@ -442,6 +459,17 @@
     }
 
     /* Engine warnings that no other part of the file already states. */
+    /* Did the structural cover for `over-drive-cap` actually fire? The long-day
+       line is read off the DayPlan flag, so a plan carrying the warning without
+       the flag — an older saved document — has no cover at all. */
+    function anyOverCapFlag(plan) {
+        const days = arr(plan && plan.days);
+        for (let i = 0; i < days.length; i++) {
+            if (days[i] && days[i].overDriveCap === true) return true;
+        }
+        return false;
+    }
+
     function residualWarnings(plan, opts) {
         const covered = distanceSourceCovered(opts && opts.matrixSource);
         const out = [], seen = {};
@@ -450,7 +478,11 @@
             const t = str(warnings[i]).trim();
             if (!t || seen[t]) continue;
             const code = warningCode(t);
-            if (COVERED_WARNINGS[code] && !(code === 'distance-source' && !covered)) continue;
+            /* Suppress only when the cover actually fired for THIS document. */
+            let isCovered = !!COVERED_WARNINGS[code];
+            if (code === 'distance-source' && !covered) isCovered = false;
+            if (code === 'over-drive-cap' && !anyOverCapFlag(plan)) isCovered = false;
+            if (isCovered) continue;
             seen[t] = 1;
             out.push(t);
         }
