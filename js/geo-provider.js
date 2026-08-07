@@ -15,30 +15,73 @@
  *   geocodePlaces(names, opts)  -> Promise<Place[]>     Nominatim, serialised >=1100ms
  *   distanceMatrix(places, opts)-> Promise<Matrix>      OSRM table, haversine fallback
  *   routeGeometry(places, opts) -> Promise<[lat,lon][]> OSRM route polyline, straight fallback
- *   decodePolyline, haversineKm, normalisePlaceName, clearGeoCache, resetGeoRateLimit
+ *   decodePolyline, haversineKm, normalisePlaceName, clearGeoCache
+ *   (`resetGeoRateLimit` is a Node-only test seam — see RATE LIMITING below)
  *
  * Injection seam — every network/time/storage dependency can be stubbed:
  *   opts = { fetchImpl, sleepImpl, now, storage, minIntervalMs, cacheTtlMs,
  *            timeoutMs, nominatimUrl, osrmBase, maxTablePlaces, roadFactor,
  *            speedKmh, userAgent, language }
  *
+ * RATE LIMITING — ONE queue, ALL THREE network entry points.
+ *   geocodePlaces (Nominatim), distanceMatrix (OSRM /table) and routeGeometry (OSRM
+ *   /route) all go through geoRequest(): a single global serial queue, never more than
+ *   one request in flight, spaced by minIntervalMs. Both hosts are OSM community demo
+ *   servers with a usage policy, and geocoding used to be the only throttled path —
+ *   a plan could fire its table and route requests unthrottled, in parallel with itself.
+ *   The queue tail is released by the task OR by a hard timer (timeoutMs + slack), so a
+ *   `fetchImpl` that ignores AbortSignal and never settles cannot wedge the queue for
+ *   the lifetime of the page.
+ *   `resetGeoRateLimit()` clears that state for the Node suite. Calling it mid-flight
+ *   would let two Nominatim requests leave ~33 ms apart, so it is INERT whenever a
+ *   `window` exists and is not published on `window` or `window.TravioGeo` at all.
+ *
  * MATRIX SOURCE — describes the WHOLE matrix, never one lucky cell:
- *   'osrm'      every off-diagonal cell came from the road graph (filledCells === 0)
+ *   'osrm'      every off-diagonal cell is entirely road-graph data (filledCells === 0)
+ *   'mixed'     some road data, some estimated (islands, ferries, unroutable pairs, or
+ *               a cell where only one of distance/duration came back)
+ *   'haversine' NO road-graph value contributed to any cell (osrmCells === 0; also the
+ *               degenerate n < 2 case, which has no off-diagonal cell at all)
  *   NOTE  osrmCells/filledCells count off-diagonal CELLS, not undirected pairs: the
  *         matrix is symmetric, so one unroutable pair contributes two cells. This is
  *         what the engine's dim*(dim-1) denominator expects ("14 of 20 cells").
- *   'mixed'     some real, some haversine-filled (islands, ferries, unroutable pairs)
- *   'haversine' no cell came from the road graph (also the degenerate n < 2 case,
- *               where there is no off-diagonal cell to have road data at all)
+ *   NOTE  they are NOT a partition. osrmCells counts cells carrying at least one
+ *         road-graph value; filledCells counts cells carrying at least one estimated
+ *         value; a half-real cell is in BOTH. This is the fix for a real bug: OSRM's
+ *         DEFAULT /table annotation is durations only, and a distances-only or
+ *         durations-only answer used to be reported as 'haversine' with osrmCells 0 —
+ *         so exact road-graph numbers were shipped under a flag that made the engine
+ *         say "no road data at all — every distance is a straight-line estimate".
+ *         `filledCells === 0` still means 'osrm' and `osrmCells === 0` still means
+ *         'haversine', which is what the contract pins down.
  *   The engine warns on 'mixed' and 'haversine', so reporting 'osrm' for a matrix
  *   that is 30% real would silently show "Palma->Ibiza 161 km by road" across open sea.
  *
- * FALLBACK CALIBRATION — haversine × 1.25 at 88 km/h.
+ * PLAUSIBILITY FLOOR — a number is only road data if it could physically be one.
+ *   OSRM (or a proxy, or a cached error page) can return values that are numerically
+ *   fine and physically impossible: 617 km in 1 second, or an all-zero grid between
+ *   cities 500 km apart. Both used to ship as clean 'osrm', and because the engine caps
+ *   days on `min`, a zero-minute leg packs the trip into too few days — the exact
+ *   day-splitting bug this branch exists to kill. Two checks, applied per cell:
+ *     - a road can never be materially shorter than the great circle beneath it
+ *       (cellKm + 0.5 >= straightKm * 0.90 — slack for OSRM snapping to the road);
+ *     - the implied average speed must be inside 5–200 km/h.
+ *   Legs under 1 km are exempt (rounding noise dominates and nothing is at stake).
+ *   A cell that fails is treated exactly like a null: discarded and haversine-filled.
+ *
+ * FALLBACK CALIBRATION — haversine × 1.25 at 90 km/h.
  *   Measured against live OSRM on long Spanish routes: the 1.25 road factor is well
  *   calibrated on distance, but 75 km/h was 22–26% pessimistic on time. Because the
  *   engine enforces maxDriveMinPerDay on `min`, a pessimistic speed invents false
  *   over-cap warnings and over-splits days — the exact bug class this project set out
- *   to fix. 88 km/h sits inside the measured 87–92 km/h long-haul average.
+ *   to fix. Five long Spanish routes measured 87.6–92.8 km/h, mean 90.6.
+ *   DIVERGENCE (deliberate, and it is a duplication, not a disagreement): this file
+ *   used 88 while js/route-engine.js uses FALLBACK_SPEED_KMH = 90 for the matrix it
+ *   synthesises when none is supplied. One physical constant living in two files will
+ *   drift, so this file now carries 90 — the same number the engine uses and the one
+ *   closest to the measured mean. The two are still two declarations; the permanent
+ *   fix is for the provider to be the single publisher (it already exports
+ *   GEO_SPEED_KMH / GEO_ROAD_FACTOR) and for the engine to read them when present.
  *
  * UNRESOLVED PLACES — documented strategy (contract: no NaN/null/Infinity cells):
  *   A place whose geocoding failed (lat/lon null, or coordinates outside ±90/±180)
@@ -70,8 +113,16 @@
     const GEO_TIMEOUT_MS      = 12000;
     const GEO_MAX_TABLE       = 25;                 // guard against huge table URLs
     const GEO_ROAD_FACTOR     = 1.25;               // straight line -> road distance
-    const GEO_SPEED_KMH       = 88;                 // fallback average driving speed
+    const GEO_SPEED_KMH       = 90;                 // fallback average driving speed
     const GEO_EARTH_R_KM      = 6371.0088;
+
+    /* Plausibility floor for values claimed to come from the road graph. */
+    const GEO_MIN_SPEED_KMH   = 5;                  // slower than this is not driving
+    const GEO_MAX_SPEED_KMH   = 200;                // faster than this is not driving
+    const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
+    const GEO_SHORTFALL_RATIO = 0.90;               // road vs great circle, with slack for
+    const GEO_SHORTFALL_SLACK = 0.5;                // OSRM snapping to the nearest road
+    const GEO_QUEUE_SLACK_MS  = 500;                // grace before the queue tail self-releases
 
     /* ── Environment seams (all lazy, all guarded) ── */
     function geoGlobalObject() {
@@ -199,9 +250,44 @@
         return isFinite(km) ? km : 0;
     }
 
-    /* ── HTTP (never throws, returns null on any failure) ── */
-    async function geoFetchJson(url, cfg) {
-        if (typeof cfg.fetchImpl !== 'function') return null;
+    function geoNoop() { /* deliberately empty */ }
+
+    /*
+     * Resolve with `promise`, or with `fallback` after `ms` — and NEVER hang.
+     * AbortController is a request to stop; it is not a guarantee. A fetch polyfill,
+     * a service worker, or a patched XHR shim can ignore `signal` entirely, and then
+     * `timeoutMs` releases nothing: the awaiting task never settles, the serial queue
+     * never advances, and the only escape is a page reload. So the WAIT is guarded
+     * here, independently of whether the abort ever lands.
+     * Rejection is folded into `fallback` too: callers of this module never see throws.
+     */
+    function geoWithDeadline(promise, ms, fallback) {
+        const g = geoGlobalObject();
+        if (!(ms > 0) || typeof g.setTimeout !== 'function') {
+            return Promise.resolve(promise).then(null, function () { return fallback; });
+        }
+        return new Promise(function (resolve) {
+            let settled = false;
+            const timer = g.setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                resolve(fallback);
+            }, ms);
+            const finish = function (value) {
+                if (settled) return;
+                settled = true;
+                if (typeof g.clearTimeout === 'function') g.clearTimeout(timer);
+                resolve(value);
+            };
+            Promise.resolve(promise).then(
+                function (v) { finish(v); },
+                function () { finish(fallback); }
+            );
+        });
+    }
+
+    /* ── HTTP (never throws, never hangs, returns null on any failure) ── */
+    async function geoFetchOnce(url, cfg) {
         const g = geoGlobalObject();
         let controller = null;
         let timer = null;
@@ -231,14 +317,44 @@
         }
     }
 
+    function geoFetchJson(url, cfg) {
+        if (typeof cfg.fetchImpl !== 'function') return Promise.resolve(null);
+        /* The abort above is the polite ask; this deadline is the guarantee. */
+        return geoWithDeadline(geoFetchOnce(url, cfg), cfg.timeoutMs, null);
+    }
+
     /* ── Serial request queue + rate limiter (OSM: 1 request per second, one in flight) ── */
     let geoQueueTail = Promise.resolve();
     let geoLastRequestAt = 0;
 
-    function geoEnqueue(task) {
-        const run = geoQueueTail.then(task, task);
-        geoQueueTail = run.then(function () {}, function () {});
-        return run;
+    /*
+     * The tail advances when the task settles OR when a cap expires — whichever comes
+     * first. Without the cap, one task that never settles blocks every future request in
+     * the page permanently, and the only escape is a reload.
+     * The cap clock starts when the task actually BEGINS, not when it was enqueued: the
+     * fifth item of a queue may sit for seconds before it runs, and a cap measured from
+     * enqueue time would expire under a request that is still perfectly healthy — which
+     * would put two requests in flight, the thing the queue exists to prevent.
+     * It also covers the throttle sleep, not just the fetch, because a hostile
+     * `sleepImpl` is one more way to never come back.
+     */
+    function geoEnqueue(task, cfg) {
+        const capMs = (cfg && cfg.timeoutMs > 0 ? cfg.timeoutMs : GEO_TIMEOUT_MS) +
+                      (cfg && cfg.minIntervalMs > 0 ? cfg.minIntervalMs : GEO_MIN_INTERVAL_MS) +
+                      GEO_QUEUE_SLACK_MS;
+
+        let release = geoNoop;
+        const gate = new Promise(function (resolve) { release = resolve; });
+        const previous = geoQueueTail;
+        geoQueueTail = gate;
+
+        function runTask() {
+            const started = Promise.resolve().then(task);
+            geoWithDeadline(started.then(geoNoop, geoNoop), capMs, undefined)
+                .then(release, release);
+            return started;
+        }
+        return previous.then(runTask, runTask);
     }
 
     async function geoThrottle(cfg) {
@@ -248,10 +364,34 @@
         geoLastRequestAt = cfg.now();
     }
 
-    /* Test seam: forget the last-request timestamp and drain the queue reference. */
+    /*
+     * The ONLY way out of this module. Nominatim and both OSRM endpoints share it, so
+     * "one request in flight, spaced by minIntervalMs" is a property of the module and
+     * not of one lucky call site. Never throws.
+     */
+    function geoRequest(url, cfg) {
+        return geoEnqueue(async function () {
+            try {
+                await geoThrottle(cfg);
+                return await geoFetchJson(url, cfg);
+            } catch (e) {
+                return null;                    // e.g. a hostile sleepImpl
+            }
+        }, cfg);
+    }
+
+    /*
+     * Test seam: forget the last-request timestamp and drain the queue reference.
+     * INERT in the browser. It is reachable there only by accident, and a mid-flight
+     * call collapses the spacing between two Nominatim requests to a few milliseconds,
+     * which is precisely the OSM usage policy this module exists to respect. The Node
+     * suite has no `window`, so it keeps the seam. Returns whether it did anything.
+     */
     function resetGeoRateLimit() {
+        if (typeof window !== 'undefined') return false;
         geoQueueTail = Promise.resolve();
         geoLastRequestAt = 0;
+        return true;
     }
 
     /* ── localStorage cache (no-ops safely when storage is unavailable) ── */
@@ -374,12 +514,8 @@
                 continue;
             }
 
-            /* Network path — serialised through the shared queue. */
-            const hit = await geoEnqueue(async function () {
-                await geoThrottle(cfg);
-                const data = await geoFetchJson(geoNominatimUrl(name, cfg), cfg);
-                return geoParseNominatim(data);
-            });
+            /* Network path — serialised and throttled through the shared queue. */
+            const hit = geoParseNominatim(await geoRequest(geoNominatimUrl(name, cfg), cfg));
 
             if (hit) {
                 localCache.set(key, hit);
@@ -432,10 +568,41 @@
         return eff;
     }
 
-    function geoHaversineCell(eff, i, j, cfg) {
-        const km = haversineKm(eff[i].lat, eff[i].lon, eff[j].lat, eff[j].lon) * cfg.roadFactor;
+    function geoHaversineCell(straightKm, cfg) {
+        const km = straightKm * cfg.roadFactor;
         const min = (km / cfg.speedKmh) * 60;
         return { km: geoRound(km, 2), min: geoRound(min, 1) };
+    }
+
+    /*
+     * ── Plausibility floor ──
+     * A value is road data only if it could physically BE road data. OSRM, a proxy, or a
+     * cached error page can hand back numbers that parse perfectly and describe nothing:
+     * 617 km in 1 second, or 0 km between Madrid and Barcelona. Those used to ship as
+     * clean 'osrm' with zero warnings, and the engine caps days on `min`, so a
+     * zero-minute leg silently packs the trip into too few days.
+     * Legs under GEO_PLAUSIBLE_MIN_KM are exempt: rounding noise dominates there and a
+     * false rejection would replace a good short value with a worse estimate.
+     */
+    function geoTrivialLeg(cellKm, straightKm) {
+        const scale = Math.max(isFinite(cellKm) ? cellKm : 0, isFinite(straightKm) ? straightKm : 0);
+        return scale < GEO_PLAUSIBLE_MIN_KM;
+    }
+
+    /* A road cannot be materially shorter than the great circle beneath it. */
+    function geoDistancePlausible(cellKm, straightKm) {
+        if (!isFinite(cellKm) || cellKm < 0) return false;
+        if (geoTrivialLeg(cellKm, straightKm)) return true;
+        return cellKm + GEO_SHORTFALL_SLACK >= straightKm * GEO_SHORTFALL_RATIO;
+    }
+
+    /* Whatever the pair ends up claiming, a car has to have driven it. */
+    function geoSpeedPlausible(cellKm, cellMin, straightKm) {
+        if (!isFinite(cellKm) || !isFinite(cellMin) || cellKm < 0 || cellMin < 0) return false;
+        if (geoTrivialLeg(cellKm, straightKm)) return true;
+        if (!(cellMin > 0)) return false;                       // distance in zero time
+        const kmh = cellKm / (cellMin / 60);
+        return isFinite(kmh) && kmh >= GEO_MIN_SPEED_KMH && kmh <= GEO_MAX_SPEED_KMH;
     }
 
     function geoOsrmTableUrl(coords, cfg) {
@@ -508,7 +675,8 @@
         let table = null;
         if (realIdx.length >= 2 && realIdx.length <= cfg.maxTablePlaces) {
             const coords = realIdx.map(function (i) { return eff[i]; });
-            const data = await geoFetchJson(geoOsrmTableUrl(coords, cfg), cfg);
+            /* Same queue and same spacing as geocoding — see RATE LIMITING in the header. */
+            const data = await geoRequest(geoOsrmTableUrl(coords, cfg), cfg);
             if (data && (data.code === undefined || data.code === 'Ok')) {
                 const dStatus = geoGridStatus(data.distances, coords.length);
                 const tStatus = geoGridStatus(data.durations, coords.length);
@@ -528,48 +696,56 @@
         for (let i = 0; i < n; i++) sub[i] = -1;
         for (let k = 0; k < realIdx.length; k++) sub[realIdx[k]] = k;
 
+        /* Pairs carrying at least one road-graph value / at least one estimated value.
+           A half-real cell is in BOTH — see the MATRIX SOURCE note in the header. */
         let osrmPairs = 0;
         let filledPairs = 0;
 
         for (let i = 0; i < n; i++) {
             for (let j = i + 1; j < n; j++) {
-                let cellKm = NaN;
-                let cellMin = NaN;
+                let rawKm = NaN;
+                let rawMin = NaN;
 
                 if (table && sub[i] >= 0 && sub[j] >= 0) {
                     const a = sub[i], b = sub[j];
-                    cellKm = geoSymmetric(
+                    rawKm = geoSymmetric(
                         geoTableValue(table.distances, a, b, 1000),
                         geoTableValue(table.distances, b, a, 1000)
                     );
-                    cellMin = geoSymmetric(
+                    rawMin = geoSymmetric(
                         geoTableValue(table.durations, a, b, 60),
                         geoTableValue(table.durations, b, a, 60)
                     );
                 }
 
-                /* Per-cell fallback: keep the real values, fill only the broken cells.
-                   A cell counts as road data only when BOTH km and min are real. */
-                if (isFinite(cellKm) && isFinite(cellMin)) {
-                    osrmPairs++;
-                    cellKm = geoRound(cellKm, 2);
-                    cellMin = geoRound(cellMin, 1);
-                } else {
-                    const hav = geoHaversineCell(eff, i, j, cfg);
-                    if (isFinite(cellKm)) {
-                        /* distance survived, duration did not (or vice versa) */
-                        cellKm = geoRound(cellKm, 2);
-                        cellMin = hav.min;
-                    } else if (isFinite(cellMin)) {
-                        cellKm = hav.km;
-                        cellMin = geoRound(cellMin, 1);
-                    } else {
-                        cellKm = hav.km;
-                        cellMin = hav.min;
-                    }
-                    filledPairs++;
+                const straightKm = haversineKm(eff[i].lat, eff[i].lon, eff[j].lat, eff[j].lon);
+                const hav = geoHaversineCell(straightKm, cfg);
+
+                /* A distance shorter than the great circle beneath it is not a road. */
+                let realKm = geoDistancePlausible(rawKm, straightKm);
+                let realMin = isFinite(rawMin);
+
+                let cellKm = realKm ? rawKm : hav.km;
+                /* A real road distance is a better base for an estimated time than the
+                   great circle is — prefer it whenever the duration is the missing half. */
+                let cellMin = realMin ? rawMin
+                    : (realKm ? (rawKm / cfg.speedKmh) * 60 : hav.min);
+
+                /* Whichever half survived, the pair as a whole must be drivable. When it
+                   is not, there is no way to tell which half lied, so both are discarded
+                   and the cell is filled exactly like a null. */
+                if ((realKm || realMin) && !geoSpeedPlausible(cellKm, cellMin, straightKm)) {
+                    realKm = false;
+                    realMin = false;
+                    cellKm = hav.km;
+                    cellMin = hav.min;
                 }
 
+                if (realKm || realMin) osrmPairs++;
+                if (!realKm || !realMin) filledPairs++;
+
+                cellKm = geoRound(cellKm, 2);
+                cellMin = geoRound(cellMin, 1);
                 if (!isFinite(cellKm) || cellKm < 0) cellKm = 0;
                 if (!isFinite(cellMin) || cellMin < 0) cellMin = 0;
 
@@ -580,7 +756,8 @@
             min[i][i] = 0;
         }
 
-        /* The flag describes the whole matrix, not one lucky cell. */
+        /* The flag describes the whole matrix, not one lucky cell — and not one lucky
+           annotation either: a distances-only answer is 'mixed', never 'haversine'. */
         let source;
         if (osrmPairs === 0) source = 'haversine';
         else if (filledPairs === 0) source = 'osrm';
@@ -670,7 +847,8 @@
             return geoTagSource(straight, 'straight');
         }
 
-        const data = await geoFetchJson(geoOsrmRouteUrl(coords, cfg), cfg);
+        /* Same queue and same spacing as geocoding — see RATE LIMITING in the header. */
+        const data = await geoRequest(geoOsrmRouteUrl(coords, cfg), cfg);
         if (data && (data.code === undefined || data.code === 'Ok') && Array.isArray(data.routes) && data.routes[0]) {
             const geom = data.routes[0].geometry;
             if (typeof geom === 'string') {
@@ -712,8 +890,17 @@
     };
 
     if (typeof window !== 'undefined') {
-        window.TravioGeo = api;
-        /* Same eight documented functions bound directly, for the UI wiring. */
+        /* The rate-limit seam is withheld from the browser surface entirely — it is a
+           way to break the OSM usage policy and has no use in the app. It is also inert
+           when a `window` exists, so a captured reference cannot resurrect it. */
+        const browserApi = {};
+        for (const k in api) {
+            if (Object.prototype.hasOwnProperty.call(api, k) && k !== 'resetGeoRateLimit') {
+                browserApi[k] = api[k];
+            }
+        }
+        window.TravioGeo = browserApi;
+        /* Same seven documented functions bound directly, for the UI wiring. */
         window.geocodePlaces      = geocodePlaces;
         window.distanceMatrix     = distanceMatrix;
         window.routeGeometry      = routeGeometry;
@@ -721,7 +908,6 @@
         window.haversineKm        = haversineKm;
         window.normalisePlaceName = normalisePlaceName;
         window.clearGeoCache      = clearGeoCache;
-        window.resetGeoRateLimit  = resetGeoRateLimit;
     }
 
     if (typeof module !== 'undefined' && module.exports) {
