@@ -42,6 +42,28 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
   - `'haversine'` — no cell came from the road graph
   `osrmCells` / `filledCells` carry the counts and are part of the contract, not extras.
 
+  **The counters overlap; they are not a partition.** A cell carries two values (km and
+  min) and they can have different provenance: OSRM's default `/table` reply annotates
+  durations only, and a `distances`-only reply is equally possible. Such a cell is half
+  real and half estimated, and it is counted in **both**. So:
+
+  - `osrmCells`  = off-diagonal cells carrying **any** road-graph value
+  - `filledCells` = off-diagonal cells carrying **any** estimated value
+  - `0 <= osrmCells <= dim*(dim-1)` and `0 <= filledCells <= dim*(dim-1)`
+  - their sum may exceed `dim*(dim-1)`; it must never be used as a consistency test
+
+  The two laws that DO hold, and that the engine may rely on:
+
+  - `filledCells === 0`  ⟺  `source === 'osrm'`
+  - `osrmCells === 0`    ⟺  `source === 'haversine'`
+
+  A matrix that violates either law is self-contradictory and the engine must warn
+  rather than trust the label — the counters are the evidence, the label is the claim.
+
+  Because of the overlap, a warning that reads "N of M cells are straight-line estimates"
+  overstates the case when those cells still hold real distances. The engine's message
+  must distinguish **partly** estimated cells from **entirely** estimated ones.
+
   **Speed calibration.** The haversine fallback must not manufacture false over-cap
   warnings. Measured against live OSRM on five long Spanish routes, a 1.25 road factor
   is well calibrated (−0.1% to +8.5% on distance) but 75 km/h is 22–26% pessimistic on
