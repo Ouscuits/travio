@@ -54,7 +54,20 @@
         viaPoints:    'Planned via points. Straight lines between them are NOT the road route.',
         roadTrack:    'Track from the routing service road geometry.',
         unlocated:    '{count} place(s) could not be located and are omitted from this file.',
-        unreliable:   'Distances and times could not be computed for this trip and are omitted.',
+        /* The five provenance states a distance can be in. Four of them still
+           print the number; only the fifth withholds it. */
+        basisRoad:        'Distances and times come from the road graph.',
+        basisPartial:     'Some of these distances are straight-line estimates, not driving distances.',
+        basisUnconfirmed: 'The provenance of these distances could not be confirmed: some or all of ' +
+                          'them may be straight-line estimates rather than measured driving distances.',
+        basisEstimated:   'STRAIGHT-LINE ESTIMATES, not driving distances: no road data was available, ' +
+                          'so these figures are crow-flies distances with a road allowance and an assumed speed.',
+        unreliable:     'Distances and times could not be computed for this trip and are omitted.',
+        notAvailable:   'not available',
+        atLeast:        'at least {value}',
+        longDay:        'Long driving day: {drive}, above the {cap} the planner was given.',
+        longDayNoCap:   'Long driving day: above the daily limit the planner was given.',
+        plannerNotes:   'Planner notes',
         km:           'km',
         hour:         'h',
         minute:       'min',
@@ -65,11 +78,79 @@
     const ICS_PRODID  = '-//Travio//Route Planner//EN';
     const UID_DOMAIN  = 'travio.app';
 
-    /* Engine warnings that mean "the numbers below are not real". Mirrors the
-       UNRELIABLE_WARNINGS set in js/itinerary-render.js — when the engine says
-       the distances are unusable, the screen withholds them and so must a file
-       the traveller will still be reading a week later. */
+    /* ── Distance provenance: FOUR states, only one of which withholds ────────
+       The first version of this module had two: print the number, or print
+       nothing. That is a strictly weaker guarantee than the screen gives, at
+       the moment it most needs to be stronger.
+
+       When OSRM is down the geo provider falls back to haversine × 1.25 at an
+       assumed speed. The engine then warns `distance-source: no road data at
+       all` and js/itinerary-render.js raises it to `alert`, its LOUDEST
+       severity. Those numbers are usable — suppressing them would be
+       over-firing — but they are crow-flies estimates, and Madrid→Barcelona
+       comes out at 632 km against 620 real road km. The figure is PLAUSIBLE,
+       which is exactly what makes an unqualified one dangerous a week later in
+       a calendar with no app around it to explain itself.
+
+       So the fix is not to withhold more, it is to QUALIFY. `road`, `partial`
+       and `estimated` all print the number with a sentence saying what kind of
+       number it is; only `unusable` withholds.
+
+       `matrixSource` is the authoritative claim, and it is the same value
+       renderSummary() reads out of view.meta.matrixSource. Warnings are the
+       evidence and may only DOWNGRADE that claim, never upgrade it — the
+       counters are the evidence, the label is the claim.
+
+       An ABSENT or unrecognised source is its own state, `unconfirmed`, and
+       not a synonym for `estimated`. Silence is not evidence of a road graph,
+       so it can never read as road data; but it is not evidence of the absence
+       of one either, and telling a traveller with a 70%-real matrix that "no
+       road data was available" is the same lie in the other direction — the
+       exact bug js/itinerary-render.js was fixed for. `unconfirmed` says only
+       what is true: this could be either. A caller that knows the source
+       should pass it and get a crisper sentence; a caller that does not also
+       gets the engine's own warning verbatim (see distanceSourceCovered). */
+    const BASIS_RANK = { road: 0, partial: 1, unconfirmed: 2, estimated: 3, unusable: 4 };
+
+    /* Warnings that make the numbers unusable. Deliberately identical to
+       UNRELIABLE_WARNINGS in js/itinerary-render.js: the file and the screen
+       must withhold on exactly the same evidence, or one of them is lying.
+       `invalid-distance` is NOT in this set for the same reason it is not in
+       the screen's — the engine sanitises those cells and carries on. */
     const UNRELIABLE_WARNINGS = { 'zero-distance': 1, 'unknown-distance': 1 };
+
+    /* Evidence that downgrades the claimed provenance, and how far. A
+       `distance-source` warning is evidence too: the engine emits none at all
+       for a clean road matrix, so its presence means the matrix is at best
+       partly estimated whatever the label says. */
+    const BASIS_EVIDENCE = {
+        'distance-source':      'partial',      /* not a clean road matrix      */
+        'distance-fallback':    'partial',      /* gaps filled with estimates   */
+        'missing-matrix':       'estimated',    /* nothing to route from at all */
+        'matrix-size-mismatch': 'unconfirmed',  /* the matrix was discarded     */
+        'invalid-distance':     'unconfirmed'   /* cells had to be repaired     */
+    };
+
+    /* ── Which engine warnings reach an exported file, and how ───────────────
+       All 20 codes the engine can emit are accounted for. These 11 are
+       represented STRUCTURALLY — as a title, a qualifier or a counted note —
+       so repeating their English prose would be duplication, not information.
+       Every other code is surfaced VERBATIM in the planner notes, the same
+       "never swallowed" rule js/itinerary-render.js applies with its
+       {code:'other'} catch-all. Nothing is dropped. */
+    const COVERED_WARNINGS = {
+        'rest-day':             1,   /* the day's own title says "Rest day in X"   */
+        'over-drive-cap':       1,   /* the long-driving-day line (quality bar B6) */
+        'round-trip':           1,   /* the route visibly returns to its origin    */
+        'unresolved-place':     1,   /* the "N place(s) could not be located" note */
+        'distance-source':      1,   /* the provenance qualifier                   */
+        'distance-fallback':    1,   /* the provenance qualifier                   */
+        'missing-matrix':       1,   /* the provenance qualifier                   */
+        'matrix-size-mismatch': 1,   /* the provenance qualifier                   */
+        'invalid-distance':     1,   /* the provenance qualifier                   */
+        'zero-distance':        1,   /* the provenance qualifier (withheld)        */
+        'unknown-distance':     1    /* the provenance qualifier (withheld)        */
+    };
 
     /* ── Tiny pure helpers ── */
     function num(v, def) {
@@ -138,15 +219,39 @@
     /* HTML keeps its newlines: the plain-text mirror is printed inside <pre>. */
     function escapeHtml(s) { return escapeMarkup(s, true); }
 
+    /* Drops C0/DEL controls and UNPAIRED surrogates. A lone surrogate is not a
+       character: it cannot be encoded as UTF-8, so it turns a well-formed
+       document into bytes no strict parser will accept. */
     function stripControl(s, keepNewline) {
         let out = '';
         for (let i = 0; i < s.length; i++) {
             const c = s.charCodeAt(i);
             if (c === 10 && keepNewline) { out += '\n'; continue; }
             if (c < 0x20 || c === 0x7f) continue;
+            if (c >= 0xd800 && c <= 0xdbff) {
+                const next = s.charCodeAt(i + 1);
+                if (next >= 0xdc00 && next <= 0xdfff) { out += s.charAt(i) + s.charAt(i + 1); i++; }
+                continue;                      /* unpaired high surrogate */
+            }
+            if (c >= 0xdc00 && c <= 0xdfff) continue;   /* unpaired low surrogate */
             out += s.charAt(i);
         }
         return out;
+    }
+
+    /* A UID has no escape syntax, so the seed is restricted rather than
+       escaped: anything outside this set could only ever be a way out of the
+       property value. */
+    function safeUidSeed(v) {
+        return stripControl(str(v)).replace(/[^A-Za-z0-9._-]/g, '').slice(0, 64);
+    }
+
+    /* CSS is not markup and must not be HTML-escaped — `.a > .b` would stop
+       working. The ONLY way out of a <style> element is the literal `</`, and
+       the HTML tokenizer does not decode CSS escapes, so removing `<` closes
+       the hole while leaving the child combinator intact. */
+    function safeCss(v) {
+        return stripControl(str(v), true).replace(/</g, '');
     }
 
     /* ── UTF-8 aware line folding (RFC 5545 §3.1) ────────────────────────────
@@ -276,18 +381,125 @@
 
     function dayNumber(day, index) { return Math.round(num(day && day.day, index + 1)); }
 
-    /* Are the plan's distances and times usable at all? The engine says so in
-       plan.warnings, and when it does the honest export carries the route but
-       no numbers. Overridable, because the caller may already know. */
-    function numbersUnreliable(plan, override) {
-        if (override === true || override === false) return override;
+    function warningCode(w) {
+        const s = str(w);
+        return s.indexOf(':') > 0 ? s.slice(0, s.indexOf(':')) : s;
+    }
+
+    function worse(a, b) { return BASIS_RANK[b] > BASIS_RANK[a] ? b : a; }
+
+    /* 'road' | 'partial' | 'estimated' | 'unusable'. See BASIS_RANK above. */
+    function distanceBasis(plan, opts) {
+        const o = opts || {};
+        const src = str(o.matrixSource);
+        let basis = src === 'osrm' ? 'road'
+            : (src === 'mixed' ? 'partial'
+                : (src === 'haversine' ? 'estimated' : 'unconfirmed'));
+
         const warnings = arr(plan && plan.warnings);
         for (let i = 0; i < warnings.length; i++) {
-            const w = str(warnings[i]);
-            const code = w.indexOf(':') > 0 ? w.slice(0, w.indexOf(':')) : w;
-            if (UNRELIABLE_WARNINGS[code]) return true;
+            const code = warningCode(warnings[i]);
+            if (UNRELIABLE_WARNINGS[code]) { basis = 'unusable'; break; }
+            if (BASIS_EVIDENCE[code]) basis = worse(basis, BASIS_EVIDENCE[code]);
         }
-        return false;
+        /* The caller's explicit verdict wins in both directions, but `false`
+           only rules out withholding — it cannot promise road data. */
+        if (o.numbersUnreliable === true) basis = 'unusable';
+        else if (o.numbersUnreliable === false && basis === 'unusable') basis = 'estimated';
+        return basis;
+    }
+
+    /* Kept as the yes/no question the rest of the module used to ask. */
+    function numbersUnreliable(plan, override) {
+        return distanceBasis(plan, { numbersUnreliable: override }) === 'unusable';
+    }
+
+    function basisNote(basis, L) {
+        if (basis === 'road') return L.basisRoad;
+        if (basis === 'partial') return L.basisPartial;
+        if (basis === 'unconfirmed') return L.basisUnconfirmed;
+        if (basis === 'unusable') return L.unreliable;
+        return L.basisEstimated;
+    }
+
+    /* ── When "covered structurally" stops being true ────────────────────────
+       `distance-source` is covered by the qualifier only while the qualifier
+       says everything the warning says. Exactly two claims do that: 'mixed'
+       lands on `partial` and 'haversine' on `estimated`, each stating the same
+       fact the engine stated.
+
+       The other two do not. An 'osrm' claim the engine warned about anyway is
+       a CONTRADICTION — the engine emits nothing for a clean road matrix — and
+       which contradiction it is (no road data at all, counters disagreeing
+       with the label) is detail no qualifier carries. An ABSENT claim lands on
+       `unconfirmed`, which is deliberately weaker than the warning it would be
+       standing in for. In both cases the engine's own sentence is surfaced
+       verbatim as well, so a caller that passes no matrixSource still gets
+       everything the screen would have shown. */
+    function distanceSourceCovered(matrixSource) {
+        const src = str(matrixSource);
+        return src === 'mixed' || src === 'haversine';
+    }
+
+    /* Engine warnings that no other part of the file already states. */
+    function residualWarnings(plan, opts) {
+        const covered = distanceSourceCovered(opts && opts.matrixSource);
+        const out = [], seen = {};
+        const warnings = arr(plan && plan.warnings);
+        for (let i = 0; i < warnings.length; i++) {
+            const t = str(warnings[i]).trim();
+            if (!t || seen[t]) continue;
+            const code = warningCode(t);
+            if (COVERED_WARNINGS[code] && !(code === 'distance-source' && !covered)) continue;
+            seen[t] = 1;
+            out.push(t);
+        }
+        return out;
+    }
+
+    /* ── Reading a number the plan may not actually have ─────────────────────
+       `num(v, 0)` turns undefined, null, NaN, '?' and Infinity into a zero, and
+       a zero is a claim: "this day involves no driving". Today's engine
+       guarantees finite values, so nothing reaches this from the live path —
+       but a saved document, a hand-built plan or a future provider can, and
+       silently exporting a manufactured zero is precisely the bug class this
+       branch exists to kill. Unknown reads as null and PRINTS as "not
+       available". */
+    function knownNonNeg(v) {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return isFinite(n) && n >= 0 ? n : null;
+    }
+    function kmText(km, L) {
+        const v = knownNonNeg(km);
+        return v === null ? L.notAvailable : formatKm(v, L);
+    }
+    /* A trip total: complete, a floor, or — when not one day could be read —
+       simply unknown. "at least 0 km" would be a manufactured zero wearing a
+       hedge. */
+    function totalText(value, seen, dayCount, formatter, L) {
+        if (seen === 0) return L.notAvailable;
+        const text = formatter(value, L);
+        return seen < dayCount ? fill(L.atLeast, { value: text }) : text;
+    }
+    function durationText(min, L) {
+        const v = knownNonNeg(min);
+        return v === null ? L.notAvailable : formatDuration(v, L);
+    }
+
+    /* The long-driving-day flag is a DayPlan field, so it needs no prose
+       parsing. The cap is NOT a plan field — quoting a default the planner may
+       never have used would export a number the app does not know, so without
+       it the warning simply drops the figure. */
+    function longDayNote(day, L, maxDriveMin) {
+        if (!day || day.overDriveCap !== true) return '';
+        const cap = knownNonNeg(maxDriveMin);
+        const drive = knownNonNeg(day.driveMin);
+        if (cap === null || drive === null) return L.longDayNoCap;
+        return fill(L.longDay, {
+            drive: formatDuration(drive, L),
+            cap: formatDuration(cap, L)
+        });
     }
 
     function countUnlocated(plan) {
@@ -454,8 +666,12 @@
             const nodes = dayNodes(d);
             const names = [];
             for (let k = 0; k < nodes.length; k++) names.push(placeName(nodes[k]));
+            /* Unknown is its own token: collapsing it to 0 would let two
+               genuinely different plans share a UID. */
+            const k = knownNonNeg(d.km), t = knownNonNeg(d.driveMin);
             parts.push(dayNumber(d, i) + '|' + names.join('>') + '|' +
-                roundKm(d.km) + '|' + Math.round(num(d.driveMin, 0)));
+                (k === null ? '?' : roundKm(k)) + '|' +
+                (t === null ? '?' : Math.round(t)));
         }
         parts.push('rt=' + (plan && plan.roundTrip ? 1 : 0));
         return parts.join('||');
@@ -492,14 +708,20 @@
         return [lat, lon];
     }
 
+    /* A path is accepted WHOLE or not at all. Dropping the unreadable points
+       and keeping the rest yields a shorter, entirely plausible track that
+       asserts a road between two places the line never joined — a fabricated
+       route is worse than no route, and the caller can still see the plan
+       through the <rte> elements. */
     function pointsOf(v) {
-        if (!Array.isArray(v)) return null;
+        if (!Array.isArray(v) || v.length < 2) return null;
         const out = [];
         for (let i = 0; i < v.length; i++) {
             const p = toPoint(v[i]);
-            if (p) out.push(p);
+            if (!p) return null;
+            out.push(p);
         }
-        return out.length >= 2 ? out : null;
+        return out;
     }
 
     /* A wrapped path may arrive under any of several key names, and a sibling
@@ -571,7 +793,18 @@
                  graph. It is emitted ONLY when real geometry is supplied.
        Drawing straight city-to-city lines into a <trk> would state that the
        road goes that way — across a bay, through a mountain — which is a claim
-       the engine never made. See the note in the module report. */
+       the engine never made.
+
+       UNVERIFIED, and recorded as unverified: how each importer treats a file
+       with routes and no track has NOT been tested against Garmin, OsmAnd,
+       Komoot or anything else. `rte` is part of GPX 1.1 and is the semantically
+       correct element, but support for it is known to be uneven and Komoot in
+       particular is reported to prefer tracks. The trade is deliberate — an
+       importer that ignores an `rte` shows the user nothing, which is
+       recoverable, whereas a fabricated `trk` shows them a road that is not
+       there, which is not. Supplying `geometry` produces a `trk` and sidesteps
+       the question entirely; that is the path the app should take. Do not
+       upgrade this note to a compatibility claim without testing it. */
     function gpxWaypoints(plan, L) {
         const roles = [];        /* [{ place, labels: [] }] keyed by identity below */
         const index = {};
@@ -632,13 +865,17 @@
         return label;
     }
 
-    function dayMetrics(day, L, unreliable) {
-        if (unreliable) return '';
-        return L.distance + ' ' + formatKm(day && day.km, L) + ', ' +
-            L.driveTime + ' ' + formatDuration(day && day.driveMin, L);
+    /* A day's figures WITH the sentence that says what kind of figures they
+       are. The qualifier travels with the number, never in a separate place a
+       reader can miss. */
+    function dayMetrics(day, L, basis) {
+        if (basis === 'unusable') return L.unreliable;
+        return L.distance + ' ' + kmText(day && day.km, L) + ', ' +
+            L.driveTime + ' ' + durationText(day && day.driveMin, L) +
+            ' — ' + basisNote(basis, L);
     }
 
-    function gpxRoutes(plan, L, unreliable) {
+    function gpxRoutes(plan, L, basis, maxDriveMin) {
         const days = planDays(plan);
         let xml = '';
         for (let i = 0; i < days.length; i++) {
@@ -648,10 +885,13 @@
                calendar entry; inventing a zero-length <rte> for it only makes
                importers draw a dot and call it a leg. */
             if (pts.length < 2) continue;
-            const metrics = dayMetrics(d, L, unreliable);
+            const parts = [dayMetrics(d, L, basis)];
+            const longDay = longDayNote(d, L, maxDriveMin);
+            if (longDay) parts.push(longDay);
+            parts.push(L.viaPoints);
             xml += '  <rte>\n';
             xml += '    <name>' + escapeXml(dayTitle(d, i, L)) + '</name>\n';
-            xml += '    <desc>' + escapeXml((metrics ? metrics + ' — ' : '') + L.viaPoints) + '</desc>\n';
+            xml += '    <desc>' + escapeXml(parts.join(' ')) + '</desc>\n';
             xml += '    <number>' + Math.max(1, dayNumber(d, i)) + '</number>\n';
             for (let k = 0; k < pts.length; k++) {
                 xml += '    <rtept lat="' + coord(pts[k].lat) + '" lon="' + coord(pts[k].lon) + '">\n';
@@ -676,16 +916,15 @@
         return xml;
     }
 
-    function gpxTracks(plan, geom, name, L, unreliable) {
+    function gpxTracks(plan, geom, name, L, basis) {
         const days = planDays(plan);
         let xml = '';
         if (geom.days) {
             for (let i = 0; i < days.length && i < geom.days.length; i++) {
                 const path = geom.days[i];
                 if (!path) continue;
-                const metrics = dayMetrics(days[i], L, unreliable);
                 xml += gpxTrackFrom(dayTitle(days[i], i, L),
-                    (metrics ? metrics + ' — ' : '') + L.roadTrack, path, L);
+                    dayMetrics(days[i], L, basis) + ' ' + L.roadTrack, path, L);
             }
             return xml;
         }
@@ -697,7 +936,7 @@
         const a = args || {};
         const L = labelsOf(a.labels);
         const plan = a.plan || null;
-        const unreliable = numbersUnreliable(plan, a.numbersUnreliable);
+        const basis = distanceBasis(plan, a);
         const geom = normaliseGeometry(a.geometry);
         const name = tripName(plan, a.name, L);
 
@@ -708,22 +947,32 @@
             const t = str(extra[i]).trim();
             if (t) notes.push(t);
         }
-        if (unreliable) notes.push(L.unreliable);
+        if (basis === 'unusable') notes.push(L.unreliable);
         else {
             const days = planDays(plan);
-            let km = 0, min = 0;
+            /* A total that skipped a day it could not read is a FLOOR and says
+               so; a total with nothing readable in it at all is not a floor of
+               zero, it is simply unknown. The two are tracked separately for
+               distance and for time, because a day can be missing one and not
+               the other. */
+            let km = 0, min = 0, kmSeen = 0, minSeen = 0;
             for (let i = 0; i < days.length; i++) {
                 const d = days[i] || {};
-                km += roundKm(d.km);
-                min += Math.max(0, Math.round(num(d.driveMin, 0)));
+                const k = knownNonNeg(d.km), t = knownNonNeg(d.driveMin);
+                if (k !== null) { km += roundKm(k); kmSeen++; }
+                if (t !== null) { min += Math.round(t); minSeen++; }
             }
             if (days.length) {
-                notes.push(L.distance + ' ' + formatKm(km, L) + ', ' +
-                    L.driveTime + ' ' + formatDuration(min, L));
+                notes.push(L.distance + ' ' + totalText(km, kmSeen, days.length, formatKm, L) + ', ' +
+                    L.driveTime + ' ' + totalText(min, minSeen, days.length, formatDuration, L) + '.');
+                notes.push(basisNote(basis, L));
             }
         }
         const missing = countUnlocated(plan);
         if (missing > 0) notes.push(fill(L.unlocated, { count: missing }));
+        /* Every engine warning not already stated above, verbatim. */
+        const residual = residualWarnings(plan, a);
+        for (let i = 0; i < residual.length; i++) notes.push(residual[i]);
 
         let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
         xml += '<gpx version="1.1" creator="' + escapeXml(GPX_CREATOR) + '"\n';
@@ -736,8 +985,8 @@
         if (notes.length) xml += '    <desc>' + escapeXml(notes.join(' ')) + '</desc>\n';
         xml += '  </metadata>\n';
         xml += gpxWaypoints(plan, L);
-        xml += gpxRoutes(plan, L, unreliable);
-        xml += gpxTracks(plan, geom, name, L, unreliable);
+        xml += gpxRoutes(plan, L, basis, a.maxDriveMin);
+        xml += gpxTracks(plan, geom, name, L, basis);
         xml += '</gpx>\n';
         return xml;
     }
@@ -751,12 +1000,17 @@
     function icsDescription(day, index, opts) {
         const L = opts.L;
         const lines = [];
-        if (opts.unreliable) {
+        if (opts.basis === 'unusable') {
             lines.push(L.unreliable);
         } else if (!isRestDay(day)) {
-            lines.push(L.distance + ': ' + formatKm(day.km, L));
-            lines.push(L.driveTime + ': ' + formatDuration(day.driveMin, L));
+            lines.push(L.distance + ': ' + kmText(day.km, L));
+            lines.push(L.driveTime + ': ' + durationText(day.driveMin, L));
+            /* The qualifier sits directly under the figures it qualifies. A
+               calendar entry is read a week later with no app around it. */
+            lines.push(basisNote(opts.basis, L));
         }
+        const longDay = longDayNote(day, L, opts.maxDriveMin);
+        if (longDay) lines.push(longDay);
 
         const nodes = dayNodes(day);
         const names = [];
@@ -771,7 +1025,7 @@
            and when the app cannot say what a day costs, the line is omitted
            rather than filled with a number nobody computed. */
         const cost = opts.costs && Array.isArray(opts.costs.days) ? opts.costs.days[index] : null;
-        if (cost && !opts.unreliable) {
+        if (cost && opts.basis !== 'unusable') {
             const total = num(cost.total, NaN);
             if (isFinite(total)) {
                 lines.push(cost.incomplete
@@ -797,6 +1051,15 @@
                 for (let k = 0; k < block.length; k++) lines.push(block[k]);
             }
         }
+
+        /* Engine warnings nothing else in the file states. They ride on the
+           first day because calendar-level DESCRIPTION is invisible in most
+           importers, and a warning nobody can see is a warning nobody got. */
+        if (index === 0 && opts.notes.length) {
+            lines.push('');
+            lines.push(L.plannerNotes);
+            for (let k = 0; k < opts.notes.length; k++) lines.push('- ' + opts.notes[k]);
+        }
         return lines.join('\n');
     }
 
@@ -812,8 +1075,10 @@
            involves driving; a rest day, or a day the user gave no departure
            time for, is an all-day entry rather than an invented 09:00. */
         const startMin = parseClock(day && day.startTime);
-        const driveMin = Math.max(0, Math.round(num(day && day.driveMin, 0)));
-        const timed = !opts.allDay && startMin !== null && driveMin > 0 && !opts.unreliable;
+        const known = knownNonNeg(day && day.driveMin);
+        const driveMin = known === null ? 0 : Math.round(known);
+        const timed = !opts.allDay && startMin !== null && driveMin > 0 &&
+            opts.basis !== 'unusable';
         if (timed) {
             const endTotal = startMin + driveMin;
             lines.push('DTSTART:' + formatIcsDateTime(date, startMin));
@@ -850,9 +1115,19 @@
         const days = planDays(plan);
         const start = parseDate(a.startDate);
         if (!start || days.length === 0) return '';
+        /* A trip that runs past 9999-12-31 has no representable DTEND: the
+           calendar date rolls into year 10000 and the date field grows a ninth
+           digit, which no RFC 5545 parser accepts. Emitting nothing beats
+           emitting a file that fails to import. */
+        const lastDate = addDays(start, days.length);
+        if (lastDate.y < 1 || lastDate.y > 9999) return '';
 
-        const unreliable = numbersUnreliable(plan, a.numbersUnreliable);
-        const seed = str(a.uidSeed).trim() || planUidSeed(plan, start);
+        const basis = distanceBasis(plan, a);
+        /* A UID is an opaque identifier, not TEXT, so it has no escape form —
+           a raw CRLF in a caller-supplied seed would close the VEVENT and open
+           a forged one. Restrict it to characters that cannot mean anything to
+           the parser instead of trying to escape them. */
+        const seed = safeUidSeed(a.uidSeed) || planUidSeed(plan, start);
         /* DTSTAMP is required and must be a UTC date-time. With the clock off
            limits, the trip's own start midnight is the one date in scope that
            is both deterministic and defensible; callers holding a real save
@@ -863,18 +1138,26 @@
         const opts = {
             L: L, start: start, seed: seed, dtstamp: dtstamp,
             costs: a.costs || null, enrichment: a.enrichment || null,
-            allDay: a.allDay === true, unreliable: unreliable
+            allDay: a.allDay === true, basis: basis,
+            maxDriveMin: a.maxDriveMin,
+            notes: residualWarnings(plan, a)
         };
 
         const lines = [];
         lines.push('BEGIN:VCALENDAR');
         lines.push('VERSION:2.0');
-        lines.push('PRODID:' + (str(a.prodId).trim() || ICS_PRODID));
+        lines.push('PRODID:' + (escapeIcs(str(a.prodId).trim()) || ICS_PRODID));
         lines.push('CALSCALE:GREGORIAN');
         lines.push('METHOD:PUBLISH');
         const name = tripName(plan, a.name, L);
         lines.push('X-WR-CALNAME:' + escapeIcs(name));
         lines.push('NAME:' + escapeIcs(name));
+        /* Calendar-level provenance. Most importers never show this, which is
+           why the per-event copy exists too — but the ones that do should not
+           have to dig into a day to find out what kind of numbers these are. */
+        const calDesc = [basisNote(basis, L)].concat(opts.notes).join(' ');
+        lines.push('DESCRIPTION:' + escapeIcs(calDesc));
+        lines.push('X-WR-CALDESC:' + escapeIcs(calDesc));
         for (let i = 0; i < days.length; i++) {
             const ev = icsEvent(days[i], i, opts);
             for (let k = 0; k < ev.length; k++) lines.push(ev[k]);
@@ -965,7 +1248,7 @@
         html += '<meta charset="utf-8">\n';
         html += '<meta name="viewport" content="width=device-width, initial-scale=1">\n';
         html += '<title>' + escapeHtml(title) + '</title>\n';
-        html += '<style>' + (typeof a.css === 'string' ? a.css : PRINT_CSS) + '</style>\n';
+        html += '<style>' + (typeof a.css === 'string' ? safeCss(a.css) : PRINT_CSS) + '</style>\n';
         html += '</head>\n<body>\n';
         html += '<header class="print-head">';
         html += '<h1 class="print-title">' + escapeHtml(title) + '</h1>';
@@ -999,6 +1282,13 @@
         buildPrintHtml: buildPrintHtml,
         PRINT_CSS: PRINT_CSS,
         DEFAULT_LABELS: DEFAULT_LABELS,
+        COVERED_WARNINGS: COVERED_WARNINGS,
+        UNRELIABLE_WARNINGS: UNRELIABLE_WARNINGS,
+        distanceBasis: distanceBasis,
+        residualWarnings: residualWarnings,
+        knownNonNeg: knownNonNeg,
+        safeUidSeed: safeUidSeed,
+        safeCss: safeCss,
         /* helpers, exported because they are separately testable units */
         escapeXml: escapeXml,
         escapeIcs: escapeIcs,

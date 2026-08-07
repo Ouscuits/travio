@@ -195,10 +195,21 @@ function icsLines(text) {
     if (lines.length && lines[lines.length - 1] === '') lines.pop();
     return lines;
 }
-function icsProp(text, name) {
+/* Properties of the VEVENTs only. DESCRIPTION exists at both calendar and
+   event level (RFC 7986), so an unscoped reader silently returns the wrong
+   one. */
+function icsProp(text, name) { return propsIn(text, name, true); }
+/* Properties of the calendar header, outside every VEVENT. */
+function icsCalProp(text, name) { return propsIn(text, name, false); }
+
+function propsIn(text, name, insideEvent) {
     const out = [];
     const lines = icsLines(text);
+    let depth = 0;
     for (let i = 0; i < lines.length; i++) {
+        if (lines[i] === 'BEGIN:VEVENT') { depth++; continue; }
+        if (lines[i] === 'END:VEVENT') { depth--; continue; }
+        if ((depth > 0) !== insideEvent) continue;
         if (lines[i].indexOf(name + ':') === 0 || lines[i].indexOf(name + ';') === 0) {
             out.push(lines[i].slice(lines[i].indexOf(':') + 1));
         }
@@ -624,12 +635,30 @@ test('GPX ignores junk geometry instead of throwing', function () {
     }
 });
 
-test('GPX drops out-of-range geometry points rather than emitting them', function () {
+test('S4 a path with an unreadable point is REJECTED, never silently shortened', function () {
+    /* Dropping the bad point leaves a shorter, entirely plausible track that
+       asserts a road between two places the line never joined. */
     const geometry = [[[40.4, -3.7], [999, 0], [41.6, -0.9]], null];
     const root = parseXml(X.buildGpx({ plan: SIMPLE_PLAN, geometry: geometry }));
-    const pts = findAll(root, 'trkpt');
-    assert.strictEqual(pts.length, 2);
-    for (let i = 0; i < pts.length; i++) assert.ok(Math.abs(Number(pts[i].attrs.lat)) <= 90);
+    assert.strictEqual(findAll(root, 'trkpt').length, 0, 'a mangled path became a track');
+    assert.strictEqual(findAll(root, 'trk').length, 0);
+    assert.strictEqual(findAll(root, 'rte').length, 2, 'the plan is still exported as routes');
+
+    const kinds = [
+        [[40.4, -3.7], [91, 0], [41.6, -0.9]],          /* latitude out of range */
+        [[40.4, -3.7], [40, 181], [41.6, -0.9]],        /* longitude out of range */
+        [[40.4, -3.7], [NaN, NaN], [41.6, -0.9]],
+        [[40.4, -3.7], null, [41.6, -0.9]],
+        [[40.4, -3.7], [40.5], [41.6, -0.9]],           /* one-element point */
+        [[40.4, -3.7], 'x', [41.6, -0.9]]
+    ];
+    for (let i = 0; i < kinds.length; i++) {
+        assert.strictEqual(X.normaliseGeometry(kinds[i]).trip, null, 'kind ' + i + ' was accepted');
+        assert.strictEqual(X.normaliseGeometry([kinds[i]]).days, null, 'kind ' + i + ' as a day path');
+    }
+    /* an intact path of the same shape is still accepted, so this is not a
+       blanket refusal */
+    assert.strictEqual(X.normaliseGeometry([[40.4, -3.7], [41, -2], [41.6, -0.9]]).trip.length, 3);
 });
 
 /* js/route-map.js is a sibling that may or may not exist yet; this module must
@@ -779,16 +808,16 @@ test('ICS carries the required calendar properties', function () {
     const lines = icsLines(ics);
     assert.strictEqual(lines[0], 'BEGIN:VCALENDAR');
     assert.strictEqual(lines[lines.length - 1], 'END:VCALENDAR');
-    assert.deepStrictEqual(icsProp(ics, 'VERSION'), ['2.0']);
-    assert.deepStrictEqual(icsProp(ics, 'PRODID'), ['-//Travio//Route Planner//EN']);
-    assert.deepStrictEqual(icsProp(ics, 'CALSCALE'), ['GREGORIAN']);
+    assert.deepStrictEqual(icsCalProp(ics, 'VERSION'), ['2.0']);
+    assert.deepStrictEqual(icsCalProp(ics, 'PRODID'), ['-//Travio//Route Planner//EN']);
+    assert.deepStrictEqual(icsCalProp(ics, 'CALSCALE'), ['GREGORIAN']);
 });
 
 test('ICS PRODID can be overridden and never comes out empty', function () {
     const ics = X.buildIcs({ plan: SIMPLE_PLAN, startDate: '2026-08-14', prodId: '-//Me//App//EN' });
-    assert.deepStrictEqual(icsProp(ics, 'PRODID'), ['-//Me//App//EN']);
+    assert.deepStrictEqual(icsCalProp(ics, 'PRODID'), ['-//Me//App//EN']);
     const blank = X.buildIcs({ plan: SIMPLE_PLAN, startDate: '2026-08-14', prodId: '   ' });
-    assert.deepStrictEqual(icsProp(blank, 'PRODID'), ['-//Travio//Route Planner//EN']);
+    assert.deepStrictEqual(icsCalProp(blank, 'PRODID'), ['-//Travio//Route Planner//EN']);
 });
 
 test('ICS emits exactly one VEVENT per plan day, correctly nested', function () {
@@ -1202,12 +1231,277 @@ test('X5 zero-distance is the other unusable class, and costs are withheld with 
     assert.ok(ics.indexOf('EUR') < 0, 'a cost computed from unusable distances was exported');
 });
 
-test('X5 an ordinary warning does NOT suppress the numbers', function () {
-    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
-    plan.warnings = ['distance-source: no road data at all', 'over-drive-cap: day 1'];
+/* ── X7 — the third state: qualify the figure, do not withhold it ───────────
+   This replaces a test that called "no road data at all" an ORDINARY warning
+   and asserted the bare figure. The numbersUnreliable half was right; the half
+   it never asserted — that an estimate carries its qualifier — is the bug. */
+
+test('X7 the haversine fallback prints its number AND says what kind of number it is', function () {
+    /* The reproduction: OSRM down, geo-provider falls back to haversine × 1.25.
+       Madrid→Barcelona is 620 real road km and this says 632 — plausible, which
+       is exactly what makes an unqualified figure dangerous. */
+    const plan = planFor(MADRID, BARCELONA, [], 1);
+    let sourced = false;
+    for (let i = 0; i < plan.warnings.length; i++) {
+        if (plan.warnings[i].indexOf('distance-source: no road data at all') === 0) sourced = true;
+    }
+    assert.ok(sourced, 'fixture no longer reproduces the haversine warning');
+
+    /* not unusable — suppressing a usable estimate would be over-firing */
     assert.strictEqual(X.numbersUnreliable(plan), false);
-    const desc = decodeIcs(icsProp(X.buildIcs({ plan: plan, startDate: '2026-08-14' }), 'DESCRIPTION')[0]);
-    assert.ok(desc.indexOf('Distance: ') === 0, desc);
+
+    /* the caller that knows the source gets the crisp sentence */
+    const told = X.buildIcs({ plan: plan, startDate: '2026-08-14', matrixSource: 'haversine' });
+    assert.strictEqual(X.distanceBasis(plan, { matrixSource: 'haversine' }), 'estimated');
+    const toldDesc = decodeIcs(icsProp(told, 'DESCRIPTION')[0]);
+    assert.ok(toldDesc.indexOf('Distance: ') === 0, 'the figure is still printed');
+    assert.ok(/STRAIGHT-LINE ESTIMATES/.test(toldDesc), 'no qualifier on the figure: ' + toldDesc);
+    assert.ok(toldDesc.indexOf('not driving distances') > 0, toldDesc);
+    /* and the qualifier sits with the numbers, not in some far corner */
+    const driveAt = toldDesc.indexOf('Drive time: ');
+    const qualAt = toldDesc.indexOf('STRAIGHT-LINE ESTIMATES');
+    assert.ok(qualAt > driveAt && qualAt - driveAt < 60, 'qualifier is not adjacent to the figures');
+
+    /* the caller that says nothing still gets a qualifier AND the engine's own
+       alert-level sentence — never a bare 632 km */
+    const quiet = X.buildIcs({ plan: plan, startDate: '2026-08-14' });
+    assert.strictEqual(X.distanceBasis(plan, {}), 'unconfirmed');
+    const quietDesc = decodeIcs(icsProp(quiet, 'DESCRIPTION')[0]);
+    assert.ok(quietDesc.indexOf('Distance: ') === 0);
+    assert.ok(quietDesc.indexOf('could not be confirmed') > 0, quietDesc);
+    assert.ok(quietDesc.indexOf('no road data at all') > 0,
+        'the engine sentence the screen shows as an alert is missing: ' + quietDesc);
+    assert.ok(decodeIcs(icsCalProp(quiet, 'DESCRIPTION')[0]).indexOf('no road data at all') > 0);
+
+    /* the GPX says it too, in the metadata and on every route */
+    const gpx = X.buildGpx({ plan: plan, matrixSource: 'haversine' });
+    const root = parseXml(gpx);
+    assert.ok(decodeXml(childText(findAll(root, 'metadata')[0], 'desc'))
+        .indexOf('STRAIGHT-LINE ESTIMATES') > 0);
+    assert.ok(decodeXml(childText(findAll(root, 'rte')[0], 'desc'))
+        .indexOf('STRAIGHT-LINE ESTIMATES') > 0);
+    assert.ok(X.buildGpx({ plan: plan }).indexOf('no road data at all') > 0,
+        'the GPX drops the engine sentence when no source is stated');
+});
+
+test('X7 all five provenance states, and only one of them withholds', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = [];
+    const cases = [
+        { src: 'osrm', basis: 'road', mark: 'from the road graph' },
+        { src: 'mixed', basis: 'partial', mark: 'Some of these distances are straight-line' },
+        { src: 'haversine', basis: 'estimated', mark: 'STRAIGHT-LINE ESTIMATES' },
+        { src: undefined, basis: 'unconfirmed', mark: 'could not be confirmed' },
+        { src: 'nonsense', basis: 'unconfirmed', mark: 'could not be confirmed' }
+    ];
+    for (let i = 0; i < cases.length; i++) {
+        const c = cases[i];
+        assert.strictEqual(X.distanceBasis(plan, { matrixSource: c.src }), c.basis, 'source ' + c.src);
+        const desc = decodeIcs(icsProp(X.buildIcs({
+            plan: plan, startDate: '2026-08-14', matrixSource: c.src
+        }), 'DESCRIPTION')[0]);
+        assert.ok(desc.indexOf('Distance: ') === 0, 'source ' + c.src + ' withheld a usable figure');
+        assert.ok(desc.indexOf(c.mark) > 0, 'source ' + c.src + ' -> ' + desc);
+    }
+    /* only 'unusable' withholds */
+    plan.warnings = ['unknown-distance: x'];
+    assert.strictEqual(X.distanceBasis(plan, { matrixSource: 'osrm' }), 'unusable');
+    const withheld = decodeIcs(icsProp(X.buildIcs({
+        plan: plan, startDate: '2026-08-14', matrixSource: 'osrm'
+    }), 'DESCRIPTION')[0]);
+    assert.ok(withheld.indexOf('Distance: ') < 0);
+});
+
+test('X7 an absent matrixSource is unconfirmed — neither road data nor "no road data"',
+    function () {
+        const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+        plan.warnings = [];
+        assert.strictEqual(X.distanceBasis(plan, {}), 'unconfirmed');
+        assert.strictEqual(X.distanceBasis(null, {}), 'unconfirmed');
+        assert.strictEqual(X.distanceBasis({}, { matrixSource: null }), 'unconfirmed');
+
+        const desc = decodeIcs(icsProp(X.buildIcs({
+            plan: plan, startDate: '2026-08-14'
+        }), 'DESCRIPTION')[0]);
+        /* silence is not evidence of a road graph ... */
+        assert.ok(desc.indexOf('come from the road graph') < 0);
+        /* ... and it is not evidence of the absence of one either. Telling a
+           70%-real matrix it has no road data is the same lie in the other
+           direction — the bug js/itinerary-render.js was fixed for. */
+        assert.ok(desc.indexOf('no road data was available') < 0,
+            'an unknown source was reported as having no road data at all');
+        assert.ok(desc.indexOf('could not be confirmed') > 0, desc);
+    });
+
+test('X7 a caller that states nothing still gets the engine warning verbatim', function () {
+    /* the qualifier for an unknown source is deliberately weaker than the
+       warning it would be standing in for, so the warning itself must survive */
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = ['distance-source: partial road data — 2 of 6 cells estimated'];
+    assert.deepStrictEqual(X.residualWarnings(plan, {}), plan.warnings);
+    assert.deepStrictEqual(X.residualWarnings(plan, { matrixSource: 'mixed' }), []);
+    assert.deepStrictEqual(X.residualWarnings(plan, { matrixSource: 'haversine' }), []);
+    assert.deepStrictEqual(X.residualWarnings(plan, { matrixSource: 'osrm' }), plan.warnings);
+    assert.ok(X.buildIcs({ plan: plan, startDate: '2026-08-14' }).indexOf('2 of 6 cells') > 0);
+});
+
+test('X7 warnings may only DOWNGRADE the claimed provenance, never upgrade it', function () {
+    const base = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    function withWarnings(w) { const p = planFor(MADRID, BARCELONA, [ZARAGOZA], 2); p.warnings = w; return p; }
+
+    /* an "osrm" label plus evidence of gap-filling is at best partial */
+    assert.strictEqual(X.distanceBasis(withWarnings(['distance-fallback: 3 cells']),
+        { matrixSource: 'osrm' }), 'partial');
+    assert.strictEqual(X.distanceBasis(withWarnings(['missing-matrix: none supplied']),
+        { matrixSource: 'osrm' }), 'estimated');
+    /* a discarded or repaired matrix proves the label is not trustworthy, but
+       not that there was no road data — so it lands on unconfirmed, not on the
+       stronger "no road data was available" */
+    assert.strictEqual(X.distanceBasis(withWarnings(['matrix-size-mismatch: 3x3 but 4 places']),
+        { matrixSource: 'osrm' }), 'unconfirmed');
+    assert.strictEqual(X.distanceBasis(withWarnings(['invalid-distance: negative values']),
+        { matrixSource: 'osrm' }), 'unconfirmed');
+    /* and nothing can turn a haversine matrix into road data */
+    assert.strictEqual(X.distanceBasis(withWarnings([]), { matrixSource: 'haversine' }), 'estimated');
+    assert.strictEqual(X.distanceBasis(base, { matrixSource: 'osrm' }), 'partial',
+        'the engine already flags this fixture as gap-filled or estimated');
+
+    /* An "osrm" claim the engine contradicted is the one case a three-way
+       qualifier cannot fully carry, so the engine's own sentence is surfaced
+       verbatim alongside the downgrade — covered structurally, but only when
+       the structure actually matches. */
+    assert.deepStrictEqual(X.residualWarnings(base, { matrixSource: 'osrm' }), base.warnings);
+    assert.deepStrictEqual(X.residualWarnings(base, {}), base.warnings);
+    assert.deepStrictEqual(X.residualWarnings(base, { matrixSource: 'haversine' }), []);
+    const ics = X.buildIcs({ plan: base, startDate: '2026-08-14', matrixSource: 'osrm' });
+    assert.ok(decodeIcs(icsCalProp(ics, 'DESCRIPTION')[0]).indexOf('no road data at all') > 0,
+        'a contradicted road-data claim went out unqualified');
+});
+
+test('X7 a mixed matrix is never told it has no road data at all', function () {
+    /* the bug itinerary-render.js fixed on screen, checked here for the file:
+       a 70%-real matrix must not claim there is no road data */
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = ['distance-source: partial road data — 2 of 6 cells estimated'];
+    const desc = decodeIcs(icsProp(X.buildIcs({
+        plan: plan, startDate: '2026-08-14', matrixSource: 'mixed'
+    }), 'DESCRIPTION')[0]);
+    assert.ok(desc.indexOf('Some of these distances') > 0, desc);
+    assert.ok(desc.indexOf('no road data was available') < 0,
+        'a partly-real matrix was reported as having no road data');
+});
+
+test('X7 numbersUnreliable(false) rules out withholding but cannot promise road data', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = ['unknown-distance: x'];
+    assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: false }), 'estimated');
+    assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: false, matrixSource: 'osrm' }),
+        'estimated', 'an override must not upgrade the claim to road data');
+    assert.strictEqual(X.distanceBasis(plan, { numbersUnreliable: true }), 'unusable');
+});
+
+test('X7 B6: a long driving day is flagged in the file, not only on screen', function () {
+    const plan = planFor(MADRID, BARCELONA, [], 1);
+    assert.strictEqual(plan.days[0].overDriveCap, true, 'fixture is not over the cap');
+
+    const withCap = decodeIcs(icsProp(X.buildIcs({
+        plan: plan, startDate: '2026-08-14', maxDriveMin: 360
+    }), 'DESCRIPTION')[0]);
+    assert.ok(withCap.indexOf('Long driving day: 7 h 1 min, above the 6 h') >= 0, withCap);
+
+    /* without a stated cap the flag stays but the number does not get invented */
+    const noCap = decodeIcs(icsProp(X.buildIcs({
+        plan: plan, startDate: '2026-08-14'
+    }), 'DESCRIPTION')[0]);
+    assert.ok(noCap.indexOf('Long driving day') >= 0, noCap);
+    assert.ok(!/above the \d/.test(noCap), 'a cap the planner never stated was exported: ' + noCap);
+
+    /* and the GPX route carries it too */
+    const gpx = X.buildGpx({ plan: plan, maxDriveMin: 360 });
+    assert.ok(gpx.indexOf('Long driving day') > 0);
+
+    /* a day under the cap says nothing */
+    const easy = planFor(MADRID, BARCELONA, [ZARAGOZA], 4);
+    const quiet = X.buildIcs({ plan: easy, startDate: '2026-08-14', maxDriveMin: 360 });
+    let flagged = 0;
+    const all = icsProp(quiet, 'DESCRIPTION').map(decodeIcs);
+    for (let i = 0; i < all.length; i++) if (all[i].indexOf('Long driving day') >= 0) flagged++;
+    let capped = 0;
+    for (let i = 0; i < easy.days.length; i++) if (easy.days[i].overDriveCap) capped++;
+    assert.strictEqual(flagged, capped);
+});
+
+test('X7 every one of the 20 engine warning codes reaches the file, structurally or verbatim',
+    function () {
+        const src = require('node:fs').readFileSync(
+            path.join(__dirname, '..', 'js', 'route-engine.js'), 'utf8');
+        const codes = {};
+        const re = /warnings\.push\('([a-z-]+):/g;
+        let m;
+        while ((m = re.exec(src)) !== null) codes[m[1]] = true;
+        const all = Object.keys(codes).sort();
+        assert.strictEqual(all.length, 20, 'the engine now emits ' + all.length + ' codes: ' + all);
+
+        const covered = X.COVERED_WARNINGS;
+        const verbatim = [];
+        for (let i = 0; i < all.length; i++) if (!covered[all[i]]) verbatim.push(all[i]);
+        assert.deepStrictEqual(verbatim, ['cap-default', 'days-clamped', 'duplicate-stop-removed',
+            'empty-trip', 'missing-end', 'missing-start', 'no-places', 'optimisation-limited',
+            'stop-ignored']);
+
+        /* the verbatim ones really do come out */
+        const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+        plan.warnings = ['duplicate-stop-removed: "Zaragoza" is listed more than once.',
+            'optimisation-limited: 14 stops exceed the 2-opt limit.',
+            'cap-default: maxDriveMinPerDay "x" is not usable, using 360.'];
+        assert.strictEqual(X.residualWarnings(plan).length, 3);
+        const ics = X.buildIcs({ plan: plan, startDate: '2026-08-14' });
+        const first = decodeIcs(icsProp(ics, 'DESCRIPTION')[0]);
+        assert.ok(first.indexOf('Planner notes') > 0, first);
+        assert.ok(first.indexOf('is listed more than once') > 0);
+        assert.ok(first.indexOf('exceed the 2-opt limit') > 0);
+        assert.ok(first.indexOf('not usable, using 360') > 0);
+        /* and only on the first day, not repeated on every event */
+        const second = decodeIcs(icsProp(ics, 'DESCRIPTION')[1]);
+        assert.ok(second.indexOf('Planner notes') < 0);
+        /* the GPX carries them too */
+        assert.ok(X.buildGpx({ plan: plan }).indexOf('exceed the 2-opt limit') > 0);
+    });
+
+test('X7 a structurally-represented warning is not ALSO dumped as raw prose', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = ['distance-source: no road data at all — every distance is a straight-line estimate.',
+        'rest-day: day 2 has no driving.',
+        'over-drive-cap: day 1 drives 421 min.',
+        'unresolved-place: "X" could not be located.',
+        'round-trip: the end point matches the start point.'];
+    /* stating the source makes the qualifier say everything the warning says */
+    const opts = { matrixSource: 'haversine' };
+    assert.deepStrictEqual(X.residualWarnings(plan, opts), []);
+    const ics = X.buildIcs({ plan: plan, startDate: '2026-08-14', matrixSource: 'haversine' });
+    assert.ok(ics.indexOf('Planner notes') < 0, 'covered warnings were duplicated as prose');
+    assert.ok(ics.indexOf('every distance is a straight-line estimate.') < 0);
+    /* but their meaning is still in the file */
+    assert.ok(decodeIcs(icsProp(ics, 'DESCRIPTION')[0]).indexOf('STRAIGHT-LINE ESTIMATES') > 0);
+});
+
+test('X7 the calendar header states the provenance as well', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    plan.warnings = [];          /* a genuinely clean road matrix */
+    const ics = X.buildIcs({ plan: plan, startDate: '2026-08-14', matrixSource: 'osrm' });
+    assert.ok(decodeIcs(icsCalProp(ics, 'DESCRIPTION')[0]).indexOf('road graph') > 0);
+    assert.ok(decodeIcs(icsCalProp(ics, 'X-WR-CALDESC')[0]).indexOf('road graph') > 0);
+    /* and it is calendar-level, so it must not be counted as an event's */
+    assert.strictEqual(icsProp(ics, 'DESCRIPTION').length, 2);
+});
+
+test('X7 the provenance sentences are translatable like everything else', function () {
+    const ics = X.buildIcs({
+        plan: planFor(MADRID, BARCELONA, [ZARAGOZA], 2), startDate: '2026-08-14',
+        matrixSource: 'haversine',
+        labels: { basisEstimated: 'Distancias en línea recta, NO por carretera.' }
+    });
+    assert.ok(decodeIcs(icsProp(ics, 'DESCRIPTION')[0]).indexOf('línea recta') > 0);
 });
 
 test('X5 numbersUnreliable can be forced either way by the caller', function () {
@@ -1267,6 +1561,181 @@ test('X5 the GPX metadata totals equal the sum of the per-day values (quality ba
     }
     const shown = km >= 10 ? Math.round(km) : Math.round(km * 10) / 10;
     assert.ok(total.indexOf('Distance ' + shown + ' km') >= 0, total);
+});
+
+/* ════════════════════════════════════════════════════════════════════════════
+   S1–S5 — the secondary findings, each failing against the previous build
+   ════════════════════════════════════════════════════════════════════════════ */
+
+test('S1 a trip that would run past 9999-12-31 emits no calendar, not a 9-digit date', function () {
+    const oneDay = planFor(MADRID, BARCELONA, [], 1);
+    /* the reproduction: DTEND used to roll to 100000101 */
+    const last = X.buildIcs({ plan: oneDay, startDate: '9999-12-31', allDay: true });
+    assert.strictEqual(last, '', 'a calendar with an unrepresentable DTEND was emitted');
+
+    const threeDay = planFor(MADRID, BARCELONA, [ZARAGOZA], 3);
+    assert.strictEqual(threeDay.days.length, 3);
+    assert.strictEqual(X.buildIcs({ plan: threeDay, startDate: '9999-12-30' }), '');
+    assert.strictEqual(X.buildIcs({ plan: threeDay, startDate: '9999-12-29' }), '');
+
+    /* one day earlier the last DTEND is 9999-12-31, which fits — so this is a
+       boundary, not a blanket refusal */
+    const ok = X.buildIcs({ plan: threeDay, startDate: '9999-12-28' });
+    assert.ok(ok.length > 0);
+    const dates = icsProp(ok, 'DTSTART').concat(icsProp(ok, 'DTEND'), icsProp(ok, 'DTSTAMP'));
+    for (let i = 0; i < dates.length; i++) {
+        assert.ok(/^\d{8}(T\d{6}Z?)?$/.test(dates[i]), 'malformed date value ' + dates[i]);
+    }
+    assert.deepStrictEqual(icsProp(ok, 'DTEND')[2].slice(0, 8), '99991231');
+});
+
+test('S1 no caller-visible input produces a date field of the wrong width', function () {
+    const plan = planFor(MADRID, BARCELONA, [ZARAGOZA], 2);
+    const starts = ['0001-01-01', '1000-01-01', '2026-02-28', '9999-01-01', '9999-12-01'];
+    for (let i = 0; i < starts.length; i++) {
+        const ics = X.buildIcs({ plan: plan, startDate: starts[i] });
+        if (!ics) continue;
+        const lines = icsLines(ics);
+        for (let k = 0; k < lines.length; k++) {
+            const m = /^(DTSTART|DTEND|DTSTAMP)[;:].*?:?(\d{4,})/.exec(lines[k]);
+            if (m) assert.ok(/^\d{8}/.test(m[2]), starts[i] + ' -> ' + lines[k]);
+        }
+    }
+});
+
+test('S2 an unreadable distance is "not available", never a manufactured zero', function () {
+    const unknowns = [undefined, null, NaN, '?', Infinity, -1, {}];
+    for (let i = 0; i < unknowns.length; i++) {
+        const d = day(1, [leg(MADRID, BARCELONA, 100, 60)], { startTime: '09:00' });
+        d.km = unknowns[i];
+        d.driveMin = unknowns[i];
+        const ics = X.buildIcs({ plan: mkPlan([d]), startDate: '2026-08-14' });
+        const desc = decodeIcs(icsProp(ics, 'DESCRIPTION')[0]);
+        assert.ok(desc.indexOf('Distance: not available') >= 0,
+            'unknown #' + i + ' -> ' + desc);
+        assert.ok(desc.indexOf('Drive time: not available') >= 0, desc);
+        assert.ok(desc.indexOf('0 km') < 0, 'unknown #' + i + ' became a zero');
+        assert.ok(desc.indexOf('0 min') < 0, 'unknown #' + i + ' became a zero');
+        /* with no readable drive time there is no window to schedule */
+        assert.ok(/^\d{8}$/.test(icsProp(ics, 'DTSTART')[0]));
+
+        const gpx = X.buildGpx({ plan: mkPlan([d]) });
+        parseXml(gpx);
+        assert.ok(gpx.indexOf('0 km') < 0, 'GPX invented a zero for unknown #' + i);
+        assert.ok(gpx.indexOf('not available') > 0);
+    }
+    assert.strictEqual(X.knownNonNeg(0), 0, 'a real zero is still a real zero');
+    assert.strictEqual(X.knownNonNeg(NaN), null);
+    assert.strictEqual(X.knownNonNeg('12.5'), 12.5);
+});
+
+test('S2 a trip total that skipped an unreadable day is labelled a floor', function () {
+    const d1 = day(1, [leg(MADRID, ZARAGOZA, 300, 180)], { startTime: '09:00' });
+    const d2 = day(2, [leg(ZARAGOZA, BARCELONA, 300, 180)], { startTime: '09:00' });
+    d2.km = null;
+    const gpx = X.buildGpx({ plan: mkPlan([d1, d2]) });
+    const desc = decodeXml(childText(findAll(parseXml(gpx), 'metadata')[0], 'desc'));
+    assert.ok(desc.indexOf('Distance at least 300 km') >= 0, desc);
+    assert.ok(desc.indexOf('Drive time 6 h') >= 0, 'the readable half is still a total');
+
+    /* and with everything readable it is not hedged */
+    const clean = decodeXml(childText(findAll(parseXml(
+        X.buildGpx({ plan: mkPlan([d1]) })), 'metadata')[0], 'desc'));
+    assert.ok(clean.indexOf('at least') < 0, clean);
+});
+
+test('S2 two plans differing only in a KNOWN vs UNKNOWN distance get different UIDs', function () {
+    const known = mkPlan([day(1, [leg(MADRID, BARCELONA, 0, 0)])]);
+    const unknownDay = day(1, [leg(MADRID, BARCELONA, 0, 0)]);
+    unknownDay.km = null; unknownDay.driveMin = null;
+    assert.notStrictEqual(X.planSignature(known), X.planSignature(mkPlan([unknownDay])));
+});
+
+test('S3 uidSeed cannot inject a second VEVENT', function () {
+    const payload = 'x\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:PWNED';
+    const ics = X.buildIcs({ plan: SIMPLE_PLAN, startDate: '2026-08-14', uidSeed: payload });
+    const lines = icsLines(ics);
+    let begins = 0;
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i] === 'BEGIN:VEVENT') begins++;
+        assert.notStrictEqual(lines[i], 'SUMMARY:PWNED', 'a forged property was injected');
+    }
+    assert.strictEqual(begins, 2, 'the calendar grew an extra component');
+    /* the payload's letters may survive as inert characters — what must not
+       survive is their structure */
+    assert.strictEqual(icsProp(ics, 'SUMMARY').length, 2);
+    const uids = icsProp(ics, 'UID');
+    assert.strictEqual(uids.length, 2);
+    for (let i = 0; i < uids.length; i++) {
+        assert.ok(/^travio-[A-Za-z0-9._-]+-d\d+@travio\.app$/.test(uids[i]), uids[i]);
+    }
+    assert.strictEqual(icsProp(ics, 'DTSTAMP').length, 2, 'every event still has a DTSTAMP');
+    /* a seed that is nothing but junk falls back to the derived one */
+    const junk = X.buildIcs({ plan: SIMPLE_PLAN, startDate: '2026-08-14', uidSeed: '\r\n;,:' });
+    assert.deepStrictEqual(icsProp(junk, 'UID'),
+        icsProp(X.buildIcs({ plan: SIMPLE_PLAN, startDate: '2026-08-14' }), 'UID'));
+    assert.strictEqual(X.safeUidSeed('route/42 ok!'), 'route42ok');
+    assert.strictEqual(X.safeUidSeed('a'.repeat(200)).length, 64);
+});
+
+test('S3 prodId cannot inject a calendar property', function () {
+    const ics = X.buildIcs({
+        plan: SIMPLE_PLAN, startDate: '2026-08-14', prodId: 'a\r\nX-EVIL:1'
+    });
+    assert.ok(ics.indexOf('\r\nX-EVIL:1') < 0, 'a forged property was injected');
+    assert.deepStrictEqual(icsCalProp(ics, 'X-EVIL'), []);
+    assert.strictEqual(icsCalProp(ics, 'PRODID')[0], 'a\\nX-EVIL:1');
+});
+
+test('S3 css cannot break out of the style element', function () {
+    const payload = '}</style><script>alert(1)</script><style>{';
+    const html = X.buildPrintHtml({ css: payload });
+    assert.ok(html.indexOf('<script>') < 0, 'script tag reached the page: ' + html);
+    assert.ok(html.indexOf('</style><') < 0);
+    assert.strictEqual((html.match(/<style>/g) || []).length, 1);
+    assert.strictEqual((html.match(/<\/style>/g) || []).length, 1);
+    /* CSS still works: the child combinator survives, only `<` is removed */
+    assert.strictEqual(X.safeCss('.a > .b{color:red}'), '.a > .b{color:red}');
+    assert.ok(X.buildPrintHtml({ css: '.day-card > p{margin:0}' }).indexOf('.day-card > p') > 0);
+    /* case and spacing variants of the closing tag are all defused */
+    const variants = ['</STYLE>', '</ style>', '</style\n>', '<\/style>'];
+    for (let i = 0; i < variants.length; i++) {
+        assert.ok(X.buildPrintHtml({ css: 'x{}' + variants[i] + 'y' })
+            .indexOf('</style>\n</head>') > 0, 'variant ' + i);
+    }
+});
+
+test('S3 only bodyHtml is documented as verbatim, and it is the only one that is', function () {
+    const src = require('node:fs').readFileSync(
+        path.join(__dirname, '..', 'js', 'route-export.js'), 'utf8');
+    assert.ok(src.indexOf('`bodyHtml` is inserted verbatim') > 0, 'the contract is undocumented');
+    const html = X.buildPrintHtml({
+        bodyHtml: '<p>trusted</p>', title: '<b>t</b>', subtitle: '<b>s</b>',
+        footer: '<b>f</b>', notes: ['<b>n</b>'], lang: 'ca'
+    });
+    assert.strictEqual((html.match(/<b>/g) || []).length, 0, 'an undocumented field passed markup');
+    assert.ok(html.indexOf('<p>trusted</p>') > 0);
+});
+
+test('S5 unpaired surrogates never reach either format', function () {
+    const lone = 'A\uD800B\uDC00C';
+    assert.strictEqual(X.escapeXml(lone), 'ABC');
+    assert.strictEqual(X.escapeIcs(lone), 'ABC');
+    assert.strictEqual(X.escapeHtml(lone), 'ABC');
+    /* a real astral character is untouched */
+    assert.strictEqual(X.escapeXml('A\u{1F600}B'), 'A\u{1F600}B');
+    assert.strictEqual(X.utf8Length(X.escapeIcs('A\u{1F600}B')), 6);
+
+    const plan = mkPlan([day(1, [leg(P('Bad\uD800Name', 41, 2), BARCELONA, 10, 10)],
+        { startTime: '09:00' })]);
+    const gpx = X.buildGpx({ plan: plan });
+    parseXml(gpx);
+    assert.ok(gpx.indexOf('BadName') > 0);
+    assert.ok(!/[\uD800-\uDFFF]/.test(gpx.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')),
+        'a lone surrogate survived into the GPX');
+    const ics = X.buildIcs({ plan: plan, startDate: '2026-08-14' });
+    assert.ok(!/[\uD800-\uDFFF]/.test(ics.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')),
+        'a lone surrogate survived into the ICS');
 });
 
 /* ════════════════════════════════════════════════════════════════════════════
