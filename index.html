@@ -224,6 +224,28 @@ input,select,textarea{font-size:16px!important}
 .enrich-tip{display:flex;gap:8px;font-size:13px;line-height:1.5;background:var(--yellow-light);border-radius:var(--radius);padding:8px 10px;margin-top:8px}
 .enrich-status{background:var(--primary-light);color:var(--primary-darker);font-size:12px;padding:6px 10px;border-radius:var(--radius);margin-bottom:12px}
 
+/* ── Route map ──
+   No fixed pixel height anywhere: the SVG carries a viewBox and scales to the
+   width the card gives it, so the card grows with the page instead of cropping. */
+.map-panel{background:var(--surface);border:1px solid var(--border-light);border-radius:8px;padding:12px 14px;margin-bottom:16px}
+.map-panel-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px;margin-bottom:8px}
+.map-panel-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label)}
+.map-source{font-size:11px;color:var(--mid);text-align:right}
+/* An estimate never wears the calm colour: same rule as the notice list. */
+.map-source-estimate{color:#8a5a00;font-weight:600}
+.map-figure svg{width:100%;height:auto;display:block;border-radius:var(--radius)}
+.map-legend{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px}
+.map-legend-item{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--label)}
+.map-legend-swatch{width:16px;flex:0 0 auto;border-radius:2px}
+
+/* ── Export ── */
+.export-bar{margin-top:16px;padding-top:12px;border-top:1px solid var(--border-light)}
+.export-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--label);margin-bottom:8px}
+.export-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.export-date{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--label);text-transform:uppercase;letter-spacing:.3px}
+.export-date input{padding:6px 8px;border:1px solid var(--border);border-radius:var(--radius);font-family:'Space Mono',monospace;background:var(--surface)}
+.export-hint{font-size:11px;color:var(--mid);margin-top:8px}
+
 .day-cost{border-top:1px dashed var(--border-light);padding-top:8px}
 .cost-table{width:100%;border-collapse:collapse;font-size:13px}
 .cost-table td{padding:3px 0}
@@ -480,6 +502,33 @@ input,select,textarea{font-size:16px!important}
                     <div id="resultContent" style="display:none">
                         <div class="result-header" id="resultHeader"></div>
                         <div class="enrich-status" id="enrichStatus" style="display:none"></div>
+
+                        <!-- Map (quality bar B8). The provenance line is part of the
+                             panel, not a decoration: a dashed line is an estimate. -->
+                        <div class="map-panel" id="routeMapPanel" style="display:none">
+                            <div class="map-panel-head">
+                                <span class="map-panel-title" id="routeMapTitle" data-i18n="map.title">Route map</span>
+                                <span class="map-source mono" id="routeMapSource"></span>
+                            </div>
+                            <div class="map-figure" id="routeMapFigure"></div>
+                            <div class="map-legend" id="routeMapLegend"></div>
+                        </div>
+
+                        <!-- Export (quality bar B8). Everything is built in the browser
+                             and downloaded from a Blob — nothing is uploaded. -->
+                        <div class="export-bar" id="exportBar" style="display:none">
+                            <div class="export-title" data-i18n="exp.title">Export</div>
+                            <div class="export-actions">
+                                <button class="btn btn-outline btn-sm" id="exportGpxBtn" data-i18n="exp.gpx">GPX</button>
+                                <button class="btn btn-outline btn-sm" id="exportPrintBtn" data-i18n="exp.print">Print / PDF</button>
+                                <label class="export-date" for="exportStartDate"><span data-i18n="exp.startDate">Trip start date</span>
+                                    <input type="date" id="exportStartDate">
+                                </label>
+                                <button class="btn btn-outline btn-sm" id="exportIcsBtn" data-i18n="exp.ics">Calendar</button>
+                            </div>
+                            <div class="export-hint" id="exportHint"></div>
+                        </div>
+
                         <div id="resultItinerary"></div>
                         <div class="result-body" id="resultBody" style="display:none"></div>
                     </div>
@@ -607,6 +656,8 @@ input,select,textarea{font-size:16px!important}
 <script src="js/route-engine.js"></script><!-- pure planner -->
 <script src="js/geo-provider.js"></script><!-- geocoding + road distances -->
 <script src="js/itinerary-render.js"></script><!-- costs + rendering -->
+<script src="js/route-map.js"></script><!-- projection + inline SVG map -->
+<script src="js/route-export.js"></script><!-- GPX / iCalendar / print -->
 <script src="js/route-form.js"></script>
 <script src="js/auth.js"></script><!-- MUST BE LAST -->
 

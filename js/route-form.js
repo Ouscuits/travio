@@ -5,16 +5,80 @@
  *   2. geocode every place (geo-provider, rate limited — progress is shown)
  *   3. build the road distance matrix (geo-provider)
  *   4. planRoute() (route-engine, pure + deterministic) -> the itinerary skeleton
- *   5. compute costs in JS and render the itinerary
+ *   4b. ONE routeGeometry() call, for the MAP ONLY (see below)
+ *   5. compute costs in JS and render the itinerary + the map
  *   6. ONLY THEN ask Claude to enrich that fixed skeleton with prose
  *
  * The model can never change the order, the days, the distances or the times:
  * steps 1-5 finish and are already on screen before step 6 is even sent.
+ *
+ * THE MAP CHANGES NOTHING. Step 4b runs AFTER planRoute, so the order it is asked
+ * about is already fixed, and its answer is used for one thing only: the shape of
+ * the line drawn on screen. Nothing downstream of it reads a distance or a time
+ * from it. If it fails, the itinerary is byte-for-byte the same and the map falls
+ * back to straight lines between the stops — which is an ESTIMATE and is labelled
+ * as one, in the notice list as well as inside the SVG.
+ *
+ * EXACTLY ONCE PER GENERATION. The line is fetched here and kept on the route
+ * object; exporting, re-rendering after a language switch, and loading a saved
+ * document never issue another request.
+ *
+ * PROVENANCE SURVIVES THE ROUND TRIP. geo-provider marks its answer with a
+ * NON-ENUMERABLE `source`, which JSON.stringify drops — so a line saved without
+ * its provenance comes back looking like measured road data. Everything below
+ * therefore carries the source as an ordinary value, saves it as an ordinary
+ * Firestore field, and treats an ABSENT source as unknown, never as road.
+ *
+ * ── MEASURED, in Chrome against live OSRM (Madrid → Valencia → Zaragoza →
+ *    Barcelona, 3 days, 1007 km) ────────────────────────────────────────────
+ *   raw geometry 11,011 points -> 188 after simplification at 0.5 km
+ *   stored flat: 376 numbers, 3,285 bytes of JSON; whole saved document 8,977
+ *   bytes, i.e. 0.9% of the Firestore 1 MB limit (the raw line alone would be
+ *   ~20%). Exports produced locally: GPX 11,564 B, print HTML 13,965 B,
+ *   ICS 1,881 B. Geometry requests: 1 for the generation, and still 1 after
+ *   three language switches, three exports and three saved-route loads.
+ *
+ * ── KNOWN LIMITATIONS, none of them fixed, all of them measured ────────────
+ *  L1 The geometry request is a FOURTH serialised network call. geo-provider
+ *     spaces every request by >=1100 ms (OSM usage policy), so a generation now
+ *     takes roughly 1.2-2.5 s longer, and the user waits for the map even though
+ *     the itinerary is already computed. Rendering the itinerary first and
+ *     slotting the map in when the line lands was NOT done: it needs a second
+ *     render pass and a second generation-token check on a surface the user is
+ *     already reading, which is exactly the shape of the zombie-route bug.
+ *  L2 A saved route never gains geometry afterwards — no backfill, no re-fetch,
+ *     no "draw the road" button. Documents from earlier builds stay an estimate
+ *     for ever, and say so on every load.
+ *  L3 The calendar start date lives in the export bar and is NOT saved with the
+ *     route: exporting the same saved route next week asks for it again. The
+ *     form has no trip date and inventing one is what buildIcs refuses to do.
+ *  L4 "Print / PDF" downloads a standalone .html file rather than opening the
+ *     print dialog. Deliberate: window.open() is blocked in an installed PWA on
+ *     iOS, and the file prints from anywhere.
+ *  L5 Map labels can overlap on short legs — measured with L'Hospitalet 12 km
+ *     from Barcelona at national zoom, where the day-3 line is shorter than the
+ *     two markers. js/route-map.js places labels without collision detection;
+ *     the legend still names every day, so nothing is unreadable, but it is
+ *     ugly. Not fixed (that file belongs to the map builder).
+ *  L6 The map is static: no pan, no zoom, no basemap tiles. Deliberate — a tile
+ *     layer means a CDN, a third-party origin and a broken offline install.
+ *  L7 GPX / ICS importer compatibility is UNTESTED against Garmin, OsmAnd,
+ *     Komoot or any calendar app. The files are well-formed and the exporter's
+ *     own header records the same gap; nobody has imported one.
  */
 
 const CLAUDE_PROXY = 'https://sitoclaude-proxy.sito041971.workers.dev';
 const CLAUDE_MODEL = 'claude-opus-5';
 const MAX_DRIVE_MIN_PER_DAY = 360;      // quality bar B6 — 6 h/day cap
+
+/* Map geometry. 0.5 km of simplification error is about one screen pixel at
+   national zoom and takes the stored line from ~199 KB to ~5 KB (see the header
+   of js/route-map.js). Width/height are viewBox units, not pixels. */
+const MAP_TOLERANCE_KM = 0.5;
+const MAP_VIEW_WIDTH   = 640;
+const MAP_VIEW_HEIGHT  = 400;
+/* The only geometry provenance value that may be drawn as a road. */
+const GEOMETRY_ROAD = 'osrm';
 
 let currentRoute = null;
 let isGenerating = false;
@@ -31,6 +95,12 @@ function isCurrentGeneration(id) { return id === generationId; }
 /* ── Small helpers ── */
 function itin() {
     return (typeof window !== 'undefined' && window.TravioItinerary) ? window.TravioItinerary : null;
+}
+function mapApi() {
+    return (typeof window !== 'undefined' && window.TravioMap) ? window.TravioMap : null;
+}
+function exportApi() {
+    return (typeof window !== 'undefined' && window.TravioExport) ? window.TravioExport : null;
 }
 function trCtx() {
     return { t: t, tf: (typeof tf === 'function' ? tf : null) };
@@ -53,6 +123,387 @@ function setVal(id, value) {
     if (node && value !== null && value !== undefined && value !== '') node.value = value;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+   GEOMETRY — persistence, provenance, and the view model behind the map
+   ══════════════════════════════════════════════════════════════════════════════
+   PERSISTENCE DECISION: the SIMPLIFIED line is saved with the route, and its
+   provenance is saved with it as an ordinary field.
+
+   Why save it. Raw OSRM geometry for a 4-stop Spanish route is 11,344 points /
+   199 KB — a fifth of the Firestore 1 MB document limit for ONE route. Simplified
+   at 0.5 km it is ~280 points / ~5.4 KB, i.e. 0.5% of the limit, and the worst
+   ground error is under half a kilometre, which is roughly one screen pixel at
+   national zoom. For that price a saved route shows the road it was planned on
+   instead of a picture of a journey nobody drives. Re-fetching it on load was
+   rejected: it is a second network round trip against a community server, on a
+   screen the user did not ask to recompute, and it can silently answer with a
+   DIFFERENT line from the one the itinerary was built with.
+
+   Why the provenance must be stored with it. geo-provider marks its answer with a
+   non-enumerable `source`, which JSON.stringify drops; js/route-map.js reads an
+   absent label as road data. Save the line alone and a straight-line ESTIMATE
+   comes back as a confident solid road line. So: the source is written as an
+   ordinary field, and anything that is not exactly 'osrm' — including absent, the
+   only thing every route saved by an older build can offer — is not road data and
+   is not drawn as one.
+
+   Why FLAT. Firestore has no nested arrays, so [[lat,lon],...] cannot be stored.
+   The line goes in as [lat,lon,lat,lon,...] and is read back whole or not at all:
+   a half-decoded line is a plausible-looking road that joins places it never
+   joined, which is worse than no line. */
+
+function flattenGeometry(points) {
+    if (!Array.isArray(points)) return null;
+    const out = [];
+    for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        if (!Array.isArray(p) || p.length < 2) return null;
+        const lat = Number(p[0]), lon = Number(p[1]);
+        if (!isFinite(lat) || !isFinite(lon)) return null;
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+        out.push(lat, lon);
+    }
+    return out.length >= 4 ? out : null;      /* fewer than 2 points is not a line */
+}
+
+function unflattenGeometry(flat) {
+    if (!Array.isArray(flat) || flat.length < 4 || flat.length % 2 !== 0) return null;
+    const out = [];
+    for (let i = 0; i + 1 < flat.length; i += 2) {
+        const lat = Number(flat[i]), lon = Number(flat[i + 1]);
+        if (!isFinite(lat) || !isFinite(lon)) return null;
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+        out.push([lat, lon]);
+    }
+    return out.length >= 2 ? out : null;
+}
+
+/* What a SAVED document may be drawn from. Only a line that says it came off the
+   road graph is used; an unlabelled one is discarded rather than redrawn dashed,
+   because "estimate" would still assert a shape nothing vouches for. */
+function savedGeometry(saved) {
+    if (!saved || saved.geometrySource !== GEOMETRY_ROAD) return null;
+    return unflattenGeometry(saved.geometry);
+}
+
+/* What gets written to Firestore for the route currently on screen: the
+   simplified, day-joined line, and only when it is verified road geometry. */
+function storedGeometryOf(route) {
+    const view = route && route.mapView;
+    if (!view || view.geometryReal !== true || view.geometrySource !== GEOMETRY_ROAD) return null;
+    const flat = flattenGeometry(view.geometry);
+    return flat ? { geometry: flat, source: GEOMETRY_ROAD, points: flat.length / 2 } : null;
+}
+
+/* The map view is rebuilt from the plan every time — never loaded from a
+   document — so day colours and marker labels cannot drift from the itinerary. */
+function buildRouteMapView(route) {
+    const M = mapApi();
+    if (!M || !route || !route.view || !route.view.plan) return null;
+    const src = (route.geometrySource === GEOMETRY_ROAD || route.geometrySource === 'straight' ||
+        route.geometrySource === 'none') ? route.geometrySource : null;
+    /* A line with no usable provenance is not passed in at all: buildMapView reads
+       an absent label as road data, so handing it one would over-claim. */
+    const geometry = (src && Array.isArray(route.geometry) && route.geometry.length >= 2)
+        ? route.geometry : null;
+    try {
+        return M.buildMapView({
+            plan: route.view.plan,
+            geometry: geometry,
+            geometrySource: geometry ? src : null,
+            width: MAP_VIEW_WIDTH,
+            height: MAP_VIEW_HEIGHT,
+            toleranceKm: MAP_TOLERANCE_KM
+        });
+    } catch (e) {
+        console.warn('Map view unavailable:', e);
+        return null;
+    }
+}
+
+/* ── Rendering the map ── */
+function renderRouteMap(route) {
+    const panel = el('routeMapPanel');
+    if (!panel) return;
+    const M = mapApi();
+    const view = route ? route.mapView : null;
+    /* Nothing to draw (a legacy plain-text route, or the module missing): hide the
+       panel AND empty it, so a previous route's picture and caption cannot linger. */
+    if (!M || !view) {
+        panel.style.display = 'none';
+        const fig0 = el('routeMapFigure');
+        if (fig0) fig0.innerHTML = '';
+        const leg0 = el('routeMapLegend');
+        if (leg0) leg0.innerHTML = '';
+        const src0 = el('routeMapSource');
+        if (src0) { src0.textContent = ''; src0.className = 'map-source mono'; }
+        return;
+    }
+    panel.style.display = '';
+
+    const titleEl = el('routeMapTitle');
+    if (titleEl) titleEl.textContent = t('map.title');
+
+    const fig = el('routeMapFigure');
+    /* renderMapSvg escapes every value it interpolates — place names in this
+       project really do contain &, <, > and quotes. */
+    if (fig) fig.innerHTML = M.renderMapSvg(view, trCtx());
+
+    const nothing = view.empty === true || view.geometrySource === 'none';
+    const real = view.geometryReal === true;
+    const srcEl = el('routeMapSource');
+    if (srcEl) {
+        srcEl.textContent = nothing ? t('map.noRoute') : t(real ? 'map.sourceRoad' : 'map.sourceStraight');
+        srcEl.className = 'map-source mono' + (!nothing && !real ? ' map-source-estimate' : '');
+    }
+    renderMapLegend(view);
+
+    /* The fallback is stated in the notice list too, not only inside the picture:
+       the SVG caption is small, and this is the app saying the line is an estimate
+       in the same place it says everything else that qualifies the numbers. */
+    if (!nothing && !real) {
+        addItineraryNotice(t(route.savedRoute ? 'map.savedNoGeometry' : 'map.straightNotice'), 'warn');
+    }
+}
+
+/* Colour is never the only carrier: each entry names its day and its endpoints. */
+function renderMapLegend(view) {
+    const host = el('routeMapLegend');
+    if (!host) return;
+    host.innerHTML = '';
+    const days = Array.isArray(view.days) ? view.days : [];
+    const real = view.geometryReal === true;
+    for (let i = 0; i < days.length; i++) {
+        const d = days[i];
+        if (!d || !Array.isArray(d.path) || d.path.length < 2) continue;   /* only what is drawn */
+        const item = document.createElement('span');
+        item.className = 'map-legend-item';
+        item.title = tf('map.dayLabel', { day: d.day, from: d.from || '', to: d.to || '' });
+        const sw = document.createElement('span');
+        sw.className = 'map-legend-swatch';
+        /* Solid for road geometry, dashed for the estimate — the swatch matches
+           the stroke it stands for. */
+        if (real) { sw.style.background = d.color; sw.style.height = '4px'; }
+        else { sw.style.borderTop = '3px dashed ' + d.color; sw.style.height = '0'; }
+        const label = document.createElement('span');
+        /* Named endpoints when there are any; a place with no name at all (an
+           unresolved geocode) leaves the day number as the only honest label. */
+        label.textContent = (d.from || d.to)
+            ? tf('map.dayLabel', { day: d.day, from: d.from || '', to: d.to || '' })
+            : tf('map.legend', { day: d.day });
+        item.appendChild(sw);
+        item.appendChild(label);
+        host.appendChild(item);
+    }
+}
+
+/* Appends one notice to the itinerary's own notice list, in its own styling.
+   Built with createElement + textContent, so no string reaches innerHTML. */
+function addItineraryNotice(text, level) {
+    const host = el('resultItinerary');
+    if (!host || !text) return;
+    let list = host.querySelector('.notice-list');
+    if (!list) {
+        list = document.createElement('div');
+        list.className = 'notice-list';
+        host.insertBefore(list, host.firstChild);
+    }
+    const icons = { alert: '⛔', warn: '⚠️', info: 'ℹ️' };
+    const box = document.createElement('div');
+    box.className = 'notice notice-' + (level || 'info');
+    const icon = document.createElement('span');
+    icon.className = 'notice-icon';
+    icon.textContent = icons[level] || icons.info;
+    const body = document.createElement('span');
+    body.className = 'notice-text';
+    body.textContent = text;
+    box.appendChild(icon);
+    box.appendChild(body);
+    list.appendChild(box);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   EXPORT — GPX / iCalendar / printable HTML, built and downloaded in the browser
+   ══════════════════════════════════════════════════════════════════════════════
+   js/route-export.js is pure: it takes data and returns a string. Everything here
+   is the wiring — a Blob, a download attribute, and an object URL that is revoked
+   once the browser has read it. No request leaves the device. */
+
+/* The export module's user-visible words. Keys already in the dictionary are
+   reused so the same sentence never exists twice in five locales. */
+function exportLabels() {
+    return {
+        trip: t('exp.trip'),
+        day: t('itin.dayN'),
+        start: t('exp.start'), end: t('exp.end'), stop: t('exp.stop'), overnight: t('exp.overnight'),
+        restDay: t('itin.restDay'), restDayAt: t('exp.restDayAt'),
+        distance: t('itin.distance'), driveTime: t('itin.driveTime'), stops: t('itin.stops'),
+        cost: t('exp.cost'), costFloor: t('exp.costFloor'),
+        suggestions: t('exp.suggestions'),
+        lodging: t('itin.lodgingIdea'), tip: t('itin.tip'),
+        viaPoints: t('exp.viaPoints'), roadTrack: t('exp.roadTrack'),
+        unlocated: t('exp.unlocated'),
+        basisRoad: t('itin.sourceRoad'),
+        basisPartial: t('itin.sourcePartial'),
+        /* The stern one, deliberately: this is the "no road data at all" case. */
+        basisEstimated: t('notice.haversine'),
+        unreliable: t('exp.unreliable'),
+        notAvailable: t('exp.notAvailable'),
+        atLeast: t('exp.atLeast'),
+        longDay: t('exp.longDay'), longDayNoCap: t('exp.longDayNoCap'),
+        plannerNotes: t('exp.plannerNotes'),
+        km: t('unit.km'), hour: t('unit.hour'), minute: t('unit.minute')
+    };
+}
+
+/* Everything the three builders share. Returns null when there is nothing
+   exportable — a legacy plain-text route, or no route at all. */
+function exportContext(route) {
+    if (!route || !route.view || !route.view.plan) return null;
+    const plan = route.view.plan;
+    if (!Array.isArray(plan.days) || plan.days.length === 0) return null;
+    const meta = route.view.meta || {};
+    const args = {
+        plan: plan,
+        labels: exportLabels(),
+        matrixSource: meta.matrixSource || ''
+    };
+    if (meta.maxDriveMin !== null && meta.maxDriveMin !== undefined) args.maxDriveMin = meta.maxDriveMin;
+    /* Only ever passed as TRUE. `false` tells the module to downgrade "unusable"
+       to "estimated" — an upgrade of the claim, which the screen never made. */
+    if (meta.numbersUnreliable === true) args.numbersUnreliable = true;
+    return args;
+}
+
+function exportFileBase(route) {
+    const fd = (route && route.formData) || {};
+    const from = String(fd.startPoint || '').trim();
+    const to = String(fd.endPoint || '').trim();
+    const base = (from && to) ? (from + '-' + to) : (from || to);
+    return base || 'travio-route';
+}
+
+/* One Blob, one download attribute, one revoke. */
+function downloadText(text, mime, filename) {
+    try {
+        const blob = new Blob([text], { type: mime + ';charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        /* The click is dispatched synchronously but the download reads the URL
+           afterwards, so the revoke waits a beat rather than racing it. */
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        return true;
+    } catch (e) {
+        console.error('Export failed:', e);
+        showFormMsg(t('common.error'), 'err');
+        return false;
+    }
+}
+
+function exportGpx() {
+    const X = exportApi();
+    const args = exportContext(currentRoute);
+    if (!X || !args) return;
+    /* A <trk> is a path that was actually resolved on the road graph. The
+       straight-line fallback is NEVER exported as one: it would state that the
+       road goes that way. Without it the file still carries every waypoint and
+       the planned per-day <rte>. */
+    const view = currentRoute.mapView;
+    if (view && view.geometryReal === true && view.geometrySource === GEOMETRY_ROAD) {
+        const days = [];
+        for (let i = 0; i < view.days.length; i++) days.push(view.days[i].points);
+        args.geometry = { days: days };
+    }
+    downloadText(X.buildGpx(args), 'application/gpx+xml', X.safeFileName(exportFileBase(currentRoute), 'gpx'));
+}
+
+function exportIcs() {
+    const X = exportApi();
+    const args = exportContext(currentRoute);
+    if (!X || !args) return;
+    const node = el('exportStartDate');
+    args.startDate = node ? node.value : '';
+    args.costs = currentRoute.view.costs || null;
+    args.enrichment = currentRoute.view.enrichment || null;
+    const ics = X.buildIcs(args);
+    /* '' means the module refused to invent a date. Offer no download. */
+    if (!ics) { showExportHint(t('exp.needDate')); return; }
+    downloadText(ics, 'text/calendar', X.safeFileName(exportFileBase(currentRoute), 'ics'));
+}
+
+function exportPrint() {
+    const X = exportApi();
+    const I = itin();
+    const M = mapApi();
+    const args = exportContext(currentRoute);
+    if (!X || !I || !args) return;
+    const view = currentRoute.view;
+    const fd = currentRoute.formData || {};
+
+    let body = '';
+    const mapView = currentRoute.mapView;
+    if (M && mapView) {
+        body += '<div style="max-width:520px;margin:0 0 18px">' + M.renderMapSvg(mapView, trCtx()) + '</div>';
+    }
+    body += I.renderItineraryHtml(view, trCtx());
+
+    const notes = [];
+    /* The printed page leaves the app behind, so the caption travels with it. */
+    if (mapView && mapView.geometryReal !== true && mapView.geometrySource !== 'none') {
+        notes.push(t(currentRoute.savedRoute ? 'map.savedNoGeometry' : 'map.straightNotice'));
+    }
+    const days = (view.plan.days || []).length;
+    const html = X.buildPrintHtml({
+        plan: args.plan,
+        labels: args.labels,
+        title: (fd.startPoint || '') + ' → ' + (fd.endPoint || ''),
+        subtitle: days + ' ' + t('result.days') + ' · ' + t('result.budget') +
+            ': EUR ' + (fd.dailyBudget || 0),
+        bodyHtml: body,
+        notes: notes,
+        footer: t('app.name') + ' · ' + t('app.tagline'),
+        lang: currentLang
+    });
+    downloadText(html, 'text/html', X.safeFileName(exportFileBase(currentRoute), 'html'));
+}
+
+function showExportHint(text) {
+    const hint = el('exportHint');
+    if (hint) hint.textContent = text || '';
+}
+
+/* Shown for anything with a computed plan — freshly generated OR loaded from
+   Firestore. A legacy plain-text route has nothing to export and hides the bar. */
+function updateExportControls() {
+    const bar = el('exportBar');
+    if (!bar) return;
+    const usable = !!(exportApi() && exportContext(currentRoute));
+    bar.style.display = usable ? '' : 'none';
+    if (!usable) return;
+    const node = el('exportStartDate');
+    const hasDate = !!(node && node.value);
+    const icsBtn = el('exportIcsBtn');
+    if (icsBtn) icsBtn.disabled = !hasDate;
+    showExportHint(hasDate ? '' : t('exp.needDate'));
+}
+
+function initExportControls() {
+    const gpx = el('exportGpxBtn');
+    if (gpx) gpx.onclick = exportGpx;
+    const ics = el('exportIcsBtn');
+    if (ics) ics.onclick = exportIcs;
+    const print = el('exportPrintBtn');
+    if (print) print.onclick = exportPrint;
+    const date = el('exportStartDate');
+    if (date) date.addEventListener('change', updateExportControls);
+}
+
 /* ── Initialization ── */
 function initRouteForm() {
     const advBtn = el('advancedToggle');
@@ -72,6 +523,8 @@ function initRouteForm() {
 
     const customChk = el('rfCustomBudget');
     if (customChk) customChk.addEventListener('change', renderBudgetPerDay);
+
+    initExportControls();
 
     /* The itinerary is built in JS, so applyTranslations() cannot reach it: without
        this hook a language switch leaves every label, notice and budget verdict in
@@ -308,11 +761,11 @@ async function generateRoute() {
         }
 
         /* 3 — road distance matrix */
-        setProgress((names.length / (names.length + 2)) * 100, t('progress.matrix'), '');
+        setProgress((names.length / (names.length + 3)) * 100, t('progress.matrix'), '');
         const matrix = await distanceMatrix(places, geoOpts);
 
         /* 4 — the deterministic skeleton: THIS is the route */
-        setProgress(((names.length + 1) / (names.length + 2)) * 100, t('progress.planning'), '');
+        setProgress(((names.length + 1) / (names.length + 3)) * 100, t('progress.planning'), '');
         const plan = planRoute({
             start: places[0],
             end: places[places.length - 1],
@@ -322,6 +775,35 @@ async function generateRoute() {
             departureTime: fd.departureTime,
             maxDriveMinPerDay: MAX_DRIVE_MIN_PER_DAY
         });
+
+        /* 4b — ONE road-geometry request, for the map and nothing else.
+           It runs AFTER planRoute because the line has to follow the order the
+           engine computed, and it is asked for exactly once per generation: the
+           export buttons and every re-render reuse this answer. A failure here
+           costs the shape of the line and nothing else. */
+        let geometry = null, geometrySource = 'none';
+        if (typeof window.routeGeometry === 'function' &&
+            Array.isArray(plan.order) && plan.order.length >= 2) {
+            setProgress(((names.length + 2) / (names.length + 3)) * 100, t('progress.mapping'), '');
+            try {
+                const line = await routeGeometry(plan.order, geoOpts);
+                if (Array.isArray(line) && line.length >= 2) {
+                    geometry = line;
+                    /* The provider's flag is authoritative; an unlabelled line is
+                       NOT assumed to be road data. */
+                    geometrySource = (line.source === GEOMETRY_ROAD) ? GEOMETRY_ROAD : 'straight';
+                } else {
+                    geometrySource = 'none';
+                }
+            } catch (e) {
+                console.warn('Route geometry unavailable:', e);
+                geometry = null;
+                geometrySource = 'none';
+            }
+        }
+        /* The zombie-route guard covers this await too: the user can clear the
+           form or load a saved route while the geometry is in flight. */
+        if (!isCurrentGeneration(myGen)) return;
 
         /* 5 — costs + render, with no model involvement whatsoever */
         const viewArgs = {
@@ -348,7 +830,7 @@ async function generateRoute() {
         };
         if (!isCurrentGeneration(myGen)) return;   // cleared / another route loaded
         const baseView = I.buildItineraryView(viewArgs);
-        currentRoute = makeRoute(fd, baseView);
+        currentRoute = makeRoute(fd, baseView, geometry, geometrySource);
         setProgress(100, t('progress.done'), '');
         displayRoute(currentRoute);
 
@@ -369,7 +851,8 @@ async function generateRoute() {
         if (!isCurrentGeneration(myGen)) return;
         viewArgs.enrichment = enrichment;
         const finalView = I.buildItineraryView(viewArgs);
-        currentRoute = makeRoute(fd, finalView);
+        /* The same line, not a second request. */
+        currentRoute = makeRoute(fd, finalView, geometry, geometrySource);
         displayRoute(currentRoute);
 
     } catch (e) {
@@ -385,15 +868,20 @@ async function generateRoute() {
     }
 }
 
-function makeRoute(fd, view) {
+function makeRoute(fd, view, geometry, geometrySource) {
     const I = itin();
-    return {
+    const route = {
         formData: fd,
         view: view,
         structured: I.serialiseView(view),
         result: I.buildPlainSummary(view, trCtx()),
-        language: currentLang
+        language: currentLang,
+        geometry: Array.isArray(geometry) ? geometry : null,
+        geometrySource: geometrySource || null,
+        savedRoute: false
     };
+    route.mapView = buildRouteMapView(route);
+    return route;
 }
 
 /* ── Display ── */
@@ -435,6 +923,11 @@ function displayRoute(route) {
         if (structuredEl) { structuredEl.innerHTML = ''; structuredEl.style.display = 'none'; }
         if (bodyEl) { bodyEl.textContent = route.result || ''; bodyEl.style.display = ''; }
     }
+
+    /* After the itinerary HTML is in place: the map notice is appended to the
+       notice list that renderItineraryHtml just wrote. */
+    renderRouteMap(route);
+    updateExportControls();
 
     if (saveBtn) saveBtn.style.display = '';
 }
@@ -504,6 +997,7 @@ async function saveCurrentRoute() {
     btn.disabled = true;
     try {
         const fd = currentRoute.formData || {};
+        const stored = storedGeometryOf(currentRoute);
         await fsSaveRoute({
             startPoint:     fd.startPoint || '',
             endPoint:       fd.endPoint || '',
@@ -524,7 +1018,14 @@ async function saveCurrentRoute() {
                 ? fd.budgets.map(function (v) { return numOrNull(v); }) : [],
             result:         currentRoute.result || '',
             structured:     currentRoute.structured || null,
-            language:       currentRoute.language || currentLang
+            language:       currentRoute.language || currentLang,
+            /* The simplified road line and its provenance, or explicit nulls. A
+               line is only ever stored WITH the label that says where it came
+               from — see the persistence note at the top of this file. Firestore
+               rejects undefined, so nothing here is left out. */
+            geometry:       stored ? stored.geometry : null,
+            geometrySource: stored ? stored.source : null,
+            geometryPoints: stored ? stored.points : null
         });
         showFormMsg(t('result.routeSaved'), 'ok');
     } catch (e) {
@@ -557,6 +1058,13 @@ function clearForm() {
     el('resultLoading').style.display = 'none';
     const structuredEl = el('resultItinerary');
     if (structuredEl) structuredEl.innerHTML = '';
+    const mapPanel = el('routeMapPanel');
+    if (mapPanel) mapPanel.style.display = 'none';
+    const mapFig = el('routeMapFigure');
+    if (mapFig) mapFig.innerHTML = '';
+    const mapLegend = el('routeMapLegend');
+    if (mapLegend) mapLegend.innerHTML = '';
+    updateExportControls();
     const saveBtn = el('saveRouteBtn');
     if (saveBtn) saveBtn.style.display = 'none';
     const errDiv = el('resultError');
@@ -603,7 +1111,18 @@ async function viewSavedRoute(routeId) {
         invalidateGeneration();     // a pending enrichment must not clobber this route
         /* New saves carry a structured plan; older ones only have the plain text. */
         const view = (I && I.isStructuredRoute(r)) ? I.viewFromSaved(r) : null;
-        currentRoute = { formData: r, view: view, structured: r.structured || null, result: r.result || '', language: r.language };
+        /* Stored road line, or nothing. A document written by any earlier build
+           carries no geometry and no provenance; absent means unknown, the map
+           falls back to straight lines and SAYS so. No geometry request is made
+           for a saved route — the user did not ask to recompute it. */
+        const line = savedGeometry(r);
+        currentRoute = {
+            formData: r, view: view, structured: r.structured || null,
+            result: r.result || '', language: r.language,
+            geometry: line, geometrySource: line ? GEOMETRY_ROAD : null,
+            savedRoute: true
+        };
+        currentRoute.mapView = buildRouteMapView(currentRoute);
 
         el('rfStartPoint').value   = r.startPoint || '';
         el('rfEndPoint').value     = r.endPoint || '';

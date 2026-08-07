@@ -17,6 +17,10 @@ const path = require('node:path');
 
 const I = require(path.join(__dirname, '..', 'js', 'itinerary-render.js'));
 const engine = require(path.join(__dirname, '..', 'js', 'route-engine.js'));
+/* The two modules the wiring puts on screen — loaded here so the W tests below
+   exercise the real map and the real exporter, not a mock of them. */
+const MAPMOD = require(path.join(__dirname, '..', 'js', 'route-map.js'));
+const EXPMOD = require(path.join(__dirname, '..', 'js', 'route-export.js'));
 
 /* ── Fixtures ── */
 function P(name, lat, lon, extra) {
@@ -1880,11 +1884,46 @@ function loadRouteForm(opts) {
     const o = opts || {};
     const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'js', 'route-form.js'), 'utf8');
     const els = {};
-    function stub(id) {
-        return {
-            id: id, value: '', checked: false, disabled: false, textContent: '', innerHTML: '',
-            className: '', style: {}, addEventListener: function () {}
+    const created = [];          /* every element the wiring builds by hand */
+
+    /* A DOM stub with just enough tree for the map legend and the notice the map
+       appends to the itinerary's own notice list. */
+    function node(tag, id) {
+        const e = {
+            id: id || '', tagName: String(tag || 'div').toUpperCase(),
+            value: '', checked: false, disabled: false, textContent: '',
+            className: '', title: '', href: '', download: '', style: {}, childNodes: [],
+            addEventListener: function (name, fn) { (e.listeners[name] = e.listeners[name] || []).push(fn); },
+            listeners: {},
+            appendChild: function (c) { e.childNodes.push(c); return c; },
+            removeChild: function (c) {
+                const i = e.childNodes.indexOf(c);
+                if (i >= 0) e.childNodes.splice(i, 1);
+                return c;
+            },
+            insertBefore: function (c) { e.childNodes.unshift(c); return c; },
+            click: function () { e.clicked = (e.clicked || 0) + 1; },
+            querySelector: function (sel) { return findByClass(e, String(sel).replace(/^\./, '')); }
         };
+        Object.defineProperty(e, 'firstChild', { get: function () { return e.childNodes[0] || null; } });
+        /* Writing innerHTML replaces the children, exactly as the DOM does — without
+           this the second render of a generation leaves the first render's appended
+           nodes behind and the harness reports duplicates the browser never shows. */
+        let html = '';
+        Object.defineProperty(e, 'innerHTML', {
+            get: function () { return html; },
+            set: function (v) { html = String(v); e.childNodes.length = 0; }
+        });
+        return e;
+    }
+    function findByClass(root, cls) {
+        for (let i = 0; i < root.childNodes.length; i++) {
+            const c = root.childNodes[i];
+            if ((' ' + c.className + ' ').indexOf(' ' + cls + ' ') >= 0) return c;
+            const deep = findByClass(c, cls);
+            if (deep) return deep;
+        }
+        return null;
     }
     const ids = ['rfStartPoint', 'rfEndPoint', 'rfDestinations', 'rfTripType', 'rfDuration',
         'rfDailyBudget', 'rfCustomBudget', 'rfTolls', 'rfDepartureTime', 'rfConsumption',
@@ -1892,13 +1931,24 @@ function loadRouteForm(opts) {
         'resultEmpty', 'resultLoading', 'resultContent', 'resultError', 'resultHeader',
         'resultItinerary', 'resultBody', 'progressBar', 'progressStep', 'progressDetail',
         'progressNote', 'enrichStatus', 'budgetPerDayContainer', 'formMsg', 'advancedToggle',
-        'advancedPanel', 'advancedIcon'];
-    for (let i = 0; i < ids.length; i++) els[ids[i]] = stub(ids[i]);
-    const document = { getElementById: function (id) { return els[id] || null; } };
+        'advancedPanel', 'advancedIcon',
+        /* the map + export surface */
+        'routeMapPanel', 'routeMapTitle', 'routeMapSource', 'routeMapFigure', 'routeMapLegend',
+        'exportBar', 'exportGpxBtn', 'exportIcsBtn', 'exportPrintBtn', 'exportStartDate', 'exportHint'];
+    for (let i = 0; i < ids.length; i++) els[ids[i]] = node('div', ids[i]);
+    const body = node('body');
+    const document = {
+        body: body,
+        getElementById: function (id) { return els[id] || null; },
+        createElement: function (tag) { const e = node(tag); created.push(e); return e; }
+    };
 
     const i18n = loadI18n();
+    let geometryCalls = 0;
     const windowObj = {
         TravioItinerary: I,
+        TravioMap: o.noMap ? null : MAPMOD,
+        TravioExport: o.noExport ? null : EXPMOD,
         planRoute: engine.planRoute,
         geocodePlaces: function (names) {
             return Promise.resolve(names.map(function (n) {
@@ -1907,11 +1957,53 @@ function loadRouteForm(opts) {
             }));
         }
     };
+    if (o.geometry !== 'absent') {
+        windowObj.routeGeometry = function (places) {
+            geometryCalls++;
+            if (o.geometry === 'throw') return Promise.reject(new Error('offline'));
+            const line = places.map(function (p) { return [p.lat, p.lon]; });
+            if (o.geometry === 'road') {
+                /* a denser line, so the simplifier and the day split have something
+                   to work with, tagged the way geo-provider tags a verified one */
+                const dense = [];
+                for (let i = 0; i + 1 < line.length; i++) {
+                    for (let k = 0; k < 8; k++) {
+                        dense.push([line[i][0] + (line[i + 1][0] - line[i][0]) * k / 8,
+                            line[i][1] + (line[i + 1][1] - line[i][1]) * k / 8]);
+                    }
+                }
+                dense.push(line[line.length - 1]);
+                Object.defineProperty(dense, 'source', { value: 'osrm', enumerable: false });
+                return Promise.resolve(dense);
+            }
+            Object.defineProperty(line, 'source', { value: 'straight', enumerable: false });
+            return Promise.resolve(line);
+        };
+    }
+
+    const downloads = [];
+    const saved = [];
+    const revoked = [];
+    const URLstub = {
+        createObjectURL: function (blob) { return 'blob:' + (downloads.push(blob) - 1); },
+        revokeObjectURL: function (url) { revoked.push(url); }
+    };
+    function BlobStub(parts, opts2) {
+        this.text = (parts || []).join('');
+        this.type = (opts2 && opts2.type) || '';
+    }
+
     const fn = new Function(
         'document', 'window', 't', 'tf', 'currentLang', 'escapeHtml', 'geocodePlaces',
         'distanceMatrix', 'planRoute', 'fetch', 'console', 'onLanguageChange', 'setTimeout',
+        'routeGeometry', 'URL', 'Blob', 'db', 'currentUser', 'fsSaveRoute', 'showView',
+        'applyTranslations',
         src + '\nreturn { initRouteForm: initRouteForm, generateRoute: generateRoute, ' +
         'clearForm: clearForm, displayRoute: displayRoute, ' +
+        'saveCurrentRoute: saveCurrentRoute, viewSavedRoute: viewSavedRoute, ' +
+        'exportGpx: exportGpx, exportIcs: exportIcs, exportPrint: exportPrint, ' +
+        'flattenGeometry: flattenGeometry, unflattenGeometry: unflattenGeometry, ' +
+        'savedGeometry: savedGeometry, storedGeometryOf: storedGeometryOf, ' +
         'rerenderCurrentRoute: rerenderCurrentRoute, route: function () { return currentRoute; } };');
 
     const api = fn(
@@ -1928,10 +2020,34 @@ function loadRouteForm(opts) {
         o.fetch || function () { return Promise.reject(new Error('offline')); },
         { warn: function () {}, error: function () {}, log: function () {} },
         i18n.onLanguageChange,
-        setTimeout
+        o.instantTimers ? function (f) { f(); return 0; } : setTimeout,
+        windowObj.routeGeometry,
+        URLstub, BlobStub,
+        { collection: function () { return { doc: function () { return {
+            get: function () { return Promise.resolve({ exists: !!o.savedDoc, data: function () { return o.savedDoc; } }); }
+        }; } }; } },
+        { uid: 'u1' },
+        function (doc) { saved.push(doc); return Promise.resolve('id1'); },
+        function () {}, function () {}
     );
     api.els = els;
     api.i18n = i18n;
+    api.created = created;
+    api.downloads = downloads;
+    api.revoked = revoked;
+    api.savedDocs = saved;
+    api.geometryCalls = function () { return geometryCalls; };
+    api.noticeTexts = function () {
+        const out = [];
+        (function walk(n) {
+            for (let i = 0; i < n.childNodes.length; i++) {
+                const c = n.childNodes[i];
+                if ((' ' + c.className + ' ').indexOf(' notice-text ') >= 0) out.push(c.textContent);
+                walk(c);
+            }
+        })(els.resultItinerary);
+        return out;
+    };
     api.initRouteForm();     // wires the buttons AND the language re-render hook
     return api;
 }
@@ -2060,4 +2176,255 @@ test('EXPORTS: the module loads in Node and in the browser without ES modules', 
     const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'js', 'itinerary-render.js'), 'utf8');
     assert.strictEqual(/^\s*(import|export)\s/m.test(src), false, 'no ES module syntax');
     assert.ok(src.indexOf('window.TravioItinerary') > 0, 'browser global is attached');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   W — THE WIRING (quality bar B8): the map and the exports, as the page runs them.
+   The map may never change the itinerary, may never present an estimate as a
+   measurement, and may never ask the road service for the same line twice.
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+function mapNoticeOf(app) {
+    const wanted = [app.i18n.t('map.straightNotice'), app.i18n.t('map.savedNoGeometry')];
+    return app.noticeTexts().filter(function (s) { return wanted.indexOf(s) >= 0; });
+}
+
+test('W1: verified road geometry draws a solid line and is captioned as road data', function () {
+    const app = loadRouteForm({ geometry: 'road' });
+    fillForm(app.els);
+    return app.generateRoute().then(function () {
+        const route = app.route();
+        assert.strictEqual(app.geometryCalls(), 1, 'exactly one geometry request per generation');
+        assert.ok(route.mapView, 'a map view was built');
+        assert.strictEqual(route.mapView.geometryReal, true);
+        assert.strictEqual(route.mapView.geometrySource, 'osrm');
+        assert.strictEqual(route.mapView.days.length, route.view.plan.days.length,
+            'one map day per itinerary day');
+        const svg = app.els.routeMapFigure.innerHTML;
+        assert.match(svg, /<svg /);
+        assert.match(svg, /<path /);
+        assert.strictEqual(/stroke-dasharray/.test(svg), false, 'road geometry must not be dashed');
+        assert.strictEqual(app.els.routeMapSource.textContent, app.i18n.t('map.sourceRoad'));
+        assert.strictEqual(app.els.routeMapSource.className.indexOf('map-source-estimate'), -1);
+        assert.deepStrictEqual(mapNoticeOf(app), [], 'no estimate notice for real road data');
+        assert.strictEqual(app.els.routeMapPanel.style.display, '');
+        assert.strictEqual(app.els.exportBar.style.display, '');
+    });
+});
+
+test('W2: a straight-line fallback is dashed, captioned as an estimate, AND in the notice list', function () {
+    const app = loadRouteForm({ geometry: 'straight' });
+    fillForm(app.els);
+    return app.generateRoute().then(function () {
+        const route = app.route();
+        assert.strictEqual(route.mapView.geometryReal, false);
+        const svg = app.els.routeMapFigure.innerHTML;
+        assert.match(svg, /stroke-dasharray/, 'the picture itself has to say it is not a road');
+        assert.strictEqual(app.els.routeMapSource.textContent, app.i18n.t('map.sourceStraight'));
+        assert.ok(app.els.routeMapSource.className.indexOf('map-source-estimate') >= 0);
+        assert.deepStrictEqual(mapNoticeOf(app), [app.i18n.t('map.straightNotice')],
+            'the fallback must reach the notice list, not only the SVG');
+    });
+});
+
+test('W3: the itinerary is byte-identical whatever the geometry does', function () {
+    const outcomes = ['road', 'straight', 'throw', 'absent'];
+    return Promise.all(outcomes.map(function (g) {
+        const app = loadRouteForm({ geometry: g });
+        fillForm(app.els);
+        return app.generateRoute().then(function () { return app.route(); });
+    })).then(function (routes) {
+        const reference = JSON.stringify(routes[0].structured);
+        for (let i = 1; i < routes.length; i++) {
+            assert.strictEqual(JSON.stringify(routes[i].structured), reference,
+                'geometry outcome "' + outcomes[i] + '" changed the computed itinerary');
+            assert.strictEqual(routes[i].result, routes[0].result, 'the plain summary drifted');
+        }
+        for (let i = 0; i < routes.length; i++) assert.ok(routes[i].mapView, outcomes[i] + ': no map');
+        assert.strictEqual(routes[0].mapView.geometryReal, true);
+        for (let i = 1; i < routes.length; i++) {
+            assert.strictEqual(routes[i].mapView.geometryReal, false, outcomes[i] + ' claimed road data');
+        }
+    });
+});
+
+test('W4: nothing re-requests the geometry — not exports, not a language switch', function () {
+    const app = loadRouteForm({ geometry: 'road' });
+    fillForm(app.els);
+    return app.generateRoute().then(function () {
+        assert.strictEqual(app.geometryCalls(), 1);
+        app.els.exportStartDate.value = '2026-09-01';
+        app.exportGpx();
+        app.exportIcs();
+        app.exportPrint();
+        app.i18n.setLanguage('fr');
+        app.i18n.setLanguage('es');
+        assert.strictEqual(app.geometryCalls(), 1, 'the road service was asked again');
+        assert.strictEqual(app.downloads.length, 3, 'three files were built locally');
+    });
+});
+
+test('W5: saving stores the SIMPLIFIED line with its provenance, or explicit nulls', function () {
+    const road = loadRouteForm({ geometry: 'road' });
+    fillForm(road.els);
+    return road.generateRoute()
+        .then(function () { return road.saveCurrentRoute(); })
+        .then(function () {
+            const doc = road.savedDocs[0];
+            assert.ok(Array.isArray(doc.geometry), 'the line was stored');
+            assert.strictEqual(doc.geometrySource, 'osrm', 'provenance is an ordinary field');
+            assert.strictEqual(doc.geometryPoints, doc.geometry.length / 2);
+            for (let i = 0; i < doc.geometry.length; i++) {
+                assert.strictEqual(typeof doc.geometry[i], 'number',
+                    'a nested array leaked into the document — Firestore rejects those');
+            }
+            assert.deepStrictEqual(road.unflattenGeometry(doc.geometry), road.route().mapView.geometry,
+                'the stored line is the simplified one, unchanged by the round trip');
+            assert.ok(doc.geometry.length / 2 <= road.route().mapView.simplification.rawPoints,
+                'the stored line is not longer than the raw one');
+            for (const k in doc) {
+                assert.notStrictEqual(doc[k], undefined, k + ' is undefined — Firestore rejects that');
+            }
+            const flat = loadRouteForm({ geometry: 'straight' });
+            fillForm(flat.els);
+            return flat.generateRoute()
+                .then(function () { return flat.saveCurrentRoute(); })
+                .then(function () {
+                    assert.strictEqual(flat.savedDocs[0].geometry, null,
+                        'an estimate is never stored as a line');
+                    assert.strictEqual(flat.savedDocs[0].geometrySource, null);
+                });
+        });
+});
+
+test('W6: a saved route is exportable, and one without geometry says the map is an estimate', function () {
+    const gen = loadRouteForm({ geometry: 'road' });
+    fillForm(gen.els);
+    return gen.generateRoute()
+        .then(function () { return gen.saveCurrentRoute(); })
+        .then(function () {
+            const doc = gen.savedDocs[0];
+            /* Every route saved by an earlier build looks like this. */
+            const legacy = {};
+            for (const k in doc) {
+                if (k !== 'geometry' && k !== 'geometrySource' && k !== 'geometryPoints') legacy[k] = doc[k];
+            }
+            const app = loadRouteForm({ geometry: 'road', savedDoc: legacy });
+            return app.viewSavedRoute('r1').then(function () {
+                assert.strictEqual(app.geometryCalls(), 0,
+                    'a saved route must not silently re-fetch its geometry');
+                assert.strictEqual(app.route().mapView.geometryReal, false);
+                assert.match(app.els.routeMapFigure.innerHTML, /stroke-dasharray/);
+                assert.deepStrictEqual(mapNoticeOf(app), [app.i18n.t('map.savedNoGeometry')]);
+                assert.strictEqual(app.els.exportBar.style.display, '');
+                app.exportGpx();
+                assert.strictEqual(app.downloads.length, 1);
+                assert.match(app.downloads[0].text, /<gpx /);
+            });
+        });
+});
+
+test('W7: a stored line without provenance is never promoted to a measurement', function () {
+    const gen = loadRouteForm({ geometry: 'road' });
+    fillForm(gen.els);
+    return gen.generateRoute()
+        .then(function () { return gen.saveCurrentRoute(); })
+        .then(function () {
+            const doc = gen.savedDocs[0];
+            const withProv = loadRouteForm({ savedDoc: doc, geometry: 'absent' });
+            return withProv.viewSavedRoute('r1').then(function () {
+                assert.strictEqual(withProv.route().mapView.geometryReal, true,
+                    'a line saved WITH its provenance comes back as road data');
+                assert.deepStrictEqual(mapNoticeOf(withProv), []);
+
+                const stripped = {};
+                for (const k in doc) if (k !== 'geometrySource') stripped[k] = doc[k];
+                const noProv = loadRouteForm({ savedDoc: stripped, geometry: 'absent' });
+                return noProv.viewSavedRoute('r1').then(function () {
+                    assert.strictEqual(noProv.route().mapView.geometryReal, false,
+                        'an unlabelled stored line was drawn as a measured road');
+                    assert.deepStrictEqual(mapNoticeOf(noProv), [noProv.i18n.t('map.savedNoGeometry')]);
+                });
+            });
+        });
+});
+
+test('W8: the three exports are built in the browser, and a track is only ever real', function () {
+    const app = loadRouteForm({ geometry: 'road', instantTimers: true });
+    fillForm(app.els);
+    return app.generateRoute().then(function () {
+        app.exportGpx();
+        const gpx = app.downloads[0].text;
+        assert.match(gpx, /<gpx /);
+        assert.match(gpx, /<trk>/, 'verified geometry belongs in a track');
+        assert.match(gpx, /<rte>/);
+
+        /* No calendar without a start date — the module refuses to invent one. */
+        app.els.exportStartDate.value = '';
+        app.exportIcs();
+        assert.strictEqual(app.downloads.length, 1, 'a calendar was offered with no date');
+        assert.strictEqual(app.els.exportHint.textContent, app.i18n.t('exp.needDate'));
+
+        app.els.exportStartDate.value = '2026-09-01';
+        app.exportIcs();
+        const ics = app.downloads[1].text;
+        assert.match(ics, /BEGIN:VCALENDAR/);
+        assert.match(ics, /DTSTART/);
+
+        app.exportPrint();
+        const html = app.downloads[2].text;
+        assert.match(html, /<!DOCTYPE html>/);
+        assert.match(html, /<svg /, 'the printed page carries the map');
+        assert.match(html, /day-card/, 'and the itinerary');
+
+        assert.strictEqual(app.revoked.length, 3, 'every object URL is released');
+        const names = app.created.filter(function (e) { return e.tagName === 'A'; })
+            .map(function (e) { return e.download; });
+        assert.deepStrictEqual(names.map(function (n) { return n.split('.').pop(); }),
+            ['gpx', 'ics', 'html']);
+
+        /* An estimate must not become a <trk>. */
+        const est = loadRouteForm({ geometry: 'straight' });
+        fillForm(est.els);
+        return est.generateRoute().then(function () {
+            est.exportGpx();
+            const flat = est.downloads[0].text;
+            assert.strictEqual(/<trk>/.test(flat), false,
+                'a straight-line estimate was exported as a travelled track');
+            assert.match(flat, /<rte>/, 'the planned via points are still there');
+        });
+    });
+});
+
+test('W9: every map / export / progress key the wiring uses resolves in all five locales', function () {
+    const i18n = loadI18n();
+    const fs = require('node:fs');
+    const sources = ['route-map.js', 'route-form.js', 'route-export.js']
+        .map(function (f) { return fs.readFileSync(path.join(__dirname, '..', 'js', f), 'utf8'); })
+        .join('\n');
+    const keys = (sources.match(/'(map|exp|progress)\.[a-zA-Z]+'/g) || [])
+        .map(function (s) { return s.slice(1, -1); })
+        .filter(function (k, i, a) { return a.indexOf(k) === i; });
+    assert.ok(keys.length >= 15, 'sanity: found ' + keys.length + ' keys');
+    for (let i = 0; i < LOCALES.length; i++) {
+        i18n.setLanguage(LOCALES[i]);
+        for (let k = 0; k < keys.length; k++) {
+            const v = i18n.t(keys[k]);
+            assert.strictEqual(typeof v, 'string', LOCALES[i] + ' / ' + keys[k]);
+            assert.notStrictEqual(v, keys[k],
+                keys[k] + ' is missing in ' + LOCALES[i] + ' — the raw key would render on screen');
+        }
+    }
+});
+
+test('W10: place names with markup in them cannot escape into the map', function () {
+    const app = loadRouteForm({ geometry: 'straight' });
+    fillForm(app.els);
+    app.els.rfDestinations.value = 'L\'Hospitalet <b>&"x"</b>';
+    return app.generateRoute().then(function () {
+        const svg = app.els.routeMapFigure.innerHTML;
+        assert.strictEqual(svg.indexOf('<b>'), -1, 'raw markup reached the SVG');
+        assert.match(svg, /&lt;b&gt;/, 'the name is present, escaped');
+        assert.ok(app.els.routeMapLegend.childNodes.length > 0, 'the legend describes what is drawn');
+    });
 });
