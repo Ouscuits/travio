@@ -1230,20 +1230,38 @@ test('matrix D6: a distance shorter than the great circle discredits the whole c
     assert.strictEqual(m.source, 'haversine', 'the answer was about a different pair of points');
     assert.strictEqual(m.osrmCells, 0);
 
-    /* A distance rejected by the DETOUR CEILING is a different matter — nothing about it
-       says the endpoints were wrong — so the duration keeps its own separate hearing. */
-    const tooLong = makeFetch(function () {
+    /* A distance refused by the DETOUR CEILING condemns the cell too, for the same
+       reason: one path computation produced both halves. Round 5 kept the duration here,
+       which left an asymmetry — a x60 detour was refused while a 202-hour duration beside
+       it was trusted, and 30305/202 = 150 km/h shows that duration is CORROBORATING the
+       absurd path, not contradicting it. Only an ABSENT distance leaves the duration to
+       stand alone (D10). */
+    const corroborating = makeFetch(function () {
         return {
             code: 'Ok',
-            distances: [[0, 6000000], [6000000, 0]],          // 6000 km, above the x10 ceiling
-            durations: [[0, 21600], [21600, 0]]               // 360 min, credible on its own
+            distances: [[0, 30305780], [30305780, 0]],        // x60 detour, refused
+            durations: [[0, 202 * 3600], [202 * 3600, 0]]     // 202 h at 150 km/h along it
         };
     });
-    const far = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: tooLong, storage: null, minIntervalMs: 0 });
+    const far = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: corroborating, storage: null, minIntervalMs: 0 });
     assertMatrixInvariants(far, 2, 'D6 over-ceiling');
-    assert.ok(Math.abs(far.km[0][1] - MAD_BCN_HAV_KM) < 0.02, 'the x12 distance was refused');
-    assert.strictEqual(far.min[0][1], 360, 'the credible duration survived on its own merits');
-    assert.strictEqual(far.source, 'mixed');
+    assert.ok(Math.abs(far.km[0][1] - MAD_BCN_HAV_KM) < 0.02, 'the x60 distance was refused');
+    assert.strictEqual(far.source, 'haversine', 'the duration timed the same absurd path');
+    assert.strictEqual(far.osrmCells, 0);
+    assert.ok(far.min[0][1] < 600, '202 hours never reaches the matrix, got ' + far.min[0][1]);
+
+    /* Incoherent halves are refused whole as well: 6000 km in 360 min is 1000 km/h. */
+    const incoherent = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 6000000], [6000000, 0]],
+            durations: [[0, 21600], [21600, 0]]
+        };
+    });
+    const bad = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: incoherent, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(bad, 2, 'D6 incoherent');
+    assert.strictEqual(bad.source, 'haversine');
+    assert.strictEqual(bad.osrmCells, 0);
 });
 
 test('matrix D6: plausible short legs are NOT churned by the floor', async function () {
@@ -1319,13 +1337,14 @@ test('matrix D10: a durations-only reply keeps the real duration on a high-detou
 test('matrix D10: there is no duration cliff on a durations-only reply', async function () {
     /* The old floor kept everything up to 135 min and discarded everything from 140 min
        on — a cliff produced entirely by the estimate, not by the data. The credible band
-       for this pair runs to 3165 min: the longest road that could join two points 9.25 km
-       apart is 142.5 km, and 48 h + 142.5/30 h = 52.75 h.
-       (Round 4 asserted here that 600 min must be REJECTED, derived from the old
-       minimum-speed floor. Live measurement then found Athens-Mykonos doing 176 km in
-       28.9 h, so 10 hours over a road of at most 142 km is ordinary for a ferry hop and
-       that assertion was wrong — in the same direction as every other gap in this file.) */
-    for (const mins of [30, 60, 90, 120, 135, 138, 140, 150, 200, 300, 450, 600, 1440, 3000]) {
+       for this pair runs to 470 min: the longest road that could join two points 9.25 km
+       apart is 142.5 km, and the stoppage allowance a 9.25 km crow line earns is
+       min(48 h, 9.25/3 h) = 3.08 h, so 3.08 + 142.5/30 = 7.83 h.
+       (Round 5 swept up to 3000 min here, because the 48 h allowance was then granted
+       unconditionally. That was the round-6 bug showing through a test: no scheduled
+       crossing is plausible over 9.25 km, so a 50-hour leg is not credible and the sweep
+       had no business asserting it.) */
+    for (const mins of [30, 60, 90, 120, 135, 138, 140, 150, 200, 300, 450]) {
         const fetchImpl = makeFetch(function () {
             return { code: 'Ok', durations: [[0, mins * 60], [mins * 60, 0]] };
         });
@@ -1336,10 +1355,12 @@ test('matrix D10: there is no duration cliff on a durations-only reply', async f
     }
 
     /* The outer bound still exists — the test is one-sided, not absent. */
-    const absurd = makeFetch(function () { return { code: 'Ok', durations: [[0, 4000 * 60], [4000 * 60, 0]] }; });
-    const m = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: absurd, storage: null, minIntervalMs: 0 });
-    assert.strictEqual(m.source, 'haversine',
-        '66 hours to cover 9.25 km as the crow flies is beyond any credible road');
+    for (const mins of [600, 1440, 4000]) {
+        const absurd = makeFetch(function () { return { code: 'Ok', durations: [[0, mins * 60], [mins * 60, 0]] }; });
+        const m = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: absurd, storage: null, minIntervalMs: 0 });
+        assert.strictEqual(m.source, 'haversine',
+            (mins / 60).toFixed(1) + ' h to cover 9.25 km as the crow flies is beyond any credible road');
+    }
 });
 
 test('matrix D10: a durations-only reply is still rejected when NO road could produce it', async function () {
@@ -1516,7 +1537,23 @@ const FERRY_ROUTES = [
     ['Oslo-Copenhagen',      59.9139, 10.7522,  55.6761, 12.5683,   605,  438],
     ['Bergen-Stavanger',     60.3913, 5.3221,   58.9700, 5.7331,    288,  330],
     ['Reykjavik-Vestmann',   64.1466, -21.9426, 63.4427, -20.2734,  151,  162],
-    ['Ullapool-Stornoway',   57.8955, -5.1590,  58.2090, -6.3890,   321,  330]
+    ['Ullapool-Stornoway',   57.8955, -5.1590,  58.2090, -6.3890,   321,  330],
+    /* Round 6: the short-crow crossings that stress a crow-scaled allowance, plus the
+       two routes the reviewer cited, measured here rather than taken on trust. */
+    ['Messina-VillaSGiov',   38.1938, 15.5540,  38.2200, 15.6360,    10,   48],
+    ['Portsmouth-Ryde',      50.8198, -1.0880,  50.7290, -1.1600,    21,   60],
+    ['Split-Supetar',        43.5081, 16.4402,  43.3833, 16.5500,    19,   66],
+    ['Oban-Craignure',       56.4152, -5.4714,  56.4700, -5.7080,   120,  132],
+    ['SantaTeresa-Bonifacio', 41.2400, 9.1900,  41.3874, 9.1600,     20,   66],
+    ['Ibiza-Formentera',     38.9067, 1.4206,   38.7333, 1.4167,     25,   36],
+    ['Piombino-Portoferraio', 42.9236, 10.5247, 42.8135, 10.3167,    45,   60],
+    ['Naples-Ischia',        40.8518, 14.2681,  40.7314, 13.9503,    51,  282],
+    ['Naples-Capri',         40.8518, 14.2681,  40.5532, 14.2222,    66,   84],
+    ['Piraeus-Aegina',       37.9420, 23.6465,  37.7470, 23.4280,    34,   72],
+    ['Dover-Calais',         51.1279, 1.3134,   50.9513, 1.8587,     87,   66],
+    ['Helsinki-Tallinn',     60.1699, 24.9384,  59.4370, 24.7536,    87,  132],
+    ['Palermo-Lampedusa',    38.1157, 13.3615,  35.4999, 12.6068,   355, 2814],
+    ['Cagliari-Palermo',     39.2238, 9.1217,   38.1157, 13.3615,  2323, 2028]
 ];
 
 test('matrix D12: every live-measured ferry route survives as clean road data', async function () {
@@ -1597,6 +1634,53 @@ test('matrix D12: no average-speed threshold could have separated these from jun
     assert.strictEqual(bogus.source, 'haversine', '7.4 km/h over 620 km is not a road journey');
 });
 
+test('matrix D13: the stoppage allowance is earned by separation, not granted flat', async function () {
+    /* Reported repro: the 48 h allowance was unconditional, so below ~100 km the cap was
+       ~48 h regardless of distance — which removed the slow-side protection from exactly
+       the legs a city itinerary is made of. Each of these shipped as source 'osrm', i.e.
+       LABELLED AS MEASURED, which is the one thing this module's central law forbids. */
+    const cases = [
+        ['2 km city claimed at 40 h',   1.9,   2, 40],
+        ['10 km city claimed at 47 h',  9.3,  10, 47],
+        ['50 km claimed at 48 h',      45.9,  50, 48],
+        ['100 km claimed at 50 h',     90.8, 100, 50]
+    ];
+    for (const [label, crowKm, roadKm, hours] of cases) {
+        const b = place('B', 40.4168 + crowKm / 111.195, -3.7038);
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, roadKm * 1000], [roadKm * 1000, 0]],
+                durations: [[0, hours * 3600], [hours * 3600, 0]]
+            };
+        });
+        const m = await distanceMatrix([place('A', 40.4168, -3.7038), b],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D13 ' + label);
+        assert.strictEqual(m.source, 'haversine',
+            label + ' must not ship labelled as measured — no crossing is plausible over ' +
+            crowKm + ' km');
+        assert.strictEqual(m.osrmCells, 0, label);
+        assert.ok(m.min[0][1] < hours * 60,
+            label + ': the estimate replaced it, got ' + m.min[0][1] + ' min');
+    }
+
+    /* The same durations over a separation where a crossing IS plausible are kept —
+       the allowance is earned by the crow line, not withheld from ferries. */
+    const ferry = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 176000], [176000, 0]],
+            durations: [[0, 1734 * 60], [1734 * 60, 0]]        // Athens-Mykonos, 28.9 h
+        };
+    });
+    const kept = await distanceMatrix(
+        [place('Athens', 37.9838, 23.7275), place('Mykonos', 37.4467, 25.3289)],
+        { fetchImpl: ferry, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(kept.source, 'osrm', '28.9 h across 153 km of Aegean is real');
+    assert.strictEqual(kept.min[0][1], 1734);
+});
+
 test('matrix D12: the 22nd measured route is correctly refused — OSRM answered elsewhere', async function () {
     /* Algeciras -> Ceuta was the one measured pair that must NOT be trusted, and it is
        the evidence behind the whole-cell rule in D6. Live: the crow line is 30 km across
@@ -1621,20 +1705,44 @@ test('matrix D12: the 22nd measured route is correctly refused — OSRM answered
 });
 
 test('matrix D12: the x10 detour ceiling still clears every measured route', async function () {
-    /* Live measurement found a worse real detour than the review did: Athens-Chios is
-       215 km as the crow flies and 1400 km by road, x6.51 — not the x4.45 of
-       Helsinki-Stockholm. The x10 + 50 km ceiling still holds, but the true headroom is
-       x1.57, not x2.2, so this test records where the real edge is. */
+    /* Successive measurement rounds keep finding worse real detours than the last:
+       x4.45 Helsinki-Stockholm (reviewer), x6.51 Athens-Chios (round 5), and now
+       x7.61 Oban-Craignure — 16 km across the Sound of Mull, 120 km around Loch Linnhe.
+       The x10 + 50 km ceiling still clears all 36, but the ratio margin is now x1.31,
+       not the x2.2 anyone believed. This test records where the real edge is so that
+       nobody tightens the ceiling without re-measuring. */
     let worstRatio = 0, worstName = '';
+    let tightest = Infinity, tightestName = '';
     for (const [name, aLat, aLon, bLat, bLon, roadKm] of FERRY_ROUTES) {
         const crow = haversineKm(aLat, aLon, bLat, bLon);
         const ratio = roadKm / crow;
+        const headroom = (crow * 10 + 50) / roadKm;
         if (ratio > worstRatio) { worstRatio = ratio; worstName = name; }
+        if (headroom < tightest) { tightest = headroom; tightestName = name; }
         assert.ok(roadKm <= crow * 10 + 50,
             name + ' detour x' + ratio.toFixed(2) + ' must clear the ceiling');
     }
-    assert.ok(worstRatio > 6 && worstRatio < 7,
+    assert.ok(worstRatio > 7 && worstRatio < 8,
         'worst measured detour is ' + worstName + ' at x' + worstRatio.toFixed(2));
+    assert.ok(tightest > 1.2,
+        'tightest ceiling headroom is ' + tightestName + ' at x' + tightest.toFixed(2));
+});
+
+test('matrix D12: every measured route clears the duration ceiling too', async function () {
+    /* The other half of the same guarantee: not one of the 36 is rejected on time, and
+       the tightest margin is Palermo-Lampedusa — 46.9 h against a 59.8 h cap. */
+    let tightest = Infinity, tightestName = '';
+    for (const [name, aLat, aLon, bLat, bLon, roadKm, minutes] of FERRY_ROUTES) {
+        const crow = haversineKm(aLat, aLon, bLat, bLon);
+        const cap = Math.min(48 * 60, crow * 20) + (roadKm / 30) * 60;
+        const headroom = cap / minutes;
+        if (headroom < tightest) { tightest = headroom; tightestName = name; }
+        assert.ok(minutes <= cap, name + ' (' + (minutes / 60).toFixed(1) + ' h) must clear its ' +
+            (cap / 60).toFixed(1) + ' h cap');
+    }
+    assert.ok(tightest > 1.25 && tightest < 1.35,
+        'tightest duration headroom is ' + tightestName + ' at x' + tightest.toFixed(2));
+    assert.strictEqual(tightestName, 'Palermo-Lampedusa');
 });
 
 /* ══════════════════════════════════════════════════════════════════════════

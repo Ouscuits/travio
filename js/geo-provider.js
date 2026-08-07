@@ -77,7 +77,7 @@
  *       great circle beneath it (cellKm + 0.5 >= straightKm * 0.90, slack for OSRM
  *       snapping to the nearest road) and never more than 10x + 50 km longer.
  *     - PAIR SPEED (only when BOTH halves are measured): at most 200 km/h, and at most
- *       geoMaxDurationMin(km) in total.
+ *       geoMaxDurationMin(km, crow) in total.
  *     - DURATION ALONE (measured duration, estimated distance): rejected only when NO
  *       credible road length makes it drivable — too fast even along the great circle,
  *       or longer than the ceiling allows even along the 10x road.
@@ -88,40 +88,60 @@
  *
  *   THRESHOLDS, from measurement rather than taste:
  *     - detour ceiling 10x + 50 km. Observed real detours: x1.15–x1.36 across the seven
- *       Spanish calibration fixtures (published road km vs great circle), ~x2 at the top
- *       of the reviewer's sweep, and x12.11 for the 9.3 km / 112 km leg above, which is
- *       real road data that must survive. A x5 ceiling was proposed and is provably too
- *       tight: 5 * 9.25 = 46 km would reject that 112 km road. 10x sits above every
- *       observed real value (and above x4–x8 fjord and rainforest geography) and an
- *       order of magnitude below the x60 case that motivated the ceiling. The +50 km is
- *       headroom for short legs, where a large ratio is cheap and common (an estuary
- *       crossing to the nearest bridge).
+ *       Spanish calibration fixtures (published road km vs great circle), and x12.11 for
+ *       the 9.3 km / 112 km leg above, which is real road data that must survive. A x5
+ *       ceiling was proposed and is provably too tight: 5 * 9.25 = 46 km would reject
+ *       that 112 km road. The +50 km is headroom for short legs, where a large ratio is
+ *       cheap and common (an estuary crossing to the nearest bridge).
+ *       CAUTION: every measurement round has found a worse real detour than the last —
+ *       x4.45 Helsinki–Stockholm, then x6.51 Athens–Chios, then x7.61 Oban–Craignure
+ *       (16 km across the Sound of Mull, 120 km around Loch Linnhe). All 36 still clear
+ *       the ceiling, but the ratio margin is x1.31, not the x2.2 it was believed to be.
+ *       Do not tighten this without measuring again; the trend says the true worst case
+ *       has not been found yet.
  *     - speed ceiling 200 km/h, flat: OSRM's car profile tops out near 140 km/h on
  *       motorways, so 200 leaves 43% headroom and no real route averages above it.
  *
- *   THE SLOW SIDE — why there is no minimum-speed test.
- *   There used to be one (5 km/h short, rising to 30 km/h over 300 km) and it was wrong:
- *   Athens -> Iraklio is 644 km of real OSRM ferry route at 34.8 km/h, only 16% above
- *   that floor, so a slower sailing was rejected and 1290 real minutes became 266.8 —
- *   a 4.8x understatement, silent. Widening the floor does not fix it. 22 routes were
- *   measured live against router.project-osrm.org over the worst geography available
- *   (Balearics, Aegean, Tyrrhenian, Baltic, Norwegian coast, Iceland, Outer Hebrides):
- *       Athens–Mykonos     176 km in 28.9 h =  6.1 km/h   REAL
- *       Athens–Santorini   290 km in 37.8 h =  7.7 km/h   REAL
- *       Athens–Iraklio     644 km in 18.5 h = 34.8 km/h   REAL
- *       Madrid–Barcelona   620 km in 84 h   =  7.4 km/h   JUNK
- *   The real and the junk distributions OVERLAP — the junk is faster than the slowest
- *   real route — so no speed threshold can separate them, at any asymptote. Average
- *   speed is the wrong instrument because it conflates a fixed wait (a scheduled
- *   sailing, which does not scale with distance) with progress (which does).
- *   Splitting those two apart separates them cleanly:
- *       maxDuration = 48 h + km / 30 km/h
- *   48 h is up to two days waiting for a service that does not sail daily; 30 km/h is a
- *   slow ferry's sustained speed once moving (real ferries make 30–40 km/h). Against the
- *   22 measured routes the tightest headroom is x1.53 (Athens–Santorini) and every one
- *   passes; all four junk cases above are still rejected. OSRM's /table response carries
- *   no ferry flag — only distances and durations — so detecting the ferry directly, the
- *   other option considered, is not possible from what this module receives.
+ *   THE SLOW SIDE — why no minimum-speed CONSTANT exists.
+ *   There used to be one (5 km/h short, rising to a flat 30 km/h over 300 km) and it was
+ *   wrong: Athens -> Iraklio is 644 km of real OSRM ferry route at 34.8 km/h, only 16%
+ *   above that floor, so a slower sailing was rejected and 1290 real minutes became
+ *   266.8 — a 4.8x understatement, silent. Widening the floor does not fix it. 36 routes
+ *   were measured live against router.project-osrm.org over the worst geography
+ *   available (Balearics, Aegean, Tyrrhenian, Adriatic, Baltic, Channel, Norwegian
+ *   coast, Iceland, Hebrides, plus every short island hop that could stress the rule):
+ *       Athens–Mykonos      176 km in 28.9 h =  6.09 km/h   REAL
+ *       Madrid–Barcelona    620 km in 84 h   =  7.38 km/h   JUNK
+ *       Palermo–Lampedusa   354 km in 46.9 h =  7.55 km/h   REAL
+ *       Athens–Santorini    290 km in 37.8 h =  7.67 km/h   REAL
+ *       Athens–Iraklio      644 km in 18.5 h = 34.81 km/h   REAL
+ *   TWO real routes STRADDLE the junk, so any constant C would have to satisfy
+ *   C <= 6.09 to keep Mykonos and C > 7.38 to reject the junk. No such C exists — that,
+ *   and not "no speed test can work", is the proof. The shipped rule IS a speed floor,
+ *       minSpeed(km) = km / (min(48 h, crow/3) + km/30)
+ *   it simply never reaches a constant at any real distance: 3.27 km/h at Mykonos's
+ *   176 km, 5.03 at Santorini's 290 km, 5.92 at Lampedusa's 354 km, 9.27 at Iraklio's
+ *   644 km, and 9.03 for the 620 km junk — above its 7.38 km/h, which is how one junk
+ *   case is rejected while two slower real ones are kept. It approaches 30 km/h only as
+ *   km grows without bound. Average speed alone fails because it conflates a wait
+ *   (which does not scale with distance) with progress (which does); stated as a
+ *   duration ceiling those two separate cleanly:
+ *       maxDuration = min(48 h, crow / 3) + km / 30 km/h
+ *   These constants are an EMPIRICAL ENVELOPE over measured OSRM output, not a model of
+ *   ferry timetables — OSRM routes on way weights and does not know a schedule, and the
+ *   long durations above come from its own low weighting of ferry ways. The envelope is
+ *   fitted, and only its shape is argued: a term that does not scale with distance plus
+ *   one that does, because that is the only way to separate the overlapping cases above.
+ *   The distance-independent term is capped by the great-circle separation because it is
+ *   only earned where a water crossing could exist at all: granting it flat let a 10 km
+ *   city hop claim 48 hours and ship LABELLED AS MEASURED, which stripped the slow-side
+ *   protection from exactly the legs a city itinerary is made of. Every slow route in the
+ *   36 has a crow line of at least 74 km; the shortest measured crossing is
+ *   Messina–Villa San Giovanni at 7.7 km and it clears the cap by x3.63.
+ *   Against all 36 the tightest headroom is x1.28 (Palermo–Lampedusa, 46.9 h against a
+ *   59.8 h cap) and not one is rejected. OSRM's /table response carries no ferry flag —
+ *   only distances and durations — so detecting the ferry directly, the other option
+ *   considered, is not possible from what this module receives.
  *
  *   WHICH DIRECTION IS "SAFE" — this file makes two calls that look opposed:
  *   FALLBACK CALIBRATION says a pessimistic speed is bad because it over-splits days,
@@ -190,6 +210,8 @@
        Every threshold below is derived from measurement — see PLAUSIBILITY FLOOR. */
     const GEO_MAX_SPEED_KMH      = 200;             // faster than this is not driving, at any length
     const GEO_STOPPAGE_ALLOWANCE_MIN = 48 * 60;     // waiting for a scheduled sailing/service
+    const GEO_ALLOWANCE_PER_CROW_MIN = 20;          // ...but only where a crossing is plausible:
+                                                    // 20 min per crow km == crow / 3 in hours
     const GEO_MIN_SUSTAINED_KMH  = 30;              // slowest sustained progress once moving
     const GEO_MAX_DETOUR         = 10;              // road / great circle ceiling
     const GEO_DETOUR_SLACK_KM    = 50;              // absolute headroom for short legs
@@ -664,15 +686,22 @@
     }
 
     /*
-     * The longest credible duration for a road of this length. There is deliberately NO
-     * minimum-speed test on the slow side: measurement shows the distributions overlap,
-     * so no speed threshold can separate a real ferry from junk (see SLOW SIDE in the
-     * header). A duration ceiling can, because it separates the two things average speed
-     * conflates — a fixed wait that does not scale with distance, and progress that does.
+     * The longest credible duration for a road of this length between points this far
+     * apart. There is deliberately no floor on average SPEED (see SLOW SIDE in the
+     * header); the bound separates the two things average speed conflates — a wait that
+     * does not scale with distance, and progress that does.
+     * The wait is granted only where a scheduled crossing could plausibly be involved.
+     * A flat 48 h was handed to every leg regardless, so a 10 km city hop could claim
+     * 48 hours and ship LABELLED AS MEASURED — which removed the slow-side protection
+     * from exactly the legs a city itinerary is made of. Every slow route in the 36
+     * measured live has a crow line of at least 74 km, so the allowance is scaled by the
+     * great-circle distance and saturates at 48 h once a real crossing is on the table.
      */
-    function geoMaxDurationMin(km) {
-        const road = isFinite(km) && km > 0 ? km : 0;
-        return GEO_STOPPAGE_ALLOWANCE_MIN + (road / GEO_MIN_SUSTAINED_KMH) * 60;
+    function geoMaxDurationMin(roadKm, straightKm) {
+        const road = isFinite(roadKm) && roadKm > 0 ? roadKm : 0;
+        const crow = isFinite(straightKm) && straightKm > 0 ? straightKm : 0;
+        const allowance = Math.min(GEO_STOPPAGE_ALLOWANCE_MIN, crow * GEO_ALLOWANCE_PER_CROW_MIN);
+        return allowance + (road / GEO_MIN_SUSTAINED_KMH) * 60;
     }
 
     /* The longest road length that could credibly join two points this far apart. */
@@ -681,26 +710,22 @@
     }
 
     /*
-     * A road SHORTER than the great circle beneath it is not a bad road distance — it is
-     * an answer about a different pair of points, and the duration beside it measures
-     * that other journey just as wrongly. Measured: asking OSRM for Algeciras -> Ceuta
-     * (30 km across the strait) snapped the Ceuta endpoint 22.5 km away onto the Spanish
-     * coast and answered 12 km / 18 min. Keeping that 18 minutes as road data would
-     * present a measurement of somewhere else as fact. So this verdict kills the WHOLE
-     * cell, not just the distance.
+     * A road cannot be materially shorter than the great circle beneath it, and it cannot
+     * wander an order of magnitude further than it either. Either verdict condemns the
+     * WHOLE cell, not just the distance, because both halves come out of ONE path
+     * computation — if the path is not a road, the duration timed that same non-road:
+     *   - too short: measured, asking OSRM for Algeciras -> Ceuta (30 km across the
+     *     strait) snapped the Ceuta endpoint 22.5 km away onto the Spanish coast and
+     *     answered 12 km / 18 min — a real journey, just not the one requested;
+     *   - too long: a x60 detour reported 30 305 km with 202 h beside it, and
+     *     30305/202 = 150 km/h, so the duration corroborates the absurd path rather
+     *     than contradicting it.
+     * Only an ABSENT distance leaves the duration to stand on its own merits.
      */
-    function geoDistanceContradictsGeometry(cellKm, straightKm) {
-        if (!isFinite(cellKm) || cellKm < 0) return false;      // absent, not contradictory
-        if (geoTrivialLeg(cellKm, straightKm)) return false;
-        return cellKm + GEO_SHORTFALL_SLACK < straightKm * GEO_SHORTFALL_RATIO;
-    }
-
-    /* A road cannot be materially shorter than the great circle beneath it, and it
-       cannot wander an order of magnitude further than it either. */
     function geoDistancePlausible(cellKm, straightKm) {
         if (!isFinite(cellKm) || cellKm < 0) return false;
         if (geoTrivialLeg(cellKm, straightKm)) return true;
-        if (geoDistanceContradictsGeometry(cellKm, straightKm)) return false;
+        if (cellKm + GEO_SHORTFALL_SLACK < straightKm * GEO_SHORTFALL_RATIO) return false;
         return cellKm <= geoMaxRoadKm(straightKm);
     }
 
@@ -714,7 +739,7 @@
         if (!(cellMin > 0)) return false;                       // distance in zero time
         const kmh = cellKm / (cellMin / 60);
         if (!isFinite(kmh) || kmh > GEO_MAX_SPEED_KMH) return false;
-        return cellMin <= geoMaxDurationMin(cellKm);
+        return cellMin <= geoMaxDurationMin(cellKm, straightKm);
     }
 
     /*
@@ -737,7 +762,7 @@
         /* Too fast even along the shortest road that could possibly exist. */
         if (straightKm / hours > GEO_MAX_SPEED_KMH) return false;
         /* Too long even for the longest road that could possibly exist. */
-        return cellMin <= geoMaxDurationMin(geoMaxRoadKm(straightKm));
+        return cellMin <= geoMaxDurationMin(geoMaxRoadKm(straightKm), straightKm);
     }
 
     function geoOsrmTableUrl(coords, cfg) {
@@ -856,11 +881,11 @@
                 const straightKm = haversineKm(eff[i].lat, eff[i].lon, eff[j].lat, eff[j].lon);
                 const hav = geoHaversineCell(straightKm, cfg);
 
-                /* A distance shorter than the great circle beneath it means OSRM answered
-                   about somewhere else, so the duration is discredited with it. */
-                const misSnapped = geoDistanceContradictsGeometry(rawKm, straightKm);
-                let realKm = !misSnapped && geoDistancePlausible(rawKm, straightKm);
-                let realMin = !misSnapped && isFinite(rawMin);
+                /* A distance that is PRESENT but is not a road condemns the duration with
+                   it: one path computation produced both. An ABSENT distance does not. */
+                const haveRawKm = isFinite(rawKm);
+                let realKm = haveRawKm && geoDistancePlausible(rawKm, straightKm);
+                let realMin = isFinite(rawMin) && (realKm || !haveRawKm);
 
                 /* Each half is judged against what is actually KNOWN about it, never
                    against the other half's estimate. */
