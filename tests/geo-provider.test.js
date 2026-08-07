@@ -1250,6 +1250,200 @@ test('matrix D6: plausible short legs are NOT churned by the floor', async funct
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
+   D10: an ESTIMATE is never the reference for validating a MEASUREMENT
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Two places 9.25 km apart as the crow flies with a 112 km / 140 min road between them
+   — a x12 detour, and entirely real (a bay, a mountain, a one-way valley). */
+const DETOUR_A = place('DetourA', 40.4168, -3.7038);
+const DETOUR_B = place('DetourB', 40.5000, -3.7038);
+const DETOUR_CROW_KM = haversineKm(40.4168, -3.7038, 40.5000, -3.7038);
+
+test('matrix D10: a durations-only reply keeps the real duration on a high-detour leg', async function () {
+    /* Reported repro. When only `durations` comes back, km is the haversine ESTIMATE,
+       and the old speed check charged that estimate's error against the real duration:
+       11.56 km / 140 min implied a fake 4.95 km/h, under the 5 km/h floor, so the whole
+       cell reverted to an estimate. The 140-minute duration became 7.7 — 18x too small,
+       with NO warning, understating drive time, which is the day-splitting bug class. */
+    assert.ok(DETOUR_CROW_KM > 9 && DETOUR_CROW_KM < 9.5, 'fixture crow distance');
+
+    /* Control: with both grids the pair validates itself and is clean road data. */
+    const both = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 112000], [112000, 0]],
+            durations: [[0, 8400], [8400, 0]]
+        };
+    });
+    const full = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: both, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(full, 2, 'D10 control');
+    assert.strictEqual(full.source, 'osrm', 'a x12 detour at 48 km/h is real road data');
+    assert.strictEqual(full.km[0][1], 112);
+    assert.strictEqual(full.min[0][1], 140);
+
+    /* The same leg, durations only: the measurement must survive the missing half. */
+    const durOnly = makeFetch(function () {
+        return { code: 'Ok', durations: [[0, 8400], [8400, 0]] };
+    });
+    const half = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: durOnly, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(half, 2, 'D10 durations only');
+    assert.strictEqual(half.min[0][1], 140, 'the measured duration is kept, not recomputed');
+    assert.strictEqual(half.source, 'mixed');
+    assert.strictEqual(half.osrmCells, 2);
+    assert.strictEqual(half.filledCells, 2);
+});
+
+test('matrix D10: there is no duration cliff on a durations-only reply', async function () {
+    /* The old floor kept everything up to 135 min and discarded everything from 140 min
+       on — a cliff produced entirely by the estimate, not by the data. The credible band
+       for this pair runs to ~506 min: the longest road that could join two points 9.25 km
+       apart is 142.5 km, and 142.5 km below its own 16.9 km/h floor is 506 min. */
+    for (const mins of [30, 60, 90, 120, 135, 138, 140, 150, 200, 300, 450]) {
+        const fetchImpl = makeFetch(function () {
+            return { code: 'Ok', durations: [[0, mins * 60], [mins * 60, 0]] };
+        });
+        const m = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D10 sweep ' + mins);
+        assert.strictEqual(m.min[0][1], mins, mins + ' min was discarded — the cliff is back');
+        assert.strictEqual(m.source, 'mixed', mins + ' min: road data reached the matrix');
+    }
+
+    /* The outer bound still exists — the test is one-sided, not absent. */
+    const absurd = makeFetch(function () { return { code: 'Ok', durations: [[0, 36000], [36000, 0]] }; });
+    const m = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: absurd, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(m.source, 'haversine',
+        '10 hours to cover 9.25 km as the crow flies is beyond any credible road');
+});
+
+test('matrix D10: a durations-only reply is still rejected when NO road could produce it', async function () {
+    /* The fix must not become a blanket "skip the check when one half is an estimate":
+       that would let 1 second between Madrid and Barcelona through the half-response
+       path. Geometry still pins the duration down from both sides — too fast even along
+       the great circle, or too slow even along the detour ceiling. */
+    const impossible = [
+        ['1 second for 505 km', 1],
+        ['12 seconds for 505 km', 12],
+        ['zero seconds', 0],
+        ['40 days for 505 km', 40 * 24 * 3600]
+    ];
+    for (const [label, seconds] of impossible) {
+        const fetchImpl = makeFetch(function () {
+            return { code: 'Ok', durations: [[0, seconds], [seconds, 0]] };
+        });
+        const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D10 impossible:' + label);
+        assert.strictEqual(m.source, 'haversine', label + ' must not survive as road data');
+        assert.strictEqual(m.osrmCells, 0, label);
+        const kmh = m.km[0][1] / (m.min[0][1] / 60);
+        assert.ok(kmh > 5 && kmh < 200, label + ': the replacement is drivable (' + kmh.toFixed(1) + ' km/h)');
+    }
+
+    /* ...and a long-but-credible duration on the same pair is still kept. */
+    const slow = makeFetch(function () { return { code: 'Ok', durations: [[0, 36000], [36000, 0]] }; });
+    const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: slow, storage: null, minIntervalMs: 0 });
+    assert.strictEqual(m.min[0][1], 600, '10 hours Madrid-Barcelona is slow but possible');
+    assert.strictEqual(m.source, 'mixed');
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+   D11: the detour ceiling and the length-scaled speed floor
+   ══════════════════════════════════════════════════════════════════════════ */
+
+test('matrix D11: an absurd detour is refused however well its duration matches it', async function () {
+    /* Reported repro: 30 305.78 km between Madrid and Barcelona (a x60 detour on a
+       505 km crow line) was accepted as clean 'osrm' with no warning, because there was
+       no upper bound on distance at all — only a lower one. */
+    const fetchImpl = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 30305780], [30305780, 0]],
+            durations: [[0, 20204 * 60], [20204 * 60, 0]]     // 30 305 km at 90 km/h
+        };
+    });
+    const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(m, 2, 'D11 x60 detour');
+    assert.strictEqual(m.source, 'haversine', 'a x60 detour is not a road');
+    assert.strictEqual(m.osrmCells, 0);
+    assert.ok(m.km[0][1] < 700, 'the honest estimate replaced it, got ' + m.km[0][1] + ' km');
+});
+
+test('matrix D11: the ceiling clears every observed real detour', async function () {
+    /* Thresholds from measurement, not taste. Observed detours: x1.15-x1.36 across the
+       seven Spanish calibration fixtures, ~x2 at the top of the reviewer's sweep, and
+       x12.11 for the 9.25 km / 112 km leg above, which is real road data. A x5 ceiling
+       was proposed and is provably too tight — 5 x 9.25 = 46 km would reject that 112 km
+       road — so the ceiling is x10 + 50 km. */
+    const cases = [
+        ['x1.36, the calibration maximum', MADRID, BARCELONA, 505 * 1.36, 90],
+        ['x2, the sweep maximum',          MADRID, BARCELONA, 505 * 2.0,  90],
+        ['x4, rainforest geography',       MADRID, BARCELONA, 505 * 4.0,  90],
+        ['x8, fjord geography',            MADRID, BARCELONA, 505 * 8.0,  90],
+        ['x12.11 on a short leg',          DETOUR_A, DETOUR_B, 112,       48]
+    ];
+    for (const [label, from, to, roadKm, kmh] of cases) {
+        const minutes = roadKm / kmh * 60;
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, Math.round(roadKm * 1000)], [Math.round(roadKm * 1000), 0]],
+                durations: [[0, Math.round(minutes * 60)], [Math.round(minutes * 60), 0]]
+            };
+        });
+        const m = await distanceMatrix([from, to], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D11 keep:' + label);
+        assert.strictEqual(m.source, 'osrm', label + ' is real road data and must survive');
+        assert.ok(Math.abs(m.km[0][1] - roadKm) < 1, label + ': the measured distance is kept');
+    }
+});
+
+test('matrix D11: the speed floor scales with distance instead of being blind to it', async function () {
+    /* 6 km/h is ordinary over 2 km of city traffic and absurd sustained over 620 km.
+       One flat 5-200 km/h band accepted both; the floor now rises from 5 km/h to
+       30 km/h across 300 km — 30 being one third of every measured long-haul average
+       (87.6-92.8 km/h, mean 90.6). */
+    const CITY_A = place('CityA', 40.4168, -3.7038);
+    const CITY_B = place('CityB', 40.4348, -3.7038);           // ~2 km
+
+    const urban = makeFetch(function () {
+        return { code: 'Ok', distances: [[0, 2400], [2400, 0]], durations: [[0, 1440], [1440, 0]] };
+    });
+    const city = await distanceMatrix([CITY_A, CITY_B], { fetchImpl: urban, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(city, 2, 'D11 urban 6 km/h');
+    assert.strictEqual(city.source, 'osrm', '2.4 km in 24 min is normal city traffic');
+    assert.strictEqual(city.km[0][1], 2.4);
+    assert.strictEqual(city.min[0][1], 24);
+
+    const crawl = makeFetch(function () {
+        return { code: 'Ok', distances: [[0, 620000], [620000, 0]], durations: [[0, 84 * 3600], [84 * 3600, 0]] };
+    });
+    const long = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: crawl, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(long, 2, 'D11 long-haul 6 km/h');
+    assert.strictEqual(long.source, 'haversine', '620 km at 6 km/h is an 84-hour day, not a drive');
+    assert.strictEqual(long.osrmCells, 0);
+
+    /* The floor must not creep up on genuinely slow long legs: 300 km of mountain road
+       at 40 km/h is real, and so is 500 km at 35 km/h in holiday traffic. */
+    const slowButReal = [
+        [MADRID, VALENCIA, 356, 40],
+        [MADRID, BARCELONA, 621, 35]
+    ];
+    for (const [from, to, roadKm, kmh] of slowButReal) {
+        const minutes = roadKm / kmh * 60;
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, roadKm * 1000], [roadKm * 1000, 0]],
+                durations: [[0, Math.round(minutes * 60)], [Math.round(minutes * 60), 0]]
+            };
+        });
+        const m = await distanceMatrix([from, to], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D11 slow ' + kmh);
+        assert.strictEqual(m.source, 'osrm', roadKm + ' km at ' + kmh + ' km/h is slow but real');
+        assert.strictEqual(m.km[0][1], roadKm);
+    }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
    D7: ALL THREE network entry points share the serial queue and the rate limit
    ══════════════════════════════════════════════════════════════════════════ */
 

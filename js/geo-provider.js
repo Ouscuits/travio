@@ -41,7 +41,9 @@
  *   'mixed'     some road data, some estimated (islands, ferries, unroutable pairs, or
  *               a cell where only one of distance/duration came back)
  *   'haversine' NO road-graph value contributed to any cell (osrmCells === 0; also the
- *               degenerate n < 2 case, which has no off-diagonal cell at all)
+ *               degenerate n < 2 case, which has no off-diagonal cell at all — the
+ *               contract carves that case out of the counter laws explicitly, and the
+ *               engine skips the source check entirely when dim <= 1)
  *   NOTE  osrmCells/filledCells count off-diagonal CELLS, not undirected pairs: the
  *         matrix is symmetric, so one unroutable pair contributes two cells. This is
  *         what the engine's dim*(dim-1) denominator expects ("14 of 20 cells").
@@ -62,12 +64,47 @@
  *   fine and physically impossible: 617 km in 1 second, or an all-zero grid between
  *   cities 500 km apart. Both used to ship as clean 'osrm', and because the engine caps
  *   days on `min`, a zero-minute leg packs the trip into too few days — the exact
- *   day-splitting bug this branch exists to kill. Two checks, applied per cell:
- *     - a road can never be materially shorter than the great circle beneath it
- *       (cellKm + 0.5 >= straightKm * 0.90 — slack for OSRM snapping to the road);
- *     - the implied average speed must be inside 5–200 km/h.
+ *   day-splitting bug this branch exists to kill.
+ *
+ *   THE GOVERNING RULE: each half of a cell is judged against what is actually KNOWN
+ *   about it — the great-circle distance — and NEVER against the other half's estimate.
+ *   An estimate is not a reference for validating a measurement. Charging the estimate's
+ *   error against a real duration destroyed real data: two places 9.3 km apart with a
+ *   112 km / 140 min road between them (a 12x detour, entirely real) implied a fake
+ *   4 km/h, so the 140-minute duration was thrown away and replaced by 7.8 minutes —
+ *   18x too small, with no warning. Hence three separate tests:
+ *     - DISTANCE (needs only geometry): a road is never materially shorter than the
+ *       great circle beneath it (cellKm + 0.5 >= straightKm * 0.90, slack for OSRM
+ *       snapping to the nearest road) and never more than 10x + 50 km longer.
+ *     - PAIR SPEED (only when BOTH halves are measured): the implied average speed must
+ *       be inside [minSpeed(km), 200] km/h.
+ *     - DURATION ALONE (measured duration, estimated distance): rejected only when NO
+ *       credible road length makes it drivable — too fast even along the great circle,
+ *       or too slow even along the 10x ceiling. Deliberately permissive towards
+ *       over-long durations, because that error over-splits days, which is the safe
+ *       direction.
+ *   A measured distance with no duration needs no time test at all: the duration is
+ *   derived from it at the calibrated speed, so it is in band by construction.
  *   Legs under 1 km are exempt (rounding noise dominates and nothing is at stake).
- *   A cell that fails is treated exactly like a null: discarded and haversine-filled.
+ *   A value that fails is treated exactly like a null: discarded and haversine-filled.
+ *
+ *   THRESHOLDS, from measurement rather than taste:
+ *     - detour ceiling 10x + 50 km. Observed real detours: x1.15–x1.36 across the seven
+ *       Spanish calibration fixtures (published road km vs great circle), ~x2 at the top
+ *       of the reviewer's sweep, and x12.11 for the 9.3 km / 112 km leg above, which is
+ *       real road data that must survive. A x5 ceiling was proposed and is provably too
+ *       tight: 5 * 9.25 = 46 km would reject that 112 km road. 10x sits above every
+ *       observed real value (and above x4–x8 fjord and rainforest geography) and an
+ *       order of magnitude below the x60 case that motivated the ceiling. The +50 km is
+ *       headroom for short legs, where a large ratio is cheap and common (an estuary
+ *       crossing to the nearest bridge).
+ *     - speed floor 5 km/h for short legs, rising linearly to 30 km/h at 300 km. 5 km/h
+ *       is ordinary stop-and-go over 1–3 km. 30 km/h is one third of every measured
+ *       long-haul average (87.6–92.8 km/h, mean 90.6) — below that, a 500 km leg would
+ *       be a 17-hour day, which is not what OSRM's car profile models. The 300 km scale
+ *       is the lower end of the routes those averages were measured on.
+ *     - speed ceiling 200 km/h, flat: OSRM's car profile tops out near 140 km/h on
+ *       motorways, so 200 leaves 43% headroom and no real route averages above it.
  *
  * FALLBACK CALIBRATION — haversine × 1.25 at 90 km/h.
  *   Measured against live OSRM on long Spanish routes: the 1.25 road factor is well
@@ -116,9 +153,14 @@
     const GEO_SPEED_KMH       = 90;                 // fallback average driving speed
     const GEO_EARTH_R_KM      = 6371.0088;
 
-    /* Plausibility floor for values claimed to come from the road graph. */
-    const GEO_MIN_SPEED_KMH   = 5;                  // slower than this is not driving
-    const GEO_MAX_SPEED_KMH   = 200;                // faster than this is not driving
+    /* Plausibility floor for values claimed to come from the road graph.
+       Every threshold below is derived from measurement — see PLAUSIBILITY FLOOR. */
+    const GEO_MIN_SPEED_KMH      = 5;               // floor for a short leg (city traffic)
+    const GEO_MIN_SPEED_LONG_KMH = 30;              // floor once the leg is long-haul
+    const GEO_SPEED_SCALE_KM     = 300;             // where the floor reaches its long-haul value
+    const GEO_MAX_SPEED_KMH      = 200;             // faster than this is not driving, at any length
+    const GEO_MAX_DETOUR         = 10;              // road / great circle ceiling
+    const GEO_DETOUR_SLACK_KM    = 50;              // absolute headroom for short legs
     const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
     const GEO_SHORTFALL_RATIO = 0.90;               // road vs great circle, with slack for
     const GEO_SHORTFALL_SLACK = 0.5;                // OSRM snapping to the nearest road
@@ -589,20 +631,65 @@
         return scale < GEO_PLAUSIBLE_MIN_KM;
     }
 
-    /* A road cannot be materially shorter than the great circle beneath it. */
+    /*
+     * The minimum credible average speed depends on how far you are going. 6 km/h is
+     * ordinary over 2 km of city traffic and absurd sustained over 505 km, so one flat
+     * band cannot judge both. Rises linearly from GEO_MIN_SPEED_KMH to
+     * GEO_MIN_SPEED_LONG_KMH across GEO_SPEED_SCALE_KM, then flat.
+     */
+    function geoMinSpeedFor(km) {
+        const t = Math.min(1, Math.max(0, (isFinite(km) ? km : 0) / GEO_SPEED_SCALE_KM));
+        return GEO_MIN_SPEED_KMH + (GEO_MIN_SPEED_LONG_KMH - GEO_MIN_SPEED_KMH) * t;
+    }
+
+    /* The longest road length that could credibly join two points this far apart. */
+    function geoMaxRoadKm(straightKm) {
+        return (isFinite(straightKm) ? straightKm : 0) * GEO_MAX_DETOUR + GEO_DETOUR_SLACK_KM;
+    }
+
+    /* A road cannot be materially shorter than the great circle beneath it, and it
+       cannot wander an order of magnitude further than it either. */
     function geoDistancePlausible(cellKm, straightKm) {
         if (!isFinite(cellKm) || cellKm < 0) return false;
         if (geoTrivialLeg(cellKm, straightKm)) return true;
-        return cellKm + GEO_SHORTFALL_SLACK >= straightKm * GEO_SHORTFALL_RATIO;
+        if (cellKm + GEO_SHORTFALL_SLACK < straightKm * GEO_SHORTFALL_RATIO) return false;
+        return cellKm <= geoMaxRoadKm(straightKm);
     }
 
-    /* Whatever the pair ends up claiming, a car has to have driven it. */
-    function geoSpeedPlausible(cellKm, cellMin, straightKm) {
+    /*
+     * BOTH halves are real, so the pair validates itself: no estimate is involved and
+     * the implied speed is the genuine article.
+     */
+    function geoPairSpeedPlausible(cellKm, cellMin, straightKm) {
         if (!isFinite(cellKm) || !isFinite(cellMin) || cellKm < 0 || cellMin < 0) return false;
         if (geoTrivialLeg(cellKm, straightKm)) return true;
         if (!(cellMin > 0)) return false;                       // distance in zero time
         const kmh = cellKm / (cellMin / 60);
-        return isFinite(kmh) && kmh >= GEO_MIN_SPEED_KMH && kmh <= GEO_MAX_SPEED_KMH;
+        return isFinite(kmh) && kmh >= geoMinSpeedFor(cellKm) && kmh <= GEO_MAX_SPEED_KMH;
+    }
+
+    /*
+     * ONLY the duration is real. The distance we would divide by is the haversine
+     * ESTIMATE, and an estimate is not a reference for judging a measurement: a leg
+     * whose road detour is 12x the great circle (9.3 km apart, 112 km by road) implies a
+     * fake 4 km/h and the real 140-minute duration gets destroyed and replaced by 7.8.
+     * So the duration is tested only against what geometry actually pins down — the road
+     * is at least the great circle and at most geoMaxRoadKm — and is rejected only when
+     * NO credible road length makes it drivable.
+     * Deliberately permissive towards over-long durations: that error over-splits days,
+     * which is the safe direction. Under-stating drive time is the bug class this branch
+     * exists to kill.
+     */
+    function geoDurationPlausible(cellMin, straightKm) {
+        if (!isFinite(cellMin) || cellMin < 0) return false;
+        if (geoTrivialLeg(0, straightKm)) return true;
+        if (!(cellMin > 0)) return false;                       // a real leg in zero time
+        const hours = cellMin / 60;
+        /* Too fast even along the shortest road that could possibly exist. */
+        if (straightKm / hours > GEO_MAX_SPEED_KMH) return false;
+        /* Too slow even along the longest road that could possibly exist. */
+        const maxRoad = geoMaxRoadKm(straightKm);
+        return (maxRoad / hours) >= geoMinSpeedFor(maxRoad);
     }
 
     function geoOsrmTableUrl(coords, cfg) {
@@ -721,25 +808,34 @@
                 const straightKm = haversineKm(eff[i].lat, eff[i].lon, eff[j].lat, eff[j].lon);
                 const hav = geoHaversineCell(straightKm, cfg);
 
-                /* A distance shorter than the great circle beneath it is not a road. */
+                /* A distance shorter than the great circle beneath it — or ten times
+                   longer than it — is not a road. */
                 let realKm = geoDistancePlausible(rawKm, straightKm);
                 let realMin = isFinite(rawMin);
+
+                /* Each half is judged against what is actually KNOWN about it, never
+                   against the other half's estimate. */
+                if (realKm && realMin) {
+                    /* Both measured: the pair validates itself. When it fails there is no
+                       way to tell which half lied, so both go and the cell is filled
+                       exactly like a null. */
+                    if (!geoPairSpeedPlausible(rawKm, rawMin, straightKm)) {
+                        realKm = false;
+                        realMin = false;
+                    }
+                } else if (realMin) {
+                    /* Measured duration, estimated distance — geometry only. */
+                    if (!geoDurationPlausible(rawMin, straightKm)) realMin = false;
+                }
+                /* A measured distance with no duration needs no time check: the duration
+                   is derived below at the calibrated speed, so it is in band by
+                   construction. */
 
                 let cellKm = realKm ? rawKm : hav.km;
                 /* A real road distance is a better base for an estimated time than the
                    great circle is — prefer it whenever the duration is the missing half. */
                 let cellMin = realMin ? rawMin
                     : (realKm ? (rawKm / cfg.speedKmh) * 60 : hav.min);
-
-                /* Whichever half survived, the pair as a whole must be drivable. When it
-                   is not, there is no way to tell which half lied, so both are discarded
-                   and the cell is filled exactly like a null. */
-                if ((realKm || realMin) && !geoSpeedPlausible(cellKm, cellMin, straightKm)) {
-                    realKm = false;
-                    realMin = false;
-                    cellKm = hav.km;
-                    cellMin = hav.min;
-                }
 
                 if (realKm || realMin) osrmPairs++;
                 if (!realKm || !realMin) filledPairs++;
