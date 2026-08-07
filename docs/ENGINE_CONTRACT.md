@@ -51,6 +51,21 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
   - `filledCells` = off-diagonal cells carrying **any** estimated value
   - `0 <= osrmCells <= dim*(dim-1)` and `0 <= filledCells <= dim*(dim-1)`
   - their sum may exceed `dim*(dim-1)`; it must never be used as a consistency test
+  - but **`osrmCells + filledCells >= dim*(dim-1)`**: every off-diagonal cell holds a km
+    and a min, each of which is either road data or an estimate, so every cell must be
+    attested by at least one counter. A shortfall means cells came from nowhere.
+
+  That last line is a coverage floor, not a partition, and it is load-bearing. Given
+  `M = dim*(dim-1)`, a consumer can derive the two quantities a user actually cares about:
+
+  - wholly estimated cells = `M - osrmCells`
+  - half-real cells (real km with an estimated min, or the reverse) = `osrmCells + filledCells - M`
+
+  The second identity is `|A ∩ B|` and holds only when `|A ∪ B| = M`. Without the floor,
+  a provider reporting `{ source: 'osrm', osrmCells: 1, filledCells: 0 }` on a 3-place
+  matrix passes both laws in silence while five of six cells are unaccounted for — the
+  same class of bug as a guessed matrix labelled clean. A consumer must check the floor
+  and refuse to derive counts when it fails.
 
   The two laws that DO hold **for `dim >= 2`**, and that the engine may rely on:
 
