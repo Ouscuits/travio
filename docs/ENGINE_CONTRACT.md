@@ -23,6 +23,45 @@ Plan     = { days: DayPlan[], order: Place[], totalKm: number, totalMin: number,
              roundTrip: boolean, warnings: string[] }
 ```
 
+## Geocoding provenance (added after a real user hit it)
+
+A user typed `Santillana de Mar, Leon, Fisterra, Lugo` for a trip round northern
+Spain and got 24,179 km and 268 hours. Nothing was broken: `Santillana de Mar`
+resolved to San Luis Potosí (Mexico) and `Leon` to Lyon (France), and the app
+faithfully planned a transatlantic drive. It even warned that 10 of 30 distances
+were straight-line estimates — but framed as a data-quality note, not as *one of
+your destinations is on another continent*.
+
+Ten review rounds went into validating OSRM's answers and none into validating
+Nominatim's. The app took the first hit and checked only that the coordinates
+were in range; a village in Mexico is perfectly in range.
+
+**The app cannot know the user meant Spain** — Lyon → Brittany is a legitimate
+trip. It can know three things, and must act on them:
+
+- **what it chose**: `Place.displayName` carries Nominatim's full label
+  ("San Luis Potosí, México"), never discarded
+- **that a place sits far from the others**: geometry, not guesswork
+- **that the choice was among several**: `Place.candidates` > 1 means the name
+  was ambiguous
+
+```
+Place = { name, lat, lon, resolved, source,
+          displayName: string,      // full label of what was chosen, '' if none
+          candidates: number,       // how many results the geocoder offered
+          chosenByCluster: boolean } // true if a non-first candidate was preferred
+```
+
+`geocodeOutliers(places, opts) -> [{ name, displayName, km }]`
+Places whose distance from the median centre of the resolved set is a large
+multiple of the median spread. Pure, synchronous, no network. Empty for a
+coherent trip.
+
+**Choosing a candidate nearer the cluster is allowed; doing it silently is not.**
+A user whose trip really does span continents must not have a destination
+quietly relocated. Whenever `chosenByCluster` is true, or `candidates > 1`, the
+UI must be able to say which one was taken.
+
 ## `js/geo-provider.js` (Builder B)
 
 - `geocodePlaces(names: string[], opts) -> Promise<Place[]>`
