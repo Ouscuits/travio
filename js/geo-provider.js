@@ -87,25 +87,30 @@
  *   A value that fails is treated exactly like a null: discarded and haversine-filled.
  *
  *   THRESHOLDS, from measurement rather than taste:
- *     - detour ceiling 10x + 50 km. Observed real detours: x1.15–x1.36 across the seven
- *       Spanish calibration fixtures (published road km vs great circle), and x12.11 for
- *       the 9.3 km / 112 km leg above, which is real road data that must survive. A x5
- *       ceiling was proposed and is provably too tight: 5 * 9.25 = 46 km would reject
- *       that 112 km road. The +50 km is headroom for short legs, where a large ratio is
- *       cheap and common (an estuary crossing to the nearest bridge).
- *       Successive rounds each found a worse real detour — x4.45 Helsinki–Stockholm,
- *       x6.51 Athens–Chios, x7.73 Oban–Craignure (16 km across the Sound of Mull, 120 km
- *       around Loch Linnhe) — but every one still cleared, so the ceiling has held.
- *
- *   CAUTION, AND IT BELONGS ON THE DURATION CAP, NOT HERE. A caution against tightening
- *   was written against this ceiling because that was where the trend had shown itself.
- *   It then expressed itself through the DURATION CAP instead: the ceiling has never
- *   rejected a real route, while the cap has now destroyed real routes twice — once by
- *   saturating too high (a 30 km/h floor killed Athens–Iraklio) and once by scaling too
- *   low (crow/3 killed the Woolwich Ferry). The generalisable rule is not "be careful
- *   with the detour ceiling", it is: BEFORE narrowing any bound here, check whether the
- *   fixture contains the case the new bound would exclude. Both duration failures came
- *   from a fixture with no example of the excluded class, not from a mis-chosen constant.
+ *     - detour ceiling 30x + 50 km. This one is DELIBERATELY NOT FITTED, and the reason
+ *       is the most transferable thing in this file. It was fitted, at 10x, and it kept
+ *       producing casualties: the worst real ratio grew every single time a new class of
+ *       geography was measured — x4.45 Helsinki–Stockholm, x6.51 Athens–Chios, x7.73
+ *       Oban–Craignure, x9.38 Oanes–Lauvvik, x13.86 Gedser–Rostock — and at 10x it
+ *       destroyed three real routes outright (Gedser–Rostock, Brindisi–Igoumenitsa,
+ *       Hirtshals–Kristiansand), while Naantali–Kapellskär survived at x9.83 by nothing
+ *       at all. A bound fitted to the worst case yet seen is a bound that fails on the
+ *       next geography anyone tries.
+ *       It can be loose because it has almost no unique work left to do. A distance that
+ *       is not a road is already condemned by the shortfall rule (whole cell), and one
+ *       that disagrees with its duration by the 200 km/h pair-speed guard: 3000 km and
+ *       6000 km in 360 min both clear a 30x ceiling and are both still rejected on speed.
+ *       The ONLY thing the ceiling uniquely catches is a distance that is absurd AND
+ *       internally consistent with its duration — the x60 case, 30 305 km in 202 h at
+ *       150 km/h. That case pins the ONLY hard constraint: the ceiling must stay below
+ *       x59.9, or it stops doing its one job. So the bound is placed at the geometric
+ *       midpoint of the two things that actually constrain it — x13.86 (worst measured
+ *       real) and x59.9 (junk) is x28.8, hence 30x. That is x2.16 clear of any real route
+ *       and x2.00 clear of failing its purpose, and it is derived from the constraints
+ *       rather than from the data's current extreme.
+ *       The +50 km is headroom for short legs, where a large ratio is cheap and common
+ *       (an estuary crossing to the nearest bridge). On short legs the slack, not the
+ *       ratio, is what carries them.
  *     - speed ceiling 200 km/h, flat: OSRM's car profile tops out near 140 km/h on
  *       motorways, so 200 leaves 43% headroom and no real route averages above it.
  *
@@ -165,6 +170,27 @@
  *   resolve. A measured duration was being replaced by an estimate 35x smaller — the
  *   same failure, in the same direction, that this file already treated as disqualifying
  *   at long range, reintroduced at short range and worse in degree.
+ *
+ *   RETRACTED, AGAIN, AND THIS IS THE PATTERN WORTH LEARNING. This file also asserted
+ *   "the ceiling has never rejected a real route", and cited x5.23 of headroom at
+ *   Oanes–Lauvvik as evidence it was safe. Both were false, and false the SAME WAY as
+ *   the 74 km premise above: the headroom was computed over a population that contained
+ *   no enclosed-sea crossing, so it characterised the wrong distribution and described a
+ *   safety that did not exist. Measuring a bound's margin against the fixture is only
+ *   meaningful if the fixture contains the class that would stress it — otherwise the
+ *   margin is a statement about what was measured, not about the bound.
+ *   Switching from a ratio band to headroom was the right instinct and is kept; it just
+ *   cannot rescue a population with a hole in it.
+ *   The two failures rhyme exactly: each new class of geography (narrow crossings, then
+ *   enclosed seas) falsified a bound that looked safe, because the evidence for "safe"
+ *   was drawn from data that excluded it. Hence:
+ *     - BEFORE narrowing any bound here, check whether the fixture contains the case the
+ *       new bound would exclude — and if the class does not exist in it, go and measure
+ *       it rather than reasoning about it;
+ *     - PREFER a bound derived from what actually constrains it (see the detour ceiling)
+ *       over one fitted to the worst case observed so far. Every bound in this file that
+ *       was fitted to observation has since produced a casualty; the failures were never
+ *       mis-chosen constants, they were confident generalisations from incomplete data.
  *
  *   WHICH DIRECTION IS "SAFE" — this file makes two calls that look opposed:
  *   FALLBACK CALIBRATION says a pessimistic speed is bad because it over-splits days,
@@ -236,7 +262,8 @@
     const GEO_ALLOWANCE_PER_CROW_MIN = 20;          // scaled by separation: crow / 3 in hours
     const GEO_MIN_CROSSING_ALLOWANCE_MIN = 120;     // floor: a narrow crossing is still a crossing
     const GEO_MIN_SUSTAINED_KMH  = 30;              // slowest sustained progress once moving
-    const GEO_MAX_DETOUR         = 10;              // road / great circle ceiling
+    const GEO_MAX_DETOUR         = 30;              // road / great circle — a LOOSE sanity
+                                                    // bound, deliberately not fitted
     const GEO_DETOUR_SLACK_KM    = 50;              // absolute headroom for short legs
     const GEO_PLAUSIBLE_MIN_KM = 1;                 // below this, nothing is at stake
     const GEO_SHORTFALL_RATIO = 0.90;               // road vs great circle, with slack for

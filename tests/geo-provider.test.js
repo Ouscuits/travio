@@ -1354,8 +1354,14 @@ test('matrix D10: there is no duration cliff on a durations-only reply', async f
         assert.strictEqual(m.source, 'mixed', mins + ' min: road data reached the matrix');
     }
 
-    /* The outer bound still exists — the test is one-sided, not absent. */
-    for (const mins of [600, 1440, 4000]) {
+    /* The outer bound still exists — the test is one-sided, not absent. It is DERIVED,
+       not independent: with no distance in the reply the road is bounded by the detour
+       ceiling, so this boundary moves whenever that ceiling does. It has moved three
+       times (3165 min under the flat allowance, 470 once the allowance was scaled, 840
+       now that the ceiling is 30x). Each move is a consequence of a bound elsewhere, not
+       a new judgement about this pair — which is why only clearly-absurd values are
+       asserted here rather than a value near the edge. */
+    for (const mins of [1440, 4000, 20000]) {
         const absurd = makeFetch(function () { return { code: 'Ok', durations: [[0, mins * 60], [mins * 60, 0]] }; });
         const m = await distanceMatrix([DETOUR_A, DETOUR_B], { fetchImpl: absurd, storage: null, minIntervalMs: 0 });
         assert.strictEqual(m.source, 'haversine',
@@ -1570,7 +1576,30 @@ const FERRY_ROUTES = [
     ['Sandbanks-Studland',   50.6845, -1.9450,  50.6790, -1.9500,  0.79,  4.7],
     ['KingHarry-Fal',        50.2205, -5.0290,  50.2210, -5.0240,  0.09,  0.2],
     ['Dartmouth-Kingswear',  50.3510, -3.5800,  50.3505, -3.5720,  1.38,  6.6],
-    ['Torpoint-Devonport',   50.3745, -4.1940,  50.3720, -4.1830,  2.19, 11.5]
+    ['Torpoint-Devonport',   50.3745, -4.1940,  50.3720, -4.1830,  2.19, 11.5],
+    /* Round 8: ENCLOSED SEAS — the exact complement of round 7's hole. Here the crossing
+       is short but OSRM declines the ferry and drives around the whole sea, so the
+       highest detour ratios occur at LONG crow lines, not short ones. The Baltic and the
+       Adriatic were absent from the fixture as crossings entirely, which is why a x10
+       ceiling looked safe while destroying three of these. */
+    ['Gedser-Rostock',       54.5740, 11.9260,  54.1780, 12.0930,   629,  426],
+    ['Brindisi-Igoumenitsa', 40.6420, 17.9460,  39.5040, 20.2650,  2601, 1626],
+    ['Hirtshals-Kristiansand', 57.5880, 9.9600, 58.1460, 7.9950,   1375,  972],
+    ['Naantali-Kapellskar',  60.4680, 22.0250,  59.7200, 19.0700,  1805, 1434],
+    ['Bari-Durres',          41.1280, 16.8670,  41.3230, 19.4560,  1914, 1404],
+    ['Frederikshavn-Goteborg', 57.4410, 10.5360, 57.7089, 11.9746,  785,  510],
+    ['Trelleborg-Sassnitz',  55.3720, 13.1570,  54.5150, 13.6430,   788,  498],
+    ['Umea-Vaasa',           63.8258, 20.2630,  63.0960, 21.6160,   838,  672],
+    ['Stockholm-Tallinn',    59.3293, 18.0686,  59.4370, 24.7536,  2930, 1968],
+    ['Turku-Stockholm',      60.4518, 22.2666,  59.3293, 18.0686,  1773, 1398],
+    ['Piombino-Bastia',      42.9236, 10.5247,  42.7000, 9.4500,    694,  768],
+    ['Klaipeda-Karlshamn',   55.7030, 21.1440,  56.1700, 14.8600,  2101, 1278],
+    ['Ystad-Swinoujscie',    55.4290, 13.8200,  53.9100, 14.2470,   833,  546],
+    ['Ancona-Split',         43.6160, 13.5190,  43.5081, 16.4402,   992,  654],
+    ['Livorno-GolfoAranci',  43.5480, 10.3100,  40.9950, 9.6150,    869, 1032],
+    ['Rodby-Puttgarden',     54.6540, 11.3560,  54.5050, 11.2280,    24,   60],
+    ['Ystad-Ronne',          55.4290, 13.8200,  55.1000, 14.7000,     76,  90],
+    ['Kiel-Goteborg',        54.3233, 10.1394,  57.7089, 11.9746,   708,  468]
 ];
 
 test('matrix D12: every live-measured ferry route survives as clean road data', async function () {
@@ -1649,6 +1678,65 @@ test('matrix D12: no average-speed threshold could have separated these from jun
     });
     const bogus = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: junk, storage: null, minIntervalMs: 0 });
     assert.strictEqual(bogus.source, 'haversine', '7.4 km/h over 620 km is not a road journey');
+});
+
+test('matrix D15: the detour ceiling is a loose sanity bound, not a fitted one', async function () {
+    /* Reported repro: at x10 the ceiling destroyed real routes. Enclosed seas produce the
+       HIGHEST ratios at LONG crow lines — the crossing is short but OSRM declines the
+       ferry and drives around the whole sea — which is the opposite of what this suite
+       previously assumed, and the +50 km slack is only 8% of a 629 km road so it cannot
+       help. All three were silent understatements of drive time. */
+    const casualties = [
+        ['Gedser-Rostock (Baltic)',        [54.5740, 11.9260], [54.1780, 12.0930],  629,  426],
+        ['Brindisi-Igoumenitsa (Adriatic)', [40.6420, 17.9460], [39.5040, 20.2650], 2601, 1626],
+        ['Hirtshals-Kristiansand (Skagerrak)', [57.5880, 9.9600], [58.1460, 7.9950], 1375, 972]
+    ];
+    for (const [label, a, b, roadKm, minutes] of casualties) {
+        const crow = haversineKm(a[0], a[1], b[0], b[1]);
+        assert.ok(roadKm > crow * 10 + 50, label + ': fixture must be one the x10 ceiling killed');
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, roadKm * 1000], [roadKm * 1000, 0]],
+                durations: [[0, minutes * 60], [minutes * 60, 0]]
+            };
+        });
+        const m = await distanceMatrix([place('A', a[0], a[1]), place('B', b[0], b[1])],
+            { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assertMatrixInvariants(m, 2, 'D15 ' + label);
+        assert.strictEqual(m.source, 'osrm',
+            label + ' (x' + (roadKm / crow).toFixed(2) + ') is an ordinary drivable answer');
+        assert.strictEqual(m.min[0][1], minutes, label + ': measured duration kept');
+    }
+
+    /* The ceiling's ONE unique job still gets done: a distance that is absurd AND
+       internally consistent with its duration, which nothing downstream would catch. */
+    const selfConsistent = makeFetch(function () {
+        return {
+            code: 'Ok',
+            distances: [[0, 30305780], [30305780, 0]],
+            durations: [[0, 202 * 3600], [202 * 3600, 0]]     // 150 km/h along it — in band
+        };
+    });
+    const junk = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: selfConsistent, storage: null, minIntervalMs: 0 });
+    assertMatrixInvariants(junk, 2, 'D15 x60 self-consistent');
+    assert.strictEqual(junk.source, 'haversine', 'the x60 case must still die on distance');
+    assert.strictEqual(junk.osrmCells, 0);
+
+    /* And everything else the ceiling used to catch is caught downstream anyway, which
+       is what lets it be loose: these clear a 30x ceiling and die on the speed guard. */
+    for (const [label, roadKm] of [['3000 km in 360 min', 3000], ['6000 km in 360 min', 6000]]) {
+        assert.ok(roadKm <= 505 * 30 + 50, label + ' clears the 30x ceiling on distance');
+        const fetchImpl = makeFetch(function () {
+            return {
+                code: 'Ok',
+                distances: [[0, roadKm * 1000], [roadKm * 1000, 0]],
+                durations: [[0, 21600], [21600, 0]]
+            };
+        });
+        const m = await distanceMatrix([MADRID, BARCELONA], { fetchImpl: fetchImpl, storage: null, minIntervalMs: 0 });
+        assert.strictEqual(m.source, 'haversine', label + ' is still rejected, by the 200 km/h guard');
+    }
 });
 
 test('matrix D14: a narrow crossing is still a crossing', async function () {
@@ -1782,29 +1870,31 @@ test('matrix D12: the 22nd measured route is correctly refused — OSRM answered
     assert.ok(m.km[0][1] > 30, 'the estimate at least describes the requested pair, got ' + m.km[0][1]);
 });
 
-test('matrix D12: the x10 detour ceiling still clears every measured route', async function () {
-    /* Successive measurement rounds keep finding worse real detour RATIOS: x4.45
-       Helsinki-Stockholm, x6.51 Athens-Chios, x7.50 Oban-Craignure, and now x9.38
-       Oanes-Lauvvik (1.28 km across the Lysefjord, 12 km by road). Every one still
-       clears, and the reason is worth stating: on short legs it is the +50 km ABSOLUTE
-       slack that carries them, not the x10 ratio — Oanes-Lauvvik is x9.38 of ratio but
-       x5.23 of actual headroom against a 62.8 km ceiling. The binding constraint is the
-       ratio only on long legs, where measured detours are far smaller. So the operative
-       assertion is headroom, and the ratio is recorded to keep the trend visible. */
+test('matrix D12: the detour ceiling clears every measured route, with room to spare', async function () {
+    /* The worst measured real ratio has grown EVERY time a new class of geography was
+       measured: x4.45 Helsinki-Stockholm, x6.51 Athens-Chios, x7.73 Oban-Craignure,
+       x9.38 Oanes-Lauvvik, x13.86 Gedser-Rostock. That is why the ceiling is no longer
+       fitted to it — see D15. The assertion here is headroom, which is the operative
+       quantity, but note what round 8 taught: headroom measured over a population that
+       lacks the stressing class describes the wrong distribution. It said x5.23 when
+       three real routes were in fact being destroyed, because no enclosed-sea crossing
+       was in the fixture. The number is only as good as the fixture behind it. */
     let worstRatio = 0, worstName = '';
     let tightest = Infinity, tightestName = '';
     for (const [name, aLat, aLon, bLat, bLon, roadKm] of FERRY_ROUTES) {
         const crow = haversineKm(aLat, aLon, bLat, bLon);
         const ratio = roadKm / crow;
-        const headroom = (crow * 10 + 50) / roadKm;
+        const headroom = (crow * 30 + 50) / roadKm;
         if (ratio > worstRatio) { worstRatio = ratio; worstName = name; }
         if (headroom < tightest) { tightest = headroom; tightestName = name; }
-        assert.ok(roadKm <= crow * 10 + 50,
+        assert.ok(roadKm <= crow * 30 + 50,
             name + ' detour x' + ratio.toFixed(2) + ' must clear the ceiling');
     }
-    assert.ok(tightest > 1.2, 'tightest ceiling headroom is ' + tightestName +
+    assert.ok(tightest > 1.5, 'tightest ceiling headroom is ' + tightestName +
         ' at x' + tightest.toFixed(2) + ' (worst ratio: ' + worstName + ' x' + worstRatio.toFixed(2) + ')');
-    assert.ok(worstRatio > 6, 'the worst measured ratio has only ever grown, now ' +
+    /* The fixture must actually CONTAIN the enclosed-sea class, or the line above is
+       measuring nothing. This is the guard the previous three rounds each lacked. */
+    assert.ok(worstRatio > 13, 'the fixture must contain an enclosed-sea crossing; worst is ' +
         worstName + ' x' + worstRatio.toFixed(2));
 });
 
