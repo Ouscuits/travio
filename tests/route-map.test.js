@@ -943,14 +943,42 @@ test('P an unknown source does not borrow the straight-line wording', function (
     const unknown = renderMapSvg(buildMapView({
         plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY.slice()
     }), null);
-    assert.ok(unknown.indexOf('map.sourceUnknown') !== -1);
-    assert.ok(unknown.indexOf('map.unknownSourceNote') !== -1);
-    assert.ok(unknown.indexOf('map.straightLineNote') === -1,
-        'an unlabelled polyline is not known to be a straight line either');
+    /* It makes no claim about the shape at all — an unlabelled polyline is not
+       known to be a straight line either — but it is unmistakably not road data. */
+    assert.ok(unknown.indexOf('map.straightLineNote') === -1);
+    assert.ok(unknown.indexOf('map.sourceStraight') === -1);
+    assert.ok(unknown.indexOf('map.sourceRoad') === -1);
+    assert.ok(unknown.indexOf('stroke-dasharray') !== -1);
+    assert.ok(unknown.indexOf('data-geometry-real="false"') !== -1);
+    assert.ok(unknown.indexOf('data-geometry-source="unknown"') !== -1);
 
     const straight = renderMapSvg(buildMapView({ plan: FOUR_DAY_PLAN }), null);
     assert.ok(straight.indexOf('map.sourceStraight') !== -1);
-    assert.ok(straight.indexOf('map.sourceUnknown') === -1);
+    assert.ok(straight.indexOf('map.straightLineNote') !== -1);
+    assert.ok(straight.indexOf('data-geometry-source="straight"') !== -1);
+});
+
+test('P the SVG carries its provenance machine-readably, needing no translation', function () {
+    const road = renderMapSvg(buildMapView({ plan: FOUR_DAY_PLAN, geometry: BIG_GEOMETRY }), null);
+    assert.ok(road.indexOf('data-geometry-real="true"') !== -1);
+    assert.ok(road.indexOf('data-geometry-source="osrm"') !== -1);
+    /* An SVG saved or printed on its own still states what it is. */
+    assert.ok(road.indexOf('map.sourceRoad') !== -1);
+});
+
+test('P the module uses no i18n key that js/i18n.js does not define', function () {
+    /* The wiring test W9 scans this file for 'map.*' literals and requires each
+       one in all five locales. Keeping the list closed here means this module can
+       never be the reason a raw developer key renders on a user's screen. */
+    const src = fs.readFileSync(MAP_PATH, 'utf8');
+    const used = (src.match(/'map\.[a-zA-Z]+'/g) || [])
+        .map(function (s) { return s.slice(1, -1); })
+        .filter(function (k, i, a) { return a.indexOf(k) === i; })
+        .sort();
+    assert.deepStrictEqual(used, [
+        'map.dayLabel', 'map.noRoute', 'map.sourceRoad',
+        'map.sourceStraight', 'map.straightLineNote', 'map.title'
+    ]);
 });
 
 test('P every non-road verdict is also carried in view.warnings for the caller', function () {

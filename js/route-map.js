@@ -135,12 +135,24 @@
  *
  * TRANSLATION KEYS read through `ctx.t` (all fall back to the key itself, so the
  * module is usable before i18n.js carries them):
- *   map.title  map.noRoute  map.sourceRoad  map.sourceStraight  map.sourceUnknown
- *   map.straightLineNote  map.unknownSourceNote  map.dayLabel {day}{from}{to}
- *   map.legend {day}
- * `map.sourceUnknown` and `map.unknownSourceNote` are new in round 2: an
- * unlabelled line must not borrow the straight-line wording, because it is not
- * known to be straight either — only its provenance is known to be missing.
+ *   map.title  map.noRoute  map.sourceRoad  map.sourceStraight
+ *   map.straightLineNote  map.dayLabel {day}{from}{to}  map.legend {day}
+ *
+ * KNOWN LIMITATION — the unknown-provenance state has no words of its own.
+ *   A line whose label was lost is dashed, is excluded from every road claim,
+ *   appears in `view.warnings` as `geometry-source-unknown:X`, and is marked
+ *   `data-geometry-real="false"` / `data-geometry-source="unknown"` on the SVG
+ *   root — but it prints NO caption, because the only captions that exist say
+ *   "straight lines between the stops", and an unlabelled polyline is not known
+ *   to be straight. Printing that would be a fresh falsehood on top of the lost
+ *   label, so the module says nothing about the shape instead.
+ *   The user is still told: js/route-form.js renders a full-sentence notice for
+ *   any `geometryReal !== true`, on screen and in the printed export.
+ *   The fix is two i18n keys — `map.sourceUnknown` and `map.unknownSourceNote`,
+ *   wording along the lines of "the origin of this line could not be confirmed;
+ *   treat it as an estimate" — in all five locales. Not done here because
+ *   js/i18n.js is owned by another builder and was mid-edit; a caption that lies
+ *   was the worse of the two available compromises.
  *
  * `view.warnings` — codes for the caller to surface, in the engine's
  * `code:detail` style. Nothing here is rendered by this module beyond the
@@ -1043,22 +1055,33 @@
         const real = view.geometryReal === true;
 
         const title = tr(ctx, 'map.title');
-        /* Three source states, three captions. 'unknown' must NOT borrow the
-           straight-line wording: an unlabelled polyline is not known to be a
-           straight line either, and saying so would be a second invention on top
-           of the first. What is true is that its provenance is unknown. */
-        const srcKey = real ? 'map.sourceRoad'
-            : (view.geometrySource === 'straight' || view.geometrySource === 'none'
-                ? 'map.sourceStraight' : 'map.sourceUnknown');
-        const noteKey = (view.geometrySource === 'straight' || view.geometrySource === 'none')
-            ? 'map.straightLineNote' : 'map.unknownSourceNote';
-        const desc = tr(ctx, srcKey);
+        /* THREE source states, but only TWO of them may make a claim about the
+           SHAPE of the line:
+             'osrm'              -> drawn from the road network;
+             'straight'/'none'   -> straight lines between the stops;
+             'unknown'           -> SAYS NOTHING about the shape. An unlabelled
+                                    polyline is not known to be straight either,
+                                    so borrowing the straight-line wording would
+                                    print a false description of the picture the
+                                    user is looking at — a second invention on top
+                                    of the lost label.
+           The unknown state is still dashed, still excluded from any road claim,
+           and still carried in `view.warnings` and in the machine-readable
+           data-geometry-* attributes below, which need no translation and survive
+           the SVG being exported on its own. See the known limitation in the
+           header about the wording this state deserves and does not yet have. */
+        const straightShape = view.geometrySource === 'straight' || view.geometrySource === 'none';
+        const desc = real ? tr(ctx, 'map.sourceRoad') : (straightShape ? tr(ctx, 'map.sourceStraight') : '');
+        const label = desc ? title + ' — ' + desc : title;
 
         let svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' +
             fmt(w) + ' ' + fmt(h) + '" preserveAspectRatio="xMidYMid meet" ' +
-            'overflow="hidden" role="img" aria-label="' + esc(title + ' — ' + desc) + '" ' +
+            'overflow="hidden" role="img" aria-label="' + esc(label) + '" ' +
+            'data-geometry-real="' + (real ? 'true' : 'false') + '" ' +
+            'data-geometry-source="' + esc(view.geometrySource || 'none') + '" ' +
             'class="travio-map" style="width:100%;height:auto;display:block">';
-        svg += '<title>' + esc(title) + '</title><desc>' + esc(desc) + '</desc>';
+        svg += '<title>' + esc(title) + '</title>';
+        if (desc) svg += '<desc>' + esc(desc) + '</desc>';
         svg += '<rect x="0" y="0" width="' + fmt(w) + '" height="' + fmt(h) +
             '" rx="10" fill="' + BG_COLOR + '"/>';
 
@@ -1117,10 +1140,14 @@
 
         /* The fallback caption. Printed INSIDE the artefact, so it survives being
            saved, printed or screenshotted away from the page that built it. */
-        if (!real) {
+        /* Only the straight-line state gets the printed caption, because it is the
+           only non-road state whose shape can be described truthfully with the
+           wording that exists. Every non-road state is dashed and carries
+           data-geometry-real="false". */
+        if (!real && straightShape) {
             svg += '<text x="' + fmt(w / 2) + '" y="' + fmt(h - 10) +
                 '" text-anchor="middle" font-family="Space Mono, monospace" font-size="11" fill="' +
-                MUTED_COLOR + '">' + esc(tr(ctx, noteKey)) + '</text>';
+                MUTED_COLOR + '">' + esc(tr(ctx, 'map.straightLineNote')) + '</text>';
         }
         return svg + '</svg>';
     }
