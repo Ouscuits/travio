@@ -29,14 +29,14 @@
  *       tol 0.50 km -> 252 pts, max error 0.49 km   <- default
  *       tol 1.00 km -> 131 pts, max error 0.99 km
  *   0.5 km of error is roughly one screen pixel at national zoom: invisible on a
- *   phone, 40x smaller on the wire. `view.geometry` hands back the SIMPLIFIED
+ *   phone, 36x smaller on the wire. `view.geometry` hands back the SIMPLIFIED
  *   line precisely so that the thing a caller persists is the small one.
  *
  *   TWO different payloads come out of one simplification, and they are not the
  *   same size — quoting one for the other is how a 5 KB line gets budgeted at
  *   2.8 KB:
- *     · what the SVG DRAWS — 2-decimal viewBox units, ~12 bytes a point, so the
- *       default tolerance ships ~3.3 KB of <path d="...">;
+ *     · what the SVG DRAWS — 2-decimal viewBox units, ~14.5 bytes a point, so the
+ *       default tolerance ships ~4.1 KB of <path d="...">;
  *     · what Firestore STORES — `view.geometry`, 5-decimal lat/lon (the precision
  *       decodePolyline gives), ~19 bytes a point, so ~5.4 KB.
  *   Both are reported: `view.geometryBytes` is the stored one, because that is
