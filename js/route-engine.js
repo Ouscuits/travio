@@ -21,7 +21,11 @@
 
    Matrix trust: matrix.source is the provider's claim and osrmCells/filledCells are the
    evidence for it. When they contradict each other the counters win and the contradiction
-   is reported. Negative cells are rejected outright, never subtracted from the totals.
+   is reported; when the counters fail the contract's coverage floor, cells came from
+   nowhere and no figure is derived from them; when they are absent altogether the one
+   label that buys silence ('osrm') is reported as unverified. Every quantity the engine
+   states about the matrix is derivable from the counters, or it is not stated. Negative
+   cells are rejected outright, never subtracted from the totals.
 
    Documented deviations from the contract (all reported through Plan.warnings):
 
@@ -702,68 +706,101 @@
            min, which can have different provenance: OSRM's default /table reply annotates
            durations only, and a distances-only reply is equally possible, so such a cell
            is half real and half estimated and is counted in both. osrmCells + filledCells
-           may therefore exceed the off-diagonal count and must never be used as a
-           consistency test — doing so raised a false alarm on the commonest real OSRM
-           reply. The two laws that do hold are:
-               filledCells === 0  <=>  source === 'osrm'
-               osrmCells   === 0  <=>  source === 'haversine'
-           plus the range 0 <= counter <= off-diagonal. Only those are checked. */
+           may therefore exceed the off-diagonal count and must never be used as an
+           equality test — doing so raised a false alarm on the commonest real OSRM reply.
+           What does hold is a coverage FLOOR: every cell holds a km and a min, each of
+           them road data or an estimate, so every cell is attested by at least one
+           counter and osrmCells + filledCells >= off-diagonal. That floor is what makes
+           the derived counts below meaningful, so it is checked:
+               filledCells === 0            <=>  source === 'osrm'
+               osrmCells   === 0            <=>  source === 'haversine'
+               0 <= each counter <= off-diagonal
+               osrmCells + filledCells      >=   off-diagonal
+           A shortfall means cells came from nowhere: { source: 'osrm', osrmCells: 1,
+           filledCells: 0 } on a 3-place matrix satisfies both laws while five of six
+           cells are unattested — the guessed-matrix-labelled-clean bug wearing a
+           different hat. When the floor fails the engine derives no count at all. */
         /* A 1x1 matrix has no off-diagonal cell, so there is no distance to characterise
            and nothing the counters could describe. Saying anything here is a false alarm. */
         if (matrix && dim > 1) {
             const src = matrix.source;
             const offDiagonal = dim * (dim - 1);
             const known = (src === 'osrm' || src === 'mixed' || src === 'haversine');
-            const hasOsrm = Number.isInteger(matrix.osrmCells);
-            const hasFilled = Number.isInteger(matrix.filledCells);
-            const osrmCells = hasOsrm ? matrix.osrmCells : null;
-            const filled = hasFilled ? matrix.filledCells : null;
-
-            function inRange(v) {
-                return v !== null && v >= 0 && v <= offDiagonal;
+            /* A counter counts, so it must be a whole number of cells that exist. */
+            function counterOf(v) {
+                return Number.isInteger(v) && v >= 0 && v <= offDiagonal ? v : null;
             }
-            /* Present but not a whole number, negative, or larger than the matrix. */
-            const outOfRange =
-                (matrix.osrmCells !== undefined && (!hasOsrm || !inRange(osrmCells))) ||
-                (matrix.filledCells !== undefined && (!hasFilled || !inRange(filled)));
-            /* Every off-diagonal cell holds a km and a min, so every cell must be counted
-               by at least one counter. Both zero on a non-trivial matrix is impossible. */
-            const accountsForNothing =
-                inRange(osrmCells) && inRange(filled) && offDiagonal > 0 &&
-                osrmCells === 0 && filled === 0;
-            const countersBroken = outOfRange || accountsForNothing;
+            const gaveOsrm = matrix.osrmCells !== undefined && matrix.osrmCells !== null;
+            const gaveFilled = matrix.filledCells !== undefined && matrix.filledCells !== null;
+            const osrmCells = counterOf(matrix.osrmCells);
+            const filled = counterOf(matrix.filledCells);
+            const outOfRange = (gaveOsrm && osrmCells === null) || (gaveFilled && filled === null);
 
-            /* What the counters, on their own, say the matrix is — by the two laws only.
-               A single counter is decisive only when it is zero; a non-zero one merely
-               refutes one of the three labels, which is not enough to name the source. */
+            /* Coverage floor. Because the counters overlap, osrmCells + filledCells is an
+               UPPER bound on how many distinct cells they attest, so a sum below the
+               off-diagonal count proves cells came from nowhere. This subsumes the
+               both-counters-zero corner, which is just the extreme case of a shortfall.
+
+               The two laws are biconditionals, so a known label pins the counter the
+               provider left out ('osrm' => filledCells 0, 'haversine' => osrmCells 0).
+               That is used ONLY to refute — to find a shortfall the supplied counter alone
+               could not reveal. It is never used to confirm a label: letting a claim
+               supply its own evidence is precisely how an unbacked 'osrm' would clear
+               itself, which is the hole this whole section exists to close. */
+            const osrmForFloor = osrmCells !== null ? osrmCells : (src === 'haversine' ? 0 : null);
+            const filledForFloor = filled !== null ? filled : (src === 'osrm' ? 0 : null);
+            const attested = (!outOfRange && osrmForFloor !== null && filledForFloor !== null)
+                ? osrmForFloor + filledForFloor : null;
+            const coverageShort = attested !== null && attested < offDiagonal;
+
+            /* What the counters alone prove. These are statements ABOUT THE COUNTERS, via
+               the two biconditional laws, so they stay sound however few cells the
+               counters cover — unlike the derived quantities below, which do not. */
+            const bothZero = osrmCells === 0 && filled === 0 && offDiagonal > 0;
             let counted = null;
-            if (!countersBroken) {
-                if (inRange(osrmCells) && inRange(filled)) {
-                    if (filled === 0) counted = 'osrm';
-                    else if (osrmCells === 0) counted = 'haversine';
-                    else counted = 'mixed';
-                } else if (inRange(filled) && filled === 0) counted = 'osrm';
-                else if (inRange(osrmCells) && osrmCells === 0) counted = 'haversine';
+            if (!outOfRange && !bothZero) {
+                if (filled === 0) counted = 'osrm';                       // law 1
+                else if (osrmCells === 0) counted = 'haversine';          // law 2
+                else if (osrmCells !== null && filled !== null) counted = 'mixed';
             }
+            /* osrmCells === 0 means no cell carries any road value, and every cell holds a
+               km and a min, so every one of them is an estimate. That needs no coverage
+               check — it is the one every-cell claim the counters can actually prove. */
+            const noRoadProven = !outOfRange && !bothZero && osrmCells === 0;
 
             /* Cells whose km AND min are both estimates, versus cells that mix the two.
                |A n B| = |A| + |B| - offDiagonal, so entirely-estimated = offDiagonal - A
-               and part-estimated = A + B - offDiagonal. No extra counter is needed. */
+               and part-estimated = A + B - offDiagonal. Both identities assume the
+               counters cover every cell (|A u B| = offDiagonal), so neither may be
+               computed unless the floor holds and both counters were actually supplied. */
             let whollyEstimated = null;
             let partlyEstimated = null;
-            if (inRange(osrmCells) && inRange(filled) && !countersBroken) {
+            if (!outOfRange && !coverageShort && osrmCells !== null && filled !== null) {
                 whollyEstimated = offDiagonal - osrmCells;
                 partlyEstimated = Math.max(0, osrmCells + filled - offDiagonal);
             }
 
-            if (countersBroken) {
+            if (outOfRange) {
                 warnings.push('distance-source: the matrix counters (osrmCells ' +
                     String(matrix.osrmCells) + ', filledCells ' + String(matrix.filledCells) +
-                    ') ' + (outOfRange
-                        ? 'are not whole cell counts between 0 and ' + offDiagonal
-                        : 'account for none of the ' + offDiagonal + ' off-diagonal cells') +
+                    ') are not whole cell counts between 0 and ' + offDiagonal +
                     ', so the provenance of these distances cannot be confirmed.');
-            } else if (counted && known && counted !== src) {
+            } else if (coverageShort) {
+                warnings.push('distance-source: the matrix counters (osrmCells ' +
+                    (osrmCells === null ? String(osrmForFloor) + ', implied by the "' + src +
+                        '" label' : String(osrmCells)) +
+                    ' + filledCells ' +
+                    (filled === null ? String(filledForFloor) + ', implied by the "' + src +
+                        '" label' : String(filled)) +
+                    ') attest at most ' + attested + ' of the ' + offDiagonal +
+                    ' off-diagonal cells, leaving ' + (offDiagonal - attested) +
+                    ' unaccounted for; where those distances came from cannot be confirmed, ' +
+                    'so no count of estimated legs is derived from them.');
+            }
+            /* The laws are about the counters themselves, so a contradiction is sound
+               however few cells they cover — it is reported alongside a shortfall, not
+               swallowed by it. */
+            if (!outOfRange && counted && known && counted !== src) {
                 warnings.push('distance-source: the matrix is labelled "' + src + '" but its ' +
                     'own counters say "' + counted + '" (' +
                     (osrmCells === null ? '?' : osrmCells) + ' road cells, ' +
@@ -772,10 +809,13 @@
             }
 
             /* Report on the evidence when there is any, otherwise on the label. */
-            const effective = countersBroken ? src : (counted || src);
+            const effective = (outOfRange ? null : counted) || src;
             if (effective === 'haversine') {
-                warnings.push('distance-source: no road data at all — every distance is a ' +
-                    'straight-line estimate, not a driving distance.');
+                /* "every distance" is only a fact when osrmCells === 0 says so. On the
+                   label alone it is the provider's claim, and must read as one. */
+                warnings.push('distance-source: no road data' +
+                    (noRoadProven ? ' at all' : ' is claimed for this matrix') +
+                    ' — every distance is a straight-line estimate, not a driving distance.');
             } else if (effective === 'mixed') {
                 /* "N of M cells are straight-line estimates" overstates the damage when
                    those cells still carry a real road distance and only the duration was
@@ -793,8 +833,14 @@
                         'real road value with an estimated one alongside it (the routing ' +
                         'service returned distances or durations, not both)';
                 } else {
+                    /* State the fact and offer the cause as an example. A wholly estimated
+                       cell can just as easily mean the routing service returned neither
+                       annotation, or the request failed outright — naming islands and
+                       ferries as THE reason is a diagnosis the engine cannot make. */
                     detail = whollyEstimated + ' of ' + offDiagonal + ' matrix cells are ' +
-                        'straight-line estimates (unroutable pairs such as islands or ferries)';
+                        'straight-line estimates (unroutable pairs such as islands or ' +
+                        'ferries are one cause, a routing request that returned nothing ' +
+                        'is another)';
                 }
                 warnings.push('distance-source: partial road data — ' + detail +
                     ', not measured driving data.');
@@ -803,9 +849,21 @@
                     '"; the distances cannot be confirmed as road data.');
             }
             /* An unusable label is worth saying even when the counters rescue the verdict. */
-            if (!known && counted && !countersBroken) {
+            if (!known && counted) {
                 warnings.push('distance-source: unknown matrix source "' + String(src) +
                     '"; the distances cannot be confirmed as road data.');
+            }
+            /* 'osrm' is the one label that buys silence, and the counters are the only
+               evidence for it. If they are absent — or present but not decisive, e.g. a
+               lone osrmCells — nothing at all supports the claim that every cell came from
+               the road graph, which is exactly the gap the round-1 guessed-matrix bug went
+               through. It is unverified rather than disproven, so it gets a softer warning
+               than a contradiction and only in this one case: 'mixed' and 'haversine'
+               already warn on the label alone, so the user has been told regardless. */
+            if (src === 'osrm' && !outOfRange && !coverageShort && counted === null) {
+                warnings.push('distance-source: the matrix is labelled "osrm" but does not ' +
+                    'supply a usable osrmCells/filledCells pair, so nothing backs the claim ' +
+                    'that every distance came from the road graph; treat it as unverified.');
             }
         }
 

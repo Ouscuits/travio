@@ -914,6 +914,141 @@ test('B5: the counters OVERLAP — their sum exceeding the cell count is not an 
         'B5: a single-place matrix has no distance to characterise and must not warn');
 });
 
+test('B5: counters that do not cover every cell are refused, never turned into a count', function () {
+    /* The counters overlap, so osrmCells + filledCells is an UPPER bound on how many
+       distinct cells they attest. A sum below the off-diagonal count therefore proves
+       cells came from nowhere. Both laws can still hold across that hole, and the engine
+       used to fill it in: it either fabricated a figure from the identity
+       whollyEstimated = M - osrmCells (which needs the coverage the sum no longer
+       guarantees), or said nothing at all. Neither is acceptable — the second is the
+       guessed-matrix-labelled-clean bug wearing a different hat. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);      // 6 places, M = 30
+    const M = 30;
+
+    function shortfall(label, counters) {
+        const m = matrixWithSource(places, label, counters);
+        if (counters.osrmCells === undefined) delete m.osrmCells;
+        if (counters.filledCells === undefined) delete m.filledCells;
+        const p = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: m, days: 3 });
+        return p.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; });
+    }
+
+    [
+        // A 'mixed' label over a hole: the old code reported "25 of 30 cells are
+        // straight-line estimates" when the provider only ever attested 5.
+        { label: 'mixed', counters: { osrmCells: 5, filledCells: 5 }, attested: 10 },
+        // An 'osrm' label over a hole: the old code said nothing whatsoever.
+        { label: 'osrm', counters: { osrmCells: 5, filledCells: 0 }, attested: 5 },
+        // A 'haversine' label over a hole. osrmCells === 0 does soundly prove that every
+        // cell is an estimate, so that claim is allowed here — but no COUNT may be.
+        { label: 'haversine', counters: { osrmCells: 0, filledCells: 2 }, attested: 2, provesNoRoad: true },
+        // The extreme case, which the coverage floor subsumes.
+        { label: 'mixed', counters: { osrmCells: 0, filledCells: 0 }, attested: 0 },
+        /* One counter absent. The laws are biconditionals, so a known label pins the
+           missing one ('osrm' => filledCells 0, 'haversine' => osrmCells 0) and the floor
+           becomes checkable even from a single supplied counter. */
+        { label: 'osrm', counters: { osrmCells: 5, filledCells: undefined }, attested: 5 },
+        { label: 'haversine', counters: { osrmCells: undefined, filledCells: 2 }, attested: 2 }
+    ].forEach(function (c) {
+        const w = shortfall(c.label, c.counters);
+        const all = w.join(' // ');
+        const tag = c.label + ' ' + JSON.stringify(c.counters);
+
+        assert.ok(w.some(function (x) {
+            return /attest at most/.test(x) && x.indexOf(String(c.attested) + ' of the ' + M) !== -1;
+        }), 'B5: ' + tag + ' must report the shortfall and name it: ' + all);
+        assert.ok(w.some(function (x) { return /cannot be confirmed/.test(x); }),
+            'B5: ' + tag + ' provenance is unconfirmed: ' + all);
+        assert.ok(w.some(function (x) { return x.indexOf((M - c.attested) + ' unaccounted for') !== -1; }),
+            'B5: ' + tag + ' says how many cells came from nowhere: ' + all);
+
+        /* The point of the floor: with it broken, no derived figure may be printed.
+           Every "N of 30" phrase that quantifies estimated cells is a fabrication. */
+        assert.ok(!w.some(function (x) { return /matrix cells are straight-line estimates/.test(x); }),
+            'B5: ' + tag + ' must not invent a count of estimated cells: ' + all);
+        assert.ok(!w.some(function (x) { return /carry a real road value/.test(x); }),
+            'B5: ' + tag + ' must not invent a count of half-real cells: ' + all);
+
+        /* "every distance is an estimate" is a fact only when a supplied osrmCells === 0
+           says so — that needs no coverage. Otherwise it is an unbacked every-cell claim. */
+        const claimsEveryCell = w.some(function (x) { return /no road data at all/.test(x); });
+        if (c.provesNoRoad) {
+            assert.ok(claimsEveryCell,
+                'B5: ' + tag + ' osrmCells === 0 does prove every cell is an estimate: ' + all);
+        } else {
+            assert.ok(!claimsEveryCell,
+                'B5: ' + tag + ' must not claim every cell is an estimate: ' + all);
+        }
+    });
+
+    // A label-only 'haversine' verdict must read as the provider's claim, not as a fact.
+    const labelOnly = shortfall('haversine', { osrmCells: undefined, filledCells: 2 });
+    assert.ok(labelOnly.some(function (x) { return /no road data is claimed for this matrix/.test(x); }),
+        'B5: without a supplied osrmCells the every-cell verdict is a claim: ' + labelOnly.join(' // '));
+
+    // The implied counter is used to refute, never to confirm: a bare 'osrm' whose
+    // implied filledCells 0 would "prove" it clean must still come back unverified.
+    const bare = shortfall('osrm', { osrmCells: undefined, filledCells: undefined });
+    assert.ok(bare.some(function (x) { return /unverified/.test(x); }),
+        'B5: a label may not supply its own evidence: ' + bare.join(' // '));
+
+    // The floor met exactly is not a shortfall — this is the boundary, and it must be quiet
+    // about coverage and still produce its derived counts.
+    const exact = shortfall('mixed', { osrmCells: 24, filledCells: 6 });
+    assert.ok(!exact.some(function (x) { return /attest at most/.test(x); }),
+        'B5: osrmCells + filledCells === 30 meets the floor: ' + exact.join(' // '));
+    assert.ok(exact.some(function (x) { return x.indexOf('6 of 30') !== -1; }),
+        'B5: and the derived count is still reported: ' + exact.join(' // '));
+
+    // One below the floor is a shortfall.
+    const justUnder = shortfall('mixed', { osrmCells: 24, filledCells: 5 });
+    assert.ok(justUnder.some(function (x) { return /attest at most 29 of the 30/.test(x); }),
+        'B5: 29 of 30 is one cell short and must be caught: ' + justUnder.join(' // '));
+});
+
+test('B5: an "osrm" label with no counters behind it is unverified, not clean', function () {
+    /* 'osrm' is the only label that buys silence, and the counters are the only evidence
+       for it. With none supplied there is nothing at all behind the one claim that
+       suppresses every warning — the exact gap the round-1 guessed-matrix bug used. It is
+       unverified rather than disproven, so it earns a softer warning than a contradiction,
+       and only for this label: 'mixed' and 'haversine' already warn on the label alone. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);
+
+    function sourceWarnings(patch) {
+        const m = engine.haversineMatrix(places);
+        delete m.osrmCells;
+        delete m.filledCells;
+        for (const k in patch) m[k] = patch[k];
+        const p = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: m, days: 3 });
+        return p.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; });
+    }
+
+    const bare = sourceWarnings({ source: 'osrm' });
+    assert.strictEqual(bare.length, 1, 'B5: exactly one warning: ' + bare.join(' // '));
+    assert.ok(/unverified/.test(bare[0]) && /does not supply a usable/.test(bare[0]),
+        'B5: an unbacked "osrm" claim is flagged as unverified: ' + bare[0]);
+    // Softer than a contradiction: it must not claim the counters disprove the label.
+    assert.ok(!/counters say/.test(bare[0]), 'B5: nothing was contradicted, only unevidenced');
+
+    // A lone counter that cannot decide the source is the same no-evidence case.
+    const half = sourceWarnings({ source: 'osrm', osrmCells: 30 });
+    assert.ok(half.some(function (w) { return /unverified/.test(w); }),
+        'B5: a lone osrmCells does not establish "osrm": ' + half.join(' // '));
+
+    // ...but a decisive counter does, and stays silent.
+    const decisive = sourceWarnings({ source: 'osrm', filledCells: 0 });
+    assert.strictEqual(decisive.length, 0,
+        'B5: filledCells === 0 IS the evidence for "osrm": ' + decisive.join(' // '));
+
+    // The other two labels already warn on the label alone; no extra noise for them.
+    ['mixed', 'haversine'].forEach(function (src) {
+        const w = sourceWarnings({ source: src });
+        assert.strictEqual(w.length, 1, 'B5: ' + src + ' warns once, not twice: ' + w.join(' // '));
+        assert.ok(!/unverified/.test(w[0]),
+            'B5: ' + src + ' already tells the user the data is degraded: ' + w[0]);
+    });
+});
+
 /* ── D6: negative matrix cells ── */
 
 test('R7/R8: negative matrix cells are rejected, not subtracted from the trip', function () {
