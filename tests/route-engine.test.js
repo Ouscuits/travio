@@ -71,6 +71,67 @@ function pathMinutes(matrix, indices) {
     return total;
 }
 
+/* ── A chain of collinear places whose consecutive legs have known drive times ──
+   Points sit west to east on the equator, so the optimiser keeps them in order and each
+   consecutive pair's haversine distance is exact. The inverse of the engine's fallback
+   (haversine x 1.25 road factor, 90 km/h) turns a wanted minute count into a longitude
+   step, which lets a test state a leg distribution directly instead of hoping a set of
+   cities happens to produce one. */
+const EARTH_R_KM = 6371.0088;
+function lonStepForMinutes(min) {
+    const roadKm = (min / 60) * 90;
+    const geoKm = roadKm / 1.25;
+    return (360 / Math.PI) * Math.asin(geoKm / (2 * EARTH_R_KM));
+}
+
+function chain(legMinutes) {
+    const places = [P('C0', 0, 0)];
+    let lon = 0;
+    for (let i = 0; i < legMinutes.length; i++) {
+        lon += lonStepForMinutes(legMinutes[i]);
+        places.push(P('C' + (i + 1), 0, lon));
+    }
+    const matrix = engine.haversineMatrix(places);
+    // The minutes the engine will actually see, after its own 2-decimal rounding.
+    const actual = [];
+    for (let i = 0; i + 1 < places.length; i++) actual.push(matrix.min[i][i + 1]);
+    return { places: places, matrix: matrix, legMin: actual };
+}
+
+function planChain(c, days, cap) {
+    const input = {
+        start: c.places[0],
+        end: c.places[c.places.length - 1],
+        stops: c.places.slice(1, c.places.length - 1),
+        matrix: c.matrix,
+        days: days
+    };
+    if (cap !== undefined) input.maxDriveMinPerDay = cap;
+    return planRoute(input);
+}
+
+/* Exhaustive oracle: does ANY contiguous split into `days` non-empty chunks keep every
+   chunk at or under `cap`? Independent of the engine — this is what R6 promises. */
+function feasibleSplitExists(legMin, days, cap) {
+    const n = legMin.length;
+    const memo = new Map();
+    function go(pos, d) {
+        if (d === days) return pos === n;
+        const key = pos + ':' + d;
+        if (memo.has(key)) return memo.get(key);
+        let acc = 0;
+        let ok = false;
+        for (let take = 1; pos + take <= n - (days - d - 1); take++) {
+            acc += legMin[pos + take - 1];
+            if (acc > cap + 1e-9) break;
+            if (go(pos + take, d + 1)) { ok = true; break; }
+        }
+        memo.set(key, ok);
+        return ok;
+    }
+    return go(0, 0);
+}
+
 function permutations(arr) {
     if (arr.length <= 1) return [arr.slice()];
     const out = [];
@@ -312,21 +373,131 @@ test('R6: 8 stops over 2 days flags overDriveCap and warns instead of hiding it'
     assertSumsConsistent(p, '8 stops 2 days');
 });
 
-test('R6: a feasible custom maxDriveMinPerDay is respected on every day', function () {
-    // Six evenly spaced stops (~55 min per leg) over 4 days with a 240 min cap: feasible.
-    const stops = [];
-    for (let i = 1; i <= 6; i++) stops.push(P('K' + i, 0, i * 0.5));
-    const S = P('S', 0, 0);
-    const E = P('E', 0, 3.5);
-    const p = plan(S, E, stops, 4, { maxDriveMinPerDay: 240 });
+test('R6: a feasible cap is respected on UNEVEN legs, not only on evenly spaced ones', function () {
+    /* The previous version of this test used six evenly spaced ~55 min legs — the one leg
+       distribution a balance-first greedy always happens to handle — so it asserted a
+       property that was false in general on a case selected to pass. These distributions
+       are uneven, and each one has a contiguous split with every day under the cap. */
+    const cases = [
+        // The headline regression: the greedy ended day 1 at 229 because taking the 81 min
+        // leg overshot the average, then dumped 317 + 156 = 473 min on an uncapped last day.
+        { legs: [229, 81, 317, 156], days: 3, cap: 360, expect: [310, 317, 156] },
+        { legs: [340, 40, 300, 40], days: 3, cap: 360, expect: [340, 40, 340] },
+        { legs: [50, 50, 350, 50, 50], days: 3, cap: 360, expect: [100, 350, 100] },
+        { legs: [200, 200, 200, 200, 200], days: 3, cap: 450, expect: [200, 400, 400] },
+        { legs: [120, 240, 120, 240, 120], days: 3, cap: 380, expect: [120, 360, 360] },
+        // Feasible only if the LAST day is the light one — the greedy's blind spot.
+        { legs: [100, 100, 100, 340], days: 2, cap: 360, expect: [300, 340] },
+        // ...and only if the FIRST day is.
+        { legs: [340, 100, 100, 100], days: 2, cap: 360, expect: [340, 300] }
+    ];
 
-    assert.strictEqual(p.days.length, 4);
-    p.days.forEach(function (d) {
-        assert.strictEqual(d.overDriveCap, false, 'R6: day ' + d.day + ' drives ' + d.driveMin + ' min');
-        assert.ok(d.driveMin <= 240 + 0.01, 'R6: cap honoured when the schedule allows it');
+    cases.forEach(function (c) {
+        const built = chain(c.legs);
+        assert.ok(feasibleSplitExists(built.legMin, c.days, c.cap),
+            'the fixture itself must admit a split under the cap: ' + c.legs.join('+'));
+
+        const p = planChain(built, c.days, c.cap);
+        assert.strictEqual(p.days.length, c.days, 'R4: ' + c.legs.join('+'));
+        assert.deepStrictEqual(
+            p.days.map(function (d) { return Math.round(d.driveMin); }),
+            c.expect,
+            'R6: ' + c.legs.join('+') + ' over ' + c.days + ' days, cap ' + c.cap);
+        p.days.forEach(function (d) {
+            assert.strictEqual(d.overDriveCap, false,
+                'R6: day ' + d.day + ' drives ' + d.driveMin + ' min, cap ' + c.cap);
+            assert.ok(d.driveMin <= c.cap + 0.01, 'R6: cap honoured when the schedule allows it');
+        });
+        assert.strictEqual(
+            p.warnings.filter(function (w) { return w.indexOf('over-drive-cap:') === 0; }).length, 0,
+            'R6: no over-cap warning when no day is over the cap');
+        assertDayChain(p, 'feasible cap ' + c.legs.join('+'));
+        assertSumsConsistent(p, 'feasible cap ' + c.legs.join('+'));
     });
-    assert.strictEqual(p.warnings.filter(function (w) { return w.indexOf('over-drive-cap:') === 0; }).length, 0);
-    assertSumsConsistent(p, 'feasible cap');
+
+    // The evenly spaced case the old test used still has to work.
+    const even = chain([55, 55, 55, 55, 55, 55, 55]);
+    const pe = planChain(even, 4, 240);
+    pe.days.forEach(function (d) {
+        assert.strictEqual(d.overDriveCap, false, 'R6: even legs, day ' + d.day);
+    });
+});
+
+test('R6: whenever a split under the cap exists, the engine finds one (1200 random instances)', function () {
+    /* A property test, not a lucky fixture: an independent exhaustive search decides
+       whether a contiguous split with every day under the cap exists, and every instance
+       where one does must come back with no day over the cap. Before the fix this failed
+       on ~3% of feasible instances, the last day being the offender almost every time. */
+    const rand = lcg(20260807);
+    let feasible = 0;
+    let violations = 0;
+    let lastDayOffender = 0;
+    let worstExcess = 0;
+    const examples = [];
+
+    for (let t = 0; t < 1200; t++) {
+        const nLegs = 3 + Math.floor(rand() * 7);                  // 3..9 legs
+        const legs = [];
+        for (let i = 0; i < nLegs; i++) legs.push(Math.round(45 + rand() * 255));   // 45..300 min
+        const days = 2 + Math.floor(rand() * Math.min(nLegs - 1, 5));
+        const cap = [240, 300, 360, 420][Math.floor(rand() * 4)];
+        if (days >= nLegs) continue;                               // that is the R5 branch
+
+        const built = chain(legs);
+        if (!feasibleSplitExists(built.legMin, days, cap)) continue;
+        feasible++;
+
+        const p = planChain(built, days, cap);
+        assert.strictEqual(p.days.length, days, 'R4: instance ' + t);
+        const over = p.days.filter(function (d) { return d.overDriveCap; });
+        if (over.length) {
+            violations++;
+            if (p.days[days - 1].overDriveCap) lastDayOffender++;
+            over.forEach(function (d) {
+                worstExcess = Math.max(worstExcess, d.driveMin - cap);
+            });
+            if (examples.length < 3) {
+                examples.push(legs.join('+') + ' over ' + days + ' days, cap ' + cap + ' -> [' +
+                    p.days.map(function (d) { return Math.round(d.driveMin); }).join(', ') + ']');
+            }
+        }
+        // Whatever the split, overDriveCap and the warning must agree with the numbers.
+        assert.strictEqual(
+            p.warnings.filter(function (w) { return w.indexOf('over-drive-cap:') === 0; }).length,
+            over.length, 'R6: one warning per over-cap day, instance ' + t);
+    }
+
+    assert.ok(feasible > 300, 'the sweep must actually exercise feasible instances, got ' + feasible);
+    assert.strictEqual(violations, 0,
+        'R6: ' + violations + '/' + feasible + ' feasible instances still produced an over-cap day ' +
+        '(last day in ' + lastDayOffender + ', worst excess ' + Math.round(worstExcess) + ' min). ' +
+        'Examples: ' + examples.join(' | '));
+});
+
+test('R6: an impossible cap is spread evenly, never dumped on one day', function () {
+    /* Feasibility cannot always be reached; balance is what is left, and it must not
+       collapse into "one short day, one enormous day". */
+    const rand = lcg(31337);
+    for (let t = 0; t < 60; t++) {
+        const nLegs = 4 + Math.floor(rand() * 6);
+        const legs = [];
+        for (let i = 0; i < nLegs; i++) legs.push(Math.round(200 + rand() * 300));
+        const days = 2 + Math.floor(rand() * 3);
+        if (days >= nLegs) continue;
+
+        const built = chain(legs);
+        assert.ok(!feasibleSplitExists(built.legMin, days, 360),
+            'fixture ' + t + ' was meant to be infeasible');
+        const p = planChain(built, days, 360);
+        const lightest = Math.min.apply(null, p.days.map(function (d) { return d.driveMin; }));
+        assert.ok(lightest > p.totalMin / (days * 4),
+            'R6: instance ' + t + ' lightest day ' + Math.round(lightest) + ' min of ' +
+            Math.round(p.totalMin) + ' over ' + days + ' days is not a balanced split');
+        p.days.forEach(function (d) {
+            assert.ok(d.legs.length >= 1, 'R5: no empty day when there are more legs than days');
+        });
+        assertSumsConsistent(p, 'impossible cap ' + t);
+    }
 });
 
 test('R7: totals equal the sum of days which equal the sum of legs (float tolerance 0.01)', function () {
@@ -634,6 +805,169 @@ test('B5: an absent or unknown matrix source is treated as unverified, not as ro
     assert.ok(p.warnings.some(function (w) { return w.indexOf('distance-source: unknown matrix source') === 0; }));
 });
 
+/* ── D5: the label and the counters are one contract; the counters are the evidence ── */
+
+test('B5: a matrix labelled "osrm" while its counters say otherwise is not trusted', function () {
+    /* The round-1 bug was a guessed matrix labelled clean, which suppressed the warning.
+       The contract puts the duty on the provider, but osrmCells/filledCells sit right
+       next to the label and are part of the same contract — when they contradict it, the
+       engine must not stay silent. Off-diagonal cells here: 6 x 5 = 30. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);
+
+    // 'osrm' claimed, yet not one cell came from the road graph.
+    const lying = matrixWithSource(places, 'osrm', { osrmCells: 0, filledCells: 30 });
+    const a = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: lying, days: 3 });
+    const wa = a.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; });
+    assert.ok(wa.length >= 1, 'B5: a matrix labelled "osrm" with 30 filled cells must warn');
+    assert.ok(wa.some(function (w) { return /labelled "osrm"/.test(w) && /counters/.test(w); }),
+        'B5: the contradiction itself is reported: ' + wa.join(' // '));
+    assert.ok(wa.some(function (w) { return /no road data/.test(w); }),
+        'B5: and the counters, not the label, decide what the user is told: ' + wa.join(' // '));
+
+    // 'osrm' claimed, but a fifth of the cells were guessed.
+    const partly = matrixWithSource(places, 'osrm', { osrmCells: 24, filledCells: 6 });
+    const b = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: partly, days: 3 });
+    const wb = b.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; });
+    assert.ok(wb.some(function (w) { return /counters say "mixed"/.test(w); }),
+        'B5: partial road data mislabelled "osrm" is caught: ' + wb.join(' // '));
+    assert.ok(wb.some(function (w) { return w.indexOf('6 of 30') !== -1; }),
+        'B5: the user is still told how many legs are estimates: ' + wb.join(' // '));
+
+    // The reverse lie is a lie too: real road data labelled as guesswork.
+    const pessimistic = matrixWithSource(places, 'haversine', { osrmCells: 30, filledCells: 0 });
+    const c = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: pessimistic, days: 3 });
+    assert.ok(c.warnings.some(function (w) { return /labelled "haversine"/.test(w) && /counters say "osrm"/.test(w); }),
+        'B5: a mislabelled-as-worse matrix is reported too');
+    assert.ok(!c.warnings.some(function (w) { return /no road data at all/.test(w); }),
+        'B5: the counters win, so the user is not told there is no road data');
+
+    // Counters outside 0..30, or not whole numbers, make the provenance unverifiable.
+    [{ osrmCells: 99, filledCells: 99 },
+     { osrmCells: -1, filledCells: 30 },
+     { osrmCells: 12.5, filledCells: 30 }].forEach(function (counters) {
+        const broken = matrixWithSource(places, 'osrm', counters);
+        const d = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: broken, days: 3 });
+        assert.ok(d.warnings.some(function (w) {
+            return w.indexOf('distance-source:') === 0 && /cannot be confirmed/.test(w);
+        }), 'B5: out-of-range counters ' + JSON.stringify(counters) + ' are reported, not believed');
+    });
+
+    // And a matrix whose label and counters agree is still silent.
+    const clean = matrixWithSource(places, 'osrm', { osrmCells: 30, filledCells: 0 });
+    const e = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: clean, days: 3 });
+    assert.strictEqual(e.warnings.filter(function (w) { return w.indexOf('distance-source:') === 0; }).length, 0,
+        'B5: no false alarm on a genuinely clean matrix');
+});
+
+test('B5: the counters OVERLAP — their sum exceeding the cell count is not an error', function () {
+    /* A cell holds a km and a min, and they can have different provenance: OSRM's default
+       /table reply annotates durations only, and a distances-only reply is equally
+       possible. Such a cell is counted in BOTH counters, so osrmCells + filledCells may
+       exceed the off-diagonal count. Treating the sum as a partition raised a false alarm
+       on the commonest real OSRM reply of all, and made the warning overstate the damage:
+       "6 of 6 cells are straight-line estimates" when all 6 road distances were real. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);          // 6 places, 30 off-diagonal cells
+
+    // Every cell has a real road distance and an estimated duration.
+    const distancesOnly = matrixWithSource(places, 'mixed', { osrmCells: 30, filledCells: 30 });
+    const p = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: distancesOnly, days: 3 });
+    const w = p.warnings.filter(function (x) { return x.indexOf('distance-source:') === 0; });
+
+    assert.ok(!w.some(function (x) { return /cannot be confirmed/.test(x); }),
+        'B5: 30 + 30 > 30 is legitimate, not a counter inconsistency: ' + w.join(' // '));
+    assert.ok(!w.some(function (x) { return /counters say/.test(x); }),
+        'B5: label and counters agree here, so nothing is contradicted: ' + w.join(' // '));
+    assert.strictEqual(w.length, 1, 'B5: exactly one distance-source warning: ' + w.join(' // '));
+    assert.ok(!/matrix cells are straight-line estimates/.test(w[0]),
+        'B5: the warning must not claim any cell is a pure straight-line estimate: ' + w[0]);
+    assert.ok(/real road value with an estimated one/.test(w[0]),
+        'B5: it must say these cells are PARTLY estimated: ' + w[0]);
+
+    // A genuinely part-guessed, part-half-guessed matrix names both quantities.
+    const both = matrixWithSource(places, 'mixed', { osrmCells: 24, filledCells: 12 });
+    const q = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: both, days: 3 });
+    const wq = q.warnings.filter(function (x) { return x.indexOf('distance-source:') === 0; })[0];
+    // 30 - 24 = 6 cells are entirely estimated; 24 + 12 - 30 = 6 more are half estimated.
+    assert.ok(/6 of 30 matrix cells are straight-line estimates/.test(wq),
+        'B5: entirely-estimated cells are counted correctly: ' + wq);
+    assert.ok(/6 more carry a real road value/.test(wq),
+        'B5: part-estimated cells are reported separately: ' + wq);
+
+    // The no-overlap case still reads exactly as before.
+    const disjoint = matrixWithSource(places, 'mixed', { osrmCells: 24, filledCells: 6 });
+    const r = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: disjoint, days: 3 });
+    const wr = r.warnings.filter(function (x) { return x.indexOf('distance-source:') === 0; })[0];
+    assert.ok(wr.indexOf('6 of 30') !== -1 && /unroutable pairs/.test(wr),
+        'B5: a plain partly-filled matrix is unchanged: ' + wr);
+    assert.ok(!/carry a real road value/.test(wr), 'B5: nothing is half-estimated here: ' + wr);
+
+    // Both counters zero on a 30-cell matrix accounts for nothing and cannot be true.
+    const nothing = matrixWithSource(places, 'mixed', { osrmCells: 0, filledCells: 0 });
+    const s = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: nothing, days: 3 });
+    assert.ok(s.warnings.some(function (x) {
+        return x.indexOf('distance-source:') === 0 && /cannot be confirmed/.test(x);
+    }), 'B5: counters that account for no cell at all are reported');
+
+    // ...but a 1x1 matrix has no off-diagonal cell, so 0/0 there is correct and silent.
+    const lone = planRoute({ stops: [TOLEDO], days: 4, matrix: engine.haversineMatrix([TOLEDO]) });
+    assert.strictEqual(lone.warnings.filter(function (x) { return x.indexOf('distance-source:') === 0; }).length, 0,
+        'B5: a single-place matrix has no distance to characterise and must not warn');
+});
+
+/* ── D6: negative matrix cells ── */
+
+test('R7/R8: negative matrix cells are rejected, not subtracted from the trip', function () {
+    /* cell() validated finiteness but not sign, so negative distances propagated straight
+       into the totals: an all-negative matrix produced totalKm = -875 and the only
+       warning was "the whole itinerary computes to 0 km" — the wrong message entirely. */
+    const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);
+
+    function negated(fraction) {
+        const m = engine.haversineMatrix(places);
+        m.source = 'osrm';
+        m.osrmCells = 30;
+        m.filledCells = 0;
+        let flipped = 0;
+        for (let i = 0; i < m.km.length; i++) {
+            for (let j = 0; j < m.km.length; j++) {
+                if (i === j) continue;
+                if (!fraction || flipped < fraction) {
+                    m.km[i][j] = -m.km[i][j];
+                    m.min[i][j] = -m.min[i][j];
+                    flipped++;
+                }
+            }
+        }
+        return m;
+    }
+
+    const all = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: negated(0), days: 3 });
+    assert.ok(all.totalKm > 500, 'R8: a negative matrix must not produce a negative trip, got ' + all.totalKm);
+    assert.ok(all.totalMin > 0, 'R7: totals stay positive, got ' + all.totalMin);
+    assert.ok(all.warnings.some(function (w) { return w.indexOf('invalid-distance:') === 0; }),
+        'R8: the corrupt matrix is named for what it is');
+    assert.ok(!all.warnings.some(function (w) { return w.indexOf('zero-distance:') === 0; }),
+        'R8: "computes to 0 km" is the wrong message for negative data');
+    all.days.forEach(function (d) {
+        assert.ok(d.km >= 0 && d.driveMin >= 0, 'R7: no negative day totals');
+        d.legs.forEach(function (l) {
+            assert.ok(l.km >= 0 && l.min >= 0, 'R7: no negative legs');
+        });
+    });
+    assertSumsConsistent(all, 'all-negative matrix');
+
+    // One poisoned cell hiding inside otherwise sound data must be caught too.
+    const one = planRoute({ start: MADRID, end: BARCELONA, stops: FOUR_STOPS, matrix: negated(1), days: 3 });
+    assert.ok(one.warnings.some(function (w) { return w.indexOf('invalid-distance:') === 0; }),
+        'R8: a single negative cell is still reported');
+    assert.ok(one.totalKm > 500 && one.totalMin > 0);
+    assertSumsConsistent(one, 'one negative cell');
+
+    // Only one warning however many cells are corrupt.
+    assert.strictEqual(all.warnings.filter(function (w) { return w.indexOf('invalid-distance:') === 0; }).length, 1,
+        'R8: the corruption is reported once, not once per leg');
+});
+
 test('B5: the engine fallback matrix carries the contract counters and a calibrated speed', function () {
     const places = placesOf(MADRID, BARCELONA, FOUR_STOPS);
     const m = engine.haversineMatrix(places);
@@ -789,6 +1123,69 @@ test('R2: or-opt keeps the plan deterministic and never worse than nearest neigh
             'R2: never worse than the typed order');
         assertSumsConsistent(a, 'or-opt instance ' + t);
     }
+});
+
+test('R2: the improvement passes scale quadratically, not cubically, up to the 60-stop limit', function () {
+    /* Both passes used to re-cost the whole sequence for every candidate, turning each
+       O(n^2) scan into O(n^3): at the 60-stop optimisation limit one planRoute() took a
+       median 81 ms on the dev machine (peaks past 230 ms) — a visible freeze in the
+       browser. Scoring each candidate by an exact O(1) delta brings that to ~5 ms.
+
+       An absolute millisecond budget would only measure the machine, so the assertion is
+       on the SHAPE of the growth: doubling the stop count costs ~4x for a quadratic scan
+       and ~8x for a cubic one. Measured here: 4.1x after the fix, 9.2x before it. */
+    function instance(n) {
+        const rand = lcg(4242);
+        const stops = [];
+        for (let i = 0; i < n; i++) stops.push(P('S' + i, 36 + rand() * 8, -9 + rand() * 12));
+        const start = P('Start', 40.4168, -3.7038);
+        const end = P('End', 41.3851, 2.1734);
+        const places = placesOf(start, end, stops);
+        const matrix = engine.haversineMatrix(places);
+        return {
+            places: places,
+            matrix: matrix,
+            input: { start: start, end: end, stops: stops, matrix: matrix, days: 7 }
+        };
+    }
+    function timeMs(input) {
+        const t0 = process.hrtime.bigint();
+        planRoute(input);
+        return Number(process.hrtime.bigint() - t0) / 1e6;
+    }
+
+    const small = instance(30);
+    const large = instance(60);
+    for (let w = 0; w < 3; w++) { planRoute(small.input); planRoute(large.input); }
+
+    /* Both sizes are measured back to back inside each round and the ratio is taken per
+       round, so JIT state, GC pauses and CPU frequency changes hit numerator and
+       denominator together instead of skewing one of them. */
+    const ratios = [];
+    for (let r = 0; r < 9; r++) {
+        const a = timeMs(small.input);
+        const b = timeMs(large.input);
+        ratios.push(b / a);
+    }
+    ratios.sort(function (a, b) { return a - b; });
+    const ratio = ratios[4];
+
+    const plan60 = planRoute(large.input);
+    assert.strictEqual(plan60.order.length, 62,
+        'R1: 60 stops is exactly the optimisation limit, and none are dropped');
+    assert.ok(!plan60.warnings.some(function (w) { return w.indexOf('optimisation-limited:') === 0; }),
+        'R2: 60 stops must still be optimised, not skipped');
+    // The fast delta must land on the same local optimum a full re-cost would.
+    const idx = indicesOf(plan60.order, large.places);
+    assert.ok(!twoOptImproves(large.matrix, idx),
+        'R2: the O(1) delta must reach a genuine 2-opt local optimum');
+    assert.ok(!orOptImproves(large.matrix, idx),
+        'R2: and a genuine or-opt local optimum');
+
+    assert.ok(ratio < 7,
+        'R2: doubling 30 -> 60 stops cost ' + ratio.toFixed(1) + 'x (median of ' +
+        ratios.map(function (x) { return x.toFixed(1); }).join(', ') + '); ' +
+        'that is cubic growth, the per-candidate full re-cost is back');
 });
 
 test('R2/R8: the engine exposes a browser-and-Node surface without ES modules', function () {
