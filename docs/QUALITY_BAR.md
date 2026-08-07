@@ -53,3 +53,40 @@ A Travio itinerary must meet what a Wanderlog itinerary guarantees:
 
 Criteria B1–B4, B6, B9 are machine-checkable and are enforced by the test suite; B5, B7,
 B8 are verified by inspection against live output.
+
+## Status against the bar
+
+Checked on the branch, not asserted from memory. 405 tests, 0 failures.
+
+| | criterion | status | evidence |
+|---|---|---|---|
+| B1 | every destination exactly once | **met** | R1, fuzzed over 22,184 origin/layout cases |
+| B2 | order computed to reduce travel | **met** | nearest-neighbour + 2-opt + or-opt; 1.5–7.5% above the brute-forced optimum over 4,600 instances, median 0.00% |
+| B3 | exactly `duration` days, no silent empty days | **met** | R4/R5; extra days become flagged rest days |
+| B4 | ends at the end point; origin reappears only on a round trip | **met** | R3 |
+| B5 | real distance and time from a routing graph, stated fallback | **met** | OSRM + Nominatim; nine review rounds; 69-route live fixture; snap-distance verification |
+| B6 | daily driving cap, warns rather than hiding a 14-hour day | **met** | exact DP over (day, split point); 0 violations in 3,479 provably-feasible instances |
+| B7 | cost per day computed and compared to budget, over-budget flag | **met** | fuel/tolls/lodging/meals, five toll provenance states, floored totals |
+| B8 | route visible on a map and exportable | **modules built, not yet wired** | `js/route-map.js` (81 tests), `js/route-export.js` (108 tests) |
+| B9 | displayed numbers internally consistent | **met** | day totals sum to trip totals; rounded once |
+
+**Not met, and deliberately so:** Roadtrippers' corridor POI discovery was scoped out —
+it needs a third network dependency (Overpass) with its own rate limits and failure
+modes, and bundling it would have made the map piece impossible to judge on its own.
+
+**Not achievable on this backend:** avoiding toll roads. The public OSRM returns
+`400 InvalidValue "Exclude flag combination is not supported"` for `exclude=toll`,
+`exclude=motorway` and `exclude=ferry`, on both `/route` and `/table` (measured). The UI
+therefore states that the route was *not* re-planned rather than showing a toll figure
+nobody computed. Real avoidance would need a self-hosted OSRM or a keyed provider behind
+the existing Cloudflare Worker — an architectural change, not a feature toggle.
+
+## What the bar did not predict
+
+Wanderlog framed the problem as routing, days and cost. Those were the reported bugs and
+they were fixed early. Ten review rounds went instead into **provenance** — whether a
+number shown to the user was measured, estimated, capped, unknown or not applicable. The
+recurring defect was never a wrong calculation; it was a correct calculation presented
+with more confidence than the data supported, and the recurring cause was a bound fitted
+to the cases someone had thought to measure. That is the part of the bar worth carrying
+into any future work here.
