@@ -71,7 +71,10 @@ function doLogout() {
 
 function showLoginError(msg) {
     const el = document.getElementById('loginError');
-    if (el) { el.textContent = msg; el.style.display = ''; }
+    /* NOT '' — .login-error carries display:none in the stylesheet, so clearing the
+       inline style hands the element straight back to it and the message is written
+       but never shown. Login errors were invisible for the life of this app. */
+    if (el) { el.textContent = msg; el.style.display = 'block'; }
 }
 function hideLoginError() {
     const el = document.getElementById('loginError');
